@@ -1,0 +1,98 @@
+[project]
+name = "zyra"
+version = "0.1.0"
+description = "Dynamic heterogeneous multi-agent system for long-horizon complex tasks."
+requires-python = ">=3.12"
+dependencies = [
+    "browser-use[core]==0.13.3",
+    "psutil>=7,<8",
+]
+
+[project.scripts]
+loopx = "loopx.cli:main"
+loopx-finance-value-discovery = "loopx_finance_value_discovery.cli:main"
+loopx-lark-provider = "loopx.extensions.lark.provider:main"
+loopx-openviking-semantic-preference = "loopx.extensions.openviking_semantic_preference.provider:main"
+zyra-source-custody = "zyra_integrations.source_custody.cli:main"
+zyra-freeze-audit = "zyra_evaluation.freeze_audit.cli:main"
+zyra-regression-hardening = "zyra_evaluation.regression_hardening.cli:main"
+zyra-deploy = "zyra_orchestration.deployment.cli:main"
+zyra-release = "zyra_productization.release.cli:main"
+zyra-first-stage-evidence = "zyra_evaluation.freeze_reporting.cli:main"
+
+[project.optional-dependencies]
+inference = [
+    "onnx==1.19.1",
+    "onnxruntime==1.23.2",
+]
+test = [
+    "pytest>=8,<10",
+]
+
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+include-package-data = true
+
+[tool.setuptools.packages.find]
+where = [
+    "apps/api",
+    "packages/code_index",
+    "packages/commands",
+    "packages/core",
+    "packages/evaluation",
+    "packages/integrations",
+    "packages/integrations/loopx_runtime",
+    "packages/integrations/loopx_runtime/packages/loopx-finance-value-discovery/src",
+    "packages/memory",
+    "packages/orchestration",
+    "packages/productization",
+    "packages/runtime",
+    "packages/scheduler",
+    "packages/skills",
+    "packages/symbolic",
+    "packages/workers",
+    "packages/workspace",
+]
+include = ["zyra_*", "loopx*", "loopx_finance_*"]
+namespaces = true
+
+[tool.setuptools.package-data]
+loopx = [
+    "capabilities/auto_research/worker_skill/SKILL.md",
+    "extensions/*/extension.toml",
+    "opencode_goal_mode/*.js",
+    "opencode_goal_mode/*.mjs",
+    "opencode_goal_mode/README.md",
+]
+zyra_integrations = ["data/*.json", "loopx/runtime/*.json"]
+zyra_evaluation = ["data/*.json"]
+
+[tool.setuptools.data-files]
+"share/zyra/loopx/man" = ["packages/integrations/loopx_runtime/man/loopx.1"]
+"share/zyra/loopx/skills/loopx-doc-registry" = ["packages/integrations/loopx_runtime/skills/loopx-doc-registry/SKILL.md"]
+"share/zyra/loopx/skills/loopx-doc-registry/agents" = ["packages/integrations/loopx_runtime/skills/loopx-doc-registry/agents/openai.yaml"]
+"share/zyra/loopx/skills/loopx-pr-review" = ["packages/integrations/loopx_runtime/skills/loopx-pr-review/SKILL.md"]
+"share/zyra/loopx/skills/loopx-pr-review/agents" = ["packages/integrations/loopx_runtime/skills/loopx-pr-review/agents/openai.yaml"]
+"share/zyra/loopx/skills/loopx-project" = ["packages/integrations/loopx_runtime/skills/loopx-project/SKILL.md"]
+"share/zyra/loopx/skills/loopx-project/agents" = ["packages/integrations/loopx_runtime/skills/loopx-project/agents/openai.yaml"]
+"share/zyra/loopx/skills/loopx-self-repair" = ["packages/integrations/loopx_runtime/skills/loopx-self-repair/SKILL.md"]
+"share/zyra/loopx/skills/loopx-self-repair/agents" = ["packages/integrations/loopx_runtime/skills/loopx-self-repair/agents/openai.yaml"]
+"share/zyra/loopx/skills/loopx-self-repair/references" = [
+    "packages/integrations/loopx_runtime/skills/loopx-self-repair/references/repair-patterns.md",
+    "packages/integrations/loopx_runtime/skills/loopx-self-repair/references/upstream-issue-escalation.md",
+]
+"share/zyra/loopx/extensions/loopx-finance-value-discovery" = [
+    "packages/integrations/loopx_runtime/packages/loopx-finance-value-discovery/extension.toml",
+    "packages/integrations/loopx_runtime/packages/loopx-finance-value-discovery/README.md",
+]
+"share/zyra/loopx/extensions/loopx-finance-value-discovery/examples" = ["packages/integrations/loopx_runtime/packages/loopx-finance-value-discovery/examples/paypal-debeta-discovery.json"]
+"share/zyra/loopx/templates" = [
+    "packages/integrations/loopx_runtime/docs/research/long-horizon-agent-benchmarks/benchmark-experiment-report-template-v0.md",
+    "packages/integrations/loopx_runtime/examples/benchmark-experiment-report-template-smoke.py",
+]
+
+[tool.zyra]
+phase = "m3-symbolic-collaboration"

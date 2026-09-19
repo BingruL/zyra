@@ -1,0 +1,230 @@
+{
+  "schema": "zyra.phase2-policy-registry/v1",
+  "slice_id": "P2-S06-03",
+  "p2_base_commit": "e207b46ca690171139a718b8b85d808cb5a79c1e",
+  "slice_base_commit": "a312129f2b358e534321c4ec58989f4674dc8a7f",
+  "registry_revision": 2,
+  "active_versions": {
+    "topology_policy": "phase2_strongest_v1"
+  },
+  "fallback": {
+    "family": "topology_policy",
+    "version": "phase1_deterministic_baseline"
+  },
+  "records": [
+    {
+      "family": "topology_policy",
+      "version": "phase1_deterministic_baseline",
+      "profile_id": "phase1_deterministic_baseline",
+      "lifecycle": "baseline",
+      "activation_state": "standby",
+      "schema_version": "v1",
+      "schema_digest": "099a8e0bc8a2862e45b9c8682f0543bd2b276da15c548cf0a4d0dcc9dd6f055a",
+      "source_digest": "1512d91bfcf14f14b2d23e4057b5b56a17177e2b944fd2f755d14e74ba646449",
+      "configuration": {
+        "baseline_decision_owner": "TopologyRouter",
+        "baseline_route_owner": "ResourceScheduler",
+        "frozen_reference": "docs/reviews/evidence/P2-S00-01/mechanism-baseline.json",
+        "side_effect_execution": "existing_runtime_only"
+      },
+      "config_digest": "3b82d5a69a0b8815d5e8d79b83baee2aebb102352d68efbc683d5e02172889cd",
+      "implementation_commit": "e207b46ca690171139a718b8b85d808cb5a79c1e",
+      "evidence_commit": "13c2964fbe1981fec7bc9af06627e8580e6e3f78",
+      "required_mechanisms": [],
+      "readiness": [],
+      "rollback_family": "topology_policy",
+      "rollback_version": "phase1_deterministic_baseline",
+      "timeout_seconds": 30.0,
+      "no_policy_training": {
+        "runtime_entry_points": [],
+        "datasets": [],
+        "checkpoints": [],
+        "mutable_learned_parameters": [],
+        "dependencies": []
+      },
+      "hard_gate_ids": [],
+      "audit_gate_ids": []
+    },
+    {
+      "family": "topology_policy",
+      "version": "phase2_strongest_v1",
+      "profile_id": "phase2_strongest_v1",
+      "lifecycle": "default",
+      "activation_state": "active",
+      "schema_version": "v1",
+      "schema_digest": "099a8e0bc8a2862e45b9c8682f0543bd2b276da15c548cf0a4d0dcc9dd6f055a",
+      "source_digest": "e1f819a731273ca527ed2d17d996028083e7e09821349a05c8ea06c5b1094052",
+      "configuration": {
+        "composition": [
+          "loopx",
+          "memory_continuity_verifier",
+          "arg_designer",
+          "card",
+          "agentprune",
+          "symbolic_projector",
+          "graph_state_custody",
+          "maas",
+          "resource_scheduler",
+          "verifier_receipts"
+        ],
+        "diagnostic_side_effects_allowed": false,
+        "normal_auto_select_validation": true,
+        "profile_id": "phase2_strongest_v1",
+        "training_allowed": false,
+        "validated_scope": "P2-S06-02 sealed evidence; P2-S06-03 active-default revalidation"
+      },
+      "config_digest": "c0ae2fcd2a8a1337a4abeab11ccc72de5b3a9d5f3b18e91158a3b906d6617424",
+      "implementation_commit": "28c0a1376c6d4226975e8fd60a1f088b75be3a42",
+      "evidence_commit": "a312129f2b358e534321c4ec58989f4674dc8a7f",
+      "required_mechanisms": [
+        "loopx",
+        "arg_designer",
+        "card",
+        "agentprune",
+        "maas"
+      ],
+      "readiness": [
+        {
+          "mechanism_id": "loopx",
+          "stage": "activation_ready",
+          "status": "deterministic_ready",
+          "report_ref": "docs/release/phase2/activation-readiness.json",
+          "report_digest": "a8eefb4ff766d4a8131df8c05431adad490a73ca88774c992bab879b92398fda"
+        },
+        {
+          "mechanism_id": "arg_designer",
+          "stage": "activation_ready",
+          "status": "deterministic_ready",
+          "report_ref": "docs/release/phase2/activation-readiness.json",
+          "report_digest": "a8eefb4ff766d4a8131df8c05431adad490a73ca88774c992bab879b92398fda"
+        },
+        {
+          "mechanism_id": "card",
+          "stage": "activation_ready",
+          "status": "deterministic_ready",
+          "report_ref": "docs/release/phase2/activation-readiness.json",
+          "report_digest": "a8eefb4ff766d4a8131df8c05431adad490a73ca88774c992bab879b92398fda"
+        },
+        {
+          "mechanism_id": "agentprune",
+          "stage": "activation_ready",
+          "status": "deterministic_ready",
+          "report_ref": "docs/release/phase2/activation-readiness.json",
+          "report_digest": "a8eefb4ff766d4a8131df8c05431adad490a73ca88774c992bab879b92398fda"
+        },
+        {
+          "mechanism_id": "maas",
+          "stage": "activation_ready",
+          "status": "deterministic_ready",
+          "report_ref": "docs/release/phase2/activation-readiness.json",
+          "report_digest": "a8eefb4ff766d4a8131df8c05431adad490a73ca88774c992bab879b92398fda"
+        }
+      ],
+      "rollback_family": "topology_policy",
+      "rollback_version": "phase1_deterministic_baseline",
+      "timeout_seconds": 30.0,
+      "no_policy_training": {
+        "runtime_entry_points": [],
+        "datasets": [],
+        "checkpoints": [],
+        "mutable_learned_parameters": [],
+        "dependencies": []
+      },
+      "hard_gate_ids": [
+        "success",
+        "safety",
+        "sealed_task_completion_ratio",
+        "human_intervention_count",
+        "effective_transition_count",
+        "canonical_mutation_custody_ratio",
+        "invalid_proposal_rejection_ratio",
+        "duplicate_side_effect_count",
+        "early_exit_false_positive_count",
+        "privacy_permission_violation_count",
+        "state_owner_duplicate_count",
+        "root_source_runtime_dependency_count",
+        "loopx_validation_failure_spend_count",
+        "no_policy_training_violation_count",
+        "required_mechanism_ready_ratio",
+        "memory_critical_fact_recall_ratio",
+        "unresolved_obligation_retention_ratio",
+        "stale_memory_execution_count",
+        "unsafe_symbolic_commit_count",
+        "production_projector_bypass_count",
+        "real_local_dispatch_receipt_ratio",
+        "real_edge_dispatch_receipt_ratio",
+        "real_cloud_dispatch_receipt_ratio",
+        "physical_placement_causality_ratio",
+        "required_condition_switch_lane_pass_ratio"
+      ],
+      "audit_gate_ids": [
+        "state_owner",
+        "runtime_path",
+        "dependency",
+        "rollback"
+      ]
+    },
+    {
+      "family": "topology_policy",
+      "version": "phase2_diagnostic_v1",
+      "profile_id": "phase2_diagnostic_v1",
+      "lifecycle": "diagnostic",
+      "activation_state": "read_only",
+      "schema_version": "v1",
+      "schema_digest": "099a8e0bc8a2862e45b9c8682f0543bd2b276da15c548cf0a4d0dcc9dd6f055a",
+      "source_digest": "e1f819a731273ca527ed2d17d996028083e7e09821349a05c8ea06c5b1094052",
+      "configuration": {
+        "actual_outcome_claim_allowed": false,
+        "canonical_mutation_allowed": false,
+        "lease_allowed": false,
+        "profile_id": "phase2_diagnostic_v1",
+        "route_change_allowed": false,
+        "side_effect_allowed": false
+      },
+      "config_digest": "9b25e67cae4eac3878a15dd899c15d8c748432e4ec89c4281adf1108fde30073",
+      "implementation_commit": "cf2857c3d9144d818ebed741b8f66af5ec5deafa",
+      "evidence_commit": "8ec8e9bb6d81cf3f1fb9b9878c81ef76f283813c",
+      "required_mechanisms": [
+        "arg_designer",
+        "card",
+        "agentprune"
+      ],
+      "readiness": [
+        {
+          "mechanism_id": "arg_designer",
+          "stage": "activation_ready",
+          "status": "deterministic_ready",
+          "report_ref": "docs/release/phase2/activation-readiness.json",
+          "report_digest": "a8eefb4ff766d4a8131df8c05431adad490a73ca88774c992bab879b92398fda"
+        },
+        {
+          "mechanism_id": "card",
+          "stage": "activation_ready",
+          "status": "deterministic_ready",
+          "report_ref": "docs/release/phase2/activation-readiness.json",
+          "report_digest": "a8eefb4ff766d4a8131df8c05431adad490a73ca88774c992bab879b92398fda"
+        },
+        {
+          "mechanism_id": "agentprune",
+          "stage": "activation_ready",
+          "status": "deterministic_ready",
+          "report_ref": "docs/release/phase2/activation-readiness.json",
+          "report_digest": "a8eefb4ff766d4a8131df8c05431adad490a73ca88774c992bab879b92398fda"
+        }
+      ],
+      "rollback_family": "topology_policy",
+      "rollback_version": "phase1_deterministic_baseline",
+      "timeout_seconds": 10.0,
+      "no_policy_training": {
+        "runtime_entry_points": [],
+        "datasets": [],
+        "checkpoints": [],
+        "mutable_learned_parameters": [],
+        "dependencies": []
+      },
+      "hard_gate_ids": [],
+      "audit_gate_ids": []
+    }
+  ],
+  "registry_digest": "fb96c696779d2e544b05a1e79366bdb7d619843a0ec0267670dce987dc103ffe"
+}

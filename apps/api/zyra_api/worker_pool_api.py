@@ -1,0 +1,1828 @@
+from __future__ import annotations
+
+import json
+import os
+from dataclasses import dataclass
+from http import HTTPStatus
+from pathlib import Path
+from typing import Any, Mapping, Sequence
+
+from zyra_core import ArtifactKind, ArtifactRef, TaskState, new_id
+from zyra_orchestration.graph_custody import (
+    DynamicTopologyRuntime,
+    GraphDeltaBuilder,
+    GraphEdge,
+    GraphNode,
+    GraphStateCustody,
+    NodeExecutionState,
+)
+from zyra_orchestration.topology_policy.contracts import (
+    PhysicalDispatchReceipt,
+    StableArtifactRef,
+    canonical_digest,
+)
+from zyra_scheduler import PhysicalDispatchReceiptValidator
+from zyra_scheduler.worker_pool import (
+    AttemptState,
+    BackendCapability,
+    CapabilityRequirement,
+    ExecutionOutcome,
+    ResourceVector,
+    WorkerLocation,
+    WorkerPoolError,
+    WorkerPoolFoundationRuntime,
+    WorkerPoolIntegrationRuntime,
+    ControlKind,
+)
+
+
+# The API audit consumes this declaration to prove that the worker-pool owners
+# are reachable from the real HTTP dispatcher.  The values are contracts, not
+# documentation-only examples: every entry is handled by ``route_get`` or
+# ``route_post`` below and covered by the integration tests.
+ZYRA_DYNAMIC_API_ROUTES = (
+    "GET /worker-pool",
+    "GET /worker-pool/workers",
+    "GET /worker-pool/workers/{worker_id}",
+    "GET /worker-pool/leases",
+    "GET /worker-pool/health",
+    "GET /worker-pool/journal",
+    "GET /worker-pool/graphs/{graph_id}",
+    "POST /worker-pool/workers/local/register",
+    "POST /worker-pool/workers/{worker_id}/drain",
+    "POST /worker-pool/workers/{worker_id}/wake",
+    "POST /worker-pool/workers/{worker_id}/stop",
+    "POST /worker-pool/workers/{worker_id}/heartbeat",
+    "POST /tasks/{task_id}/worker-pool-lease",
+    "POST /tasks/{task_id}/worker-pool-cancel",
+    "POST /worker-pool/graphs/{graph_id}/mutate",
+    "GET /worker-pool/integration",
+    "GET /worker-pool/controls",
+    "GET /worker-pool/checkpoints/{run_id}",
+    "GET /worker-pool/handoff",
+    "GET /worker-pool/recovery-handoff",
+    "POST /worker-pool/checkpoints/{run_id}",
+    "POST /worker-pool/health/sweep",
+    "POST /tasks/{task_id}/worker-pool-control",
+)
+
+
+@dataclass(frozen=True, slots=True)
+class WorkerPoolApiResponse:
+    status: HTTPStatus
+    body: Mapping[str, Any]
+    headers: Mapping[str, str]
+
+
+class WorkerPoolApiService:
+    def __init__(
+        self,
+        pool: WorkerPoolFoundationRuntime,
+        graph_custody: GraphStateCustody,
+        *,
+        backend_health: Any | None = None,
+        wake_execution: Any | None = None,
+        artifact_store: Any | None = None,
+    ) -> None:
+        self.pool = pool
+        self.graph_custody = graph_custody
+        self.topology = DynamicTopologyRuntime(graph_custody)
+        self.backend_health = backend_health
+        self.artifact_store = artifact_store
+        self.integration = WorkerPoolIntegrationRuntime(
+            pool,
+            graph_custody,
+            backend_health=backend_health,
+            wake_execution=wake_execution,
+        )
+
+    def close(self) -> None:
+        close = getattr(self.backend_health, "close", None)
+        if callable(close):
+            close()
+
+    def route_get(
+        self,
+        parts: Sequence[str],
+        query: Mapping[str, str] | None = None,
+    ) -> WorkerPoolApiResponse | None:
+        query = dict(query or {})
+        if list(parts) == ["worker-pool"]:
+            return self._ok(self.pool.api_projection())
+        if list(parts) == ["worker-pool", "workers"]:
+            projection = self.pool.api_projection()
+            return self._ok(
+                {
+                    "revision": projection["revision"],
+                    "workers": projection["workers"],
+                    "custody": projection["custody"],
+                }
+            )
+        if list(parts) == ["worker-pool", "leases"]:
+            task_id = str(query.get("task_id") or "")
+            worker_id = str(query.get("worker_id") or "")
+            leases = self.pool.store.list_leases(task_id=task_id, worker_id=worker_id)
+            return self._ok({"leases": [item.to_dict() for item in leases], "revision": self.pool.store.revision})
+        if list(parts) == ["worker-pool", "health"]:
+            workers = self.pool.store.list_workers()
+            health = [self.pool.heartbeats.assess(item.worker_id).to_dict() for item in workers]
+            return self._ok({"health": health, "integrity": self.pool.store.integrity_report()})
+        if list(parts) == ["worker-pool", "journal"]:
+            after = max(0, int(query.get("after_sequence") or 0))
+            limit = max(1, min(5000, int(query.get("limit") or 1000)))
+            records = self.pool.store.journal(after_sequence=after, limit=limit)
+            return self._ok({"records": [item.to_dict() for item in records]})
+        if list(parts) == ["worker-pool", "integration"]:
+            return self._ok(self.integration.api_projection(
+                run_id=str(query.get("run_id") or ""),
+                task_id=str(query.get("task_id") or ""),
+            ))
+        if list(parts) == ["worker-pool", "handoff"]:
+            handoff = self.integration.projection.handoff(
+                after_sequence=max(0, int(query.get("after_sequence") or 0)),
+                limit=max(1, min(5000, int(query.get("limit") or 500))),
+                run_id=str(query.get("run_id") or ""),
+                task_id=str(query.get("task_id") or ""),
+            )
+            return self._ok(handoff.to_dict())
+        if list(parts) == ["worker-pool", "recovery-handoff"]:
+            handoff = self.integration.recovery_handoff.build(
+                run_id=str(query.get("run_id") or ""),
+                task_id=str(query.get("task_id") or ""),
+            )
+            return self._ok(handoff.to_dict())
+        if list(parts) == ["worker-pool", "controls"]:
+            controls = self.integration.repository.list_controls(
+                task_id=str(query.get("task_id") or ""),
+                worker_id=str(query.get("worker_id") or ""),
+            )
+            return self._ok({"controls": [item.to_dict() for item in controls]})
+        if len(parts) == 3 and parts[0] == "worker-pool" and parts[1] == "checkpoints":
+            checkpoint = self.integration.repository.latest_checkpoint(parts[2])
+            if checkpoint is None:
+                return self._error(HTTPStatus.NOT_FOUND, "checkpoint_not_found", "worker checkpoint is not available")
+            restore = self.integration.checkpoints.restore(checkpoint.checkpoint_id, strict=False)
+            return self._ok({"checkpoint": checkpoint.to_dict(), "restore": restore.to_dict()})
+        if len(parts) == 3 and parts[0] == "worker-pool" and parts[1] == "workers":
+            worker = self.pool.store.get_worker(parts[2])
+            if worker is None:
+                return self._error(HTTPStatus.NOT_FOUND, "worker_not_found", "worker is not registered")
+            manifest = self.pool.store.latest_manifest(worker.worker_id)
+            telemetry = self.pool.store.latest_telemetry(worker.worker_id)
+            leases = self.pool.store.list_leases(worker_id=worker.worker_id)
+            return self._ok(
+                {
+                    "worker": worker.to_dict(),
+                    "manifest": manifest.to_dict() if manifest else None,
+                    "telemetry": telemetry.to_dict() if telemetry else None,
+                    "health": self.pool.heartbeats.assess(worker.worker_id).to_dict(),
+                    "leases": [item.to_dict() for item in leases],
+                }
+            )
+        if len(parts) == 3 and parts[0] == "worker-pool" and parts[1] == "graphs":
+            try:
+                snapshot = self.graph_custody.current(parts[2])
+            except KeyError:
+                return self._error(HTTPStatus.NOT_FOUND, "graph_not_found", "dynamic graph is not registered")
+            return self._ok(
+                {
+                    "snapshot": snapshot.to_dict(),
+                    "version_ref": self.topology.version_ref(parts[2]).to_dict(),
+                    "journal": list(self.graph_custody.store.journal(parts[2])),
+                }
+            )
+        return None
+
+    def route_post(
+        self,
+        parts: Sequence[str],
+        payload: Mapping[str, Any],
+        *,
+        task_state: TaskState | None = None,
+    ) -> WorkerPoolApiResponse | None:
+        try:
+            if list(parts) == ["worker-pool", "health", "sweep"]:
+                report = self.integration.health_bridge.sweep()
+                status = HTTPStatus.OK if not report.failures else HTTPStatus.MULTI_STATUS
+                return self._response(status, report.to_dict())
+            if list(parts) == ["worker-pool", "workers", "local", "register"]:
+                registration = self.ensure_default_local_worker(
+                    worker_id=str(payload.get("worker_id") or "local-code-worker"),
+                    replace_generation=bool(payload.get("replace_generation", False)),
+                )
+                return self._response(HTTPStatus.CREATED, registration.to_dict())
+            if len(parts) == 4 and parts[0] == "worker-pool" and parts[1] == "workers":
+                worker_id = parts[2]
+                action = parts[3]
+                if action == "drain":
+                    command = self.integration.control.submit_and_apply(
+                        ControlKind.DRAIN,
+                        claim_owner="worker-pool-api",
+                        actor_id="worker-pool-api",
+                        reason=str(payload.get("reason") or "api drain"),
+                        idempotency_key=str(payload.get("idempotency_key") or f"api-drain:{worker_id}"),
+                        worker_id=worker_id,
+                    )
+                    worker = self.pool.store.require_worker(worker_id)
+                elif action == "wake":
+                    command = self.integration.control.submit_and_apply(
+                        ControlKind.WAKE,
+                        claim_owner="worker-pool-api",
+                        actor_id="worker-pool-api",
+                        reason=str(payload.get("reason") or "api wake"),
+                        idempotency_key=str(payload.get("idempotency_key") or f"api-wake:{worker_id}:{self.pool.store.revision}"),
+                        worker_id=worker_id,
+                    )
+                    worker = self.pool.store.require_worker(worker_id)
+                elif action == "stop":
+                    command = self.integration.control.submit_and_apply(
+                        ControlKind.STOP,
+                        claim_owner="worker-pool-api",
+                        actor_id="worker-pool-api",
+                        reason=str(payload.get("reason") or "api stop"),
+                        idempotency_key=str(payload.get("idempotency_key") or f"api-stop:{worker_id}:{self.pool.store.revision}"),
+                        worker_id=worker_id,
+                    )
+                    worker = self.pool.store.require_worker(worker_id)
+                elif action == "heartbeat":
+                    command = None
+                    latest = self.pool.store.latest_heartbeat(worker_id)
+                    sequence = 1 if latest is None else latest.sequence + 1
+                    self.pool.heartbeat_local_worker(
+                        worker_id,
+                        sequence=sequence,
+                        queue_depth=int(payload.get("queue_depth") or 0),
+                        load_average=float(payload.get("load_average") or 0),
+                    )
+                    worker = self.pool.store.require_worker(worker_id)
+                else:
+                    return None
+                return self._ok({
+                    "worker": worker.to_dict(),
+                    "control": command.to_dict() if command is not None else None,
+                })
+            if len(parts) == 3 and parts[0] == "tasks" and parts[2] == "worker-pool-lease":
+                if task_state is None or task_state.task_id != parts[1]:
+                    return self._error(HTTPStatus.NOT_FOUND, "task_not_found", "task is not available")
+                acquisition = self.acquire_for_task(task_state, payload=payload)
+                return self._response(
+                    HTTPStatus.CREATED,
+                    acquisition.to_dict(include_fence_token=bool(payload.get("include_fence_token", False))),
+                )
+            if len(parts) == 3 and parts[0] == "tasks" and parts[2] == "worker-pool-cancel":
+                if task_state is None or task_state.task_id != parts[1]:
+                    return self._error(HTTPStatus.NOT_FOUND, "task_not_found", "task is not available")
+                idempotency_key = str(
+                    payload.get("idempotency_key")
+                    or f"api-cancel:{task_state.task_id}"
+                )
+                descendant_controls = []
+                for binding in self.integration.repository.list_bindings(
+                    run_id=task_state.run_id
+                ):
+                    if (
+                        binding.terminal
+                        or str(binding.metadata.get("parent_task_id") or "")
+                        != task_state.task_id
+                    ):
+                        continue
+                    descendant_controls.append(
+                        self.integration.control.submit_and_apply(
+                            ControlKind.CANCEL,
+                            claim_owner="worker-pool-api",
+                            actor_id="worker-pool-api",
+                            reason=str(
+                                payload.get("reason")
+                                or "parent worker pool cancellation requested"
+                            ),
+                            idempotency_key=(
+                                f"{idempotency_key}:descendant:"
+                                f"{binding.binding_id}"
+                            ),
+                            task_id=binding.task_id,
+                            run_id=binding.run_id,
+                            binding_id=binding.binding_id,
+                        )
+                    )
+                command = self.integration.control.submit_and_apply(
+                    ControlKind.CANCEL,
+                    claim_owner="worker-pool-api",
+                    actor_id="worker-pool-api",
+                    reason=str(payload.get("reason") or "worker pool cancellation requested"),
+                    idempotency_key=idempotency_key,
+                    task_id=task_state.task_id,
+                    run_id=task_state.run_id,
+                )
+                return self._ok({
+                    "control": command.to_dict(),
+                    "cancellation": dict(command.effect.get("cancellation") or {}),
+                    "descendant_controls": [
+                        item.to_dict() for item in descendant_controls
+                    ],
+                    "descendant_cleanup_ok": all(
+                        item.phase.value in {"applied", "superseded"}
+                        for item in descendant_controls
+                    ),
+                })
+            if len(parts) == 3 and parts[0] == "tasks" and parts[2] == "worker-pool-control":
+                if task_state is None or task_state.task_id != parts[1]:
+                    return self._error(HTTPStatus.NOT_FOUND, "task_not_found", "task is not available")
+                kind = ControlKind(str(payload.get("kind") or "cancel"))
+                command = self.integration.control.submit_and_apply(
+                    kind,
+                    claim_owner="worker-pool-api",
+                    actor_id=str(payload.get("actor_id") or "worker-pool-api"),
+                    reason=str(payload.get("reason") or f"api {kind.value}"),
+                    idempotency_key=str(payload.get("idempotency_key") or f"api-control:{task_state.task_id}:{kind.value}"),
+                    task_id=task_state.task_id,
+                    run_id=task_state.run_id,
+                    worker_id=str(payload.get("worker_id") or ""),
+                    lease_id=str(payload.get("lease_id") or ""),
+                    binding_id=str(payload.get("binding_id") or ""),
+                )
+                return self._ok({"control": command.to_dict()})
+            if len(parts) == 3 and parts[0] == "worker-pool" and parts[1] == "checkpoints":
+                run_id = parts[2]
+                graph_ids = tuple(
+                    sorted({
+                        item.foreign_refs.graph.object_id
+                        for item in self.integration.repository.list_bindings(run_id=run_id)
+                        if item.foreign_refs.graph.object_id
+                    })
+                )
+                checkpoint = self.integration.checkpoints.create(
+                    run_id=run_id,
+                    graph_ids=graph_ids,
+                    foreign_checkpoint_refs=tuple(payload.get("foreign_checkpoint_refs") or ()),
+                    previous_checkpoint_id=str(payload.get("previous_checkpoint_id") or ""),
+                    checkpoint_id=str(payload.get("checkpoint_id") or ""),
+                )
+                return self._response(HTTPStatus.CREATED, {"checkpoint": checkpoint.to_dict()})
+            if len(parts) == 4 and parts[0] == "worker-pool" and parts[1] == "graphs" and parts[3] == "mutate":
+                return self._mutate_graph(parts[2], payload)
+        except WorkerPoolError as error:
+            status = HTTPStatus.CONFLICT
+            if error.code.value in {"worker_not_found", "attempt_not_found", "lease_not_found"}:
+                status = HTTPStatus.NOT_FOUND
+            return self._error(status, error.code.value, str(error), detail=error.to_dict())
+        except (KeyError, TypeError, ValueError) as error:
+            return self._error(HTTPStatus.BAD_REQUEST, "worker_pool_request_invalid", str(error))
+        return None
+
+    def ensure_default_local_worker(
+        self,
+        *,
+        worker_id: str = "local-code-worker",
+        replace_generation: bool = False,
+    ):
+        existing = self.pool.store.get_worker(worker_id)
+        # A durable registration can outlive the API process that created it.
+        # Its process_identity still names the old PID, so the settlement-time
+        # ownership check (`refresh_owned_local_worker_heartbeat`) rejects it as
+        # a non-owned identity.  Re-register when the identity is not this
+        # process rather than reviving another process's worker generation.
+        existing_owned = bool(
+            existing is not None
+            and existing.location.value == "local"
+            and existing.metadata.get("default_api_worker") is True
+            and existing.process_identity == f"local-pid-{os.getpid()}"
+            and existing.endpoint == f"local://pid/{os.getpid()}/{worker_id}"
+        )
+        if existing is not None and existing.accepting_leases and existing_owned:
+            manifest = self.pool.store.latest_manifest(worker_id)
+            from zyra_scheduler.worker_pool.application import LocalWorkerRegistration
+
+            self._heartbeat_local(worker_id)
+            return LocalWorkerRegistration(
+                worker=existing,
+                manifest=manifest,
+                process_identity=existing.process_identity,
+            )
+        if existing is not None and existing.accepting_leases and not existing_owned:
+            replace_generation = True
+        backend = BackendCapability(
+            backend_id="local-sandbox-gateway",
+            backend_kind="sandbox_gateway",
+            enabled=True,
+            healthy=True,
+            capabilities=("agent_task", "code_execution", "artifact_return", "local_execution"),
+            tool_ids=("code", "shell", "read", "write", "search"),
+            constraints={"gateway_owner": "SandboxGatewayRuntime", "sealed_capable": True},
+            labels={"dispatch_location": "local"},
+        )
+        registration = self.pool.register_local_worker(
+            worker_id=worker_id,
+            worker_kind="code-worker",
+            backend=backend,
+            capabilities=("agent_task", "code_execution", "artifact_return", "local_execution"),
+            tool_ids=("code", "shell", "read", "write", "search"),
+            resources=ResourceVector(
+                cpu_cores=1.0,
+                memory_mb=1024,
+                disk_mb=2048,
+                network_mbps=100,
+                process_slots=4,
+            ),
+            replace_generation=replace_generation,
+            metadata={"default_api_worker": True, "gateway_owner": "SandboxGatewayRuntime"},
+        )
+        self._heartbeat_local(worker_id)
+        return registration
+
+    def _heartbeat_local(self, worker_id: str) -> None:
+        """Refresh the API-owned local worker before placement decisions.
+
+        The worker record is durable while process liveness is not.  Emitting a
+        fresh monotonic heartbeat on every API acquisition prevents a restored
+        process from silently routing through a stale registration.
+        """
+
+        latest = self.pool.store.latest_heartbeat(worker_id)
+        sequence = 1 if latest is None else latest.sequence + 1
+        self.pool.heartbeat_local_worker(worker_id, sequence=sequence)
+
+    def refresh_owned_local_worker_heartbeat(self, worker_id: str) -> None:
+        """Prove the API-owned in-process worker is alive before settlement.
+
+        Subagent execution can legitimately exceed the heartbeat lost window.
+        This refresh is deliberately narrower than registration: it may only
+        touch the default local worker generation attested to this exact API
+        process, and cannot revive a replaced or external worker identity.
+        """
+
+        worker = self.pool.store.require_worker(worker_id)
+        expected_identity = f"local-pid-{os.getpid()}"
+        owned = (
+            worker.location.value == "local"
+            and worker.metadata.get("default_api_worker") is True
+            and worker.process_identity == expected_identity
+            and worker.endpoint == f"local://pid/{os.getpid()}/{worker_id}"
+        )
+        if not owned:
+            # A durable registration can outlive the API process that created
+            # it, leaving a stale process identity.  This process is the
+            # legitimate owner of an API-local worker, so take ownership by
+            # re-registering rather than reviving the old generation or failing
+            # the settlement that depends on this heartbeat.
+            if (
+                worker.location.value == "local"
+                and worker.metadata.get("default_api_worker") is True
+            ):
+                self.ensure_default_local_worker(
+                    worker_id=worker_id,
+                    replace_generation=True,
+                )
+                return
+            raise RuntimeError(
+                "local worker heartbeat refresh rejected a non-owned process "
+                f"identity: {worker_id}"
+            )
+        self._heartbeat_local(worker_id)
+
+    def _refresh_owned_local_lease_worker(self, lease: Any) -> None:
+        """Renew an active lease only when this API process owns its worker."""
+
+        worker = self.pool.store.require_worker(lease.worker_id)
+        if (
+            worker.location.value == "local"
+            and worker.metadata.get("default_api_worker") is True
+        ):
+            self.refresh_owned_local_worker_heartbeat(worker.worker_id)
+
+    def ensure_task_graph(self, state: TaskState) -> str:
+        graph_id_value = str(state.metadata.get("dynamic_graph_id") or f"graph:{state.task_id}")
+        try:
+            self.graph_custody.current(graph_id_value)
+            return graph_id_value
+        except KeyError:
+            pass
+        snapshot = self.graph_custody.create(
+            graph_id_value=graph_id_value,
+            run_id=state.run_id,
+            metadata={
+                "logical_task_id": state.task_id,
+                "logical_task_owner": "typescript.AgentTaskRuntime",
+                "source_graph_version": str(state.metadata.get("graph_version") or ""),
+            },
+        )
+        builder = GraphDeltaBuilder(
+            snapshot,
+            branch_id="api-task-bootstrap",
+            actor_id="task-api",
+            causation_id=f"task-created:{state.task_id}",
+            idempotency_key=f"bootstrap:{state.task_id}",
+        )
+        node_ids = set(state.plan_nodes)
+        default_worker = self.pool.store.get_worker("local-code-worker")
+        if default_worker is None or not default_worker.accepting_leases:
+            # Strongest auto-run tasks do not create the provisional local
+            # CodeWorker generation.  At this point the production composition
+            # root has already reconciled its physical workers, so bind the
+            # precompiled logical graph to a truthful registered identity.
+            # Keep the historical local worker preference for non-auto tasks.
+            candidates = tuple(
+                sorted(
+                    (
+                        item
+                        for item in self.pool.store.list_workers()
+                        if item.accepting_leases
+                        and self.pool.store.latest_manifest(item.worker_id)
+                        is not None
+                    ),
+                    key=lambda item: (
+                        item.worker_id != "provider-code-worker",
+                        item.worker_id,
+                    ),
+                )
+            )
+            default_worker = candidates[0] if candidates else None
+        default_manifest = (
+            self.pool.store.latest_manifest(default_worker.worker_id)
+            if default_worker is not None
+            else None
+        )
+        for node in state.plan_nodes.values():
+            builder.add_node(
+                GraphNode(
+                    node_id=node.node_id,
+                    role=str(node.metadata.get("stage") or "task"),
+                    capabilities=tuple(node.constraints.required_tools or node.constraints.allowed_tools or ("agent_task",)),
+                    dependencies=tuple(item for item in node.depends_on if item in node_ids),
+                    state=NodeExecutionState.SUCCEEDED if str(node.status) == "completed" else NodeExecutionState.PLANNED,
+                    logical_task_id=state.task_id,
+                    workspace_ref=str(state.metadata.get("workspace_ref") or ""),
+                    artifact_refs=tuple(item.artifact_id for item in node.artifact_refs),
+                    metadata={
+                        "plan_node_projection": True,
+                        "stage": str(node.metadata.get("stage") or ""),
+                        "worker_id": (
+                            default_worker.worker_id
+                            if default_worker is not None
+                            else ""
+                        ),
+                        "arg_binding_id": (
+                            f"worker:{default_worker.worker_id}:"
+                            f"{default_manifest.digest[:16]}"
+                            if default_worker is not None
+                            and default_manifest is not None
+                            else ""
+                        ),
+                    },
+                )
+            )
+        for node in state.plan_nodes.values():
+            for dependency in node.depends_on:
+                if dependency not in node_ids:
+                    continue
+                builder.add_edge(
+                    GraphEdge(
+                        edge_id=f"edge:{dependency}:{node.node_id}",
+                        source_node_id=dependency,
+                        target_node_id=node.node_id,
+                        relation="depends_on",
+                    )
+                )
+        result = self.graph_custody.commit(builder.build())
+        if not result.receipt.committed:
+            raise ValueError("task dynamic graph bootstrap conflicted")
+        state.metadata["dynamic_graph_id"] = graph_id_value
+        state.metadata["dynamic_graph_ref"] = self.topology.version_ref(graph_id_value).to_dict()
+        return graph_id_value
+
+    def acquire_for_task(
+        self,
+        state: TaskState,
+        *,
+        payload: Mapping[str, Any] | None = None,
+    ):
+        options = dict(payload or {})
+        self.ensure_default_local_worker()
+        graph_id_value = self.ensure_task_graph(state)
+        locations = tuple(
+            WorkerLocation(str(item))
+            for item in options.get("locations") or (WorkerLocation.LOCAL.value,)
+        )
+        requirement = CapabilityRequirement(
+            required=tuple(str(item) for item in options.get("required_capabilities") or ("agent_task",)),
+            tool_ids=tuple(str(item) for item in options.get("tool_ids") or ()),
+            backend_kinds=tuple(str(item) for item in options.get("backend_kinds") or ()),
+            locations=locations,
+            resources=ResourceVector.from_dict(
+                options.get("resources")
+                if isinstance(options.get("resources"), Mapping)
+                else {"process_slots": 1, "memory_mb": 64}
+            ),
+        )
+        causal_binding = (
+            dict(options.get("causal_binding") or {})
+            if isinstance(options.get("causal_binding"), Mapping)
+            else {}
+        )
+        required_causal_fields = {
+            "permission_receipt_id",
+            "permission_receipt_digest",
+            "resource_decision_id",
+            "operator_candidate_set_digest",
+            "topology_commit_id",
+        }
+        if causal_binding and (
+            not required_causal_fields.issubset(causal_binding)
+            or any(
+                not str(causal_binding.get(item) or "")
+                for item in required_causal_fields
+            )
+        ):
+            raise ValueError(
+                "operator placement causal binding is incomplete"
+            )
+        latest_attempt = self.pool.store.latest_attempt(state.task_id)
+        replay_attempt = (
+            latest_attempt is not None
+            and not latest_attempt.terminal
+            and latest_attempt.state is not AttemptState.LOST
+        )
+        attempt_number = (
+            latest_attempt.attempt_number
+            if replay_attempt
+            else (1 if latest_attempt is None else latest_attempt.attempt_number + 1)
+        )
+        acquisition = None
+        bound = None
+        execute_node_id = ""
+        try:
+            acquisition = self.pool.acquire_task(
+                task_id=state.task_id,
+                run_id=state.run_id,
+                owner_session_id=str(
+                    state.metadata.get("query_session_id")
+                    or f"task:{state.task_id}"
+                ),
+                requirement=requirement,
+                preferred_worker_ids=tuple(
+                    str(item)
+                    for item in options.get("preferred_worker_ids") or ()
+                ),
+                excluded_worker_ids=tuple(
+                    str(item)
+                    for item in options.get("excluded_worker_ids") or ()
+                ),
+                attempt_number=attempt_number,
+                ttl_seconds=float(options.get("ttl_seconds") or 3600.0),
+                idempotency_key=str(
+                    options.get("idempotency_key")
+                    or f"task-lease:{state.task_id}:{attempt_number}"
+                ),
+                metadata={
+                    "api_task_flow": True,
+                    "dynamic_graph_id": graph_id_value,
+                    "operator_placement_causality": causal_binding,
+                },
+            )
+            execute_node_id = next(
+                (
+                    node.node_id
+                    for node in state.plan_nodes.values()
+                    if str(node.metadata.get("stage") or "") == "execute"
+                ),
+                state.root_node_id,
+            )
+            bound = self._bind_task_graph_acquisition(
+                graph_id_value,
+                execute_node_id,
+                physical_attempt_ref=acquisition.attempt.attempt_id,
+                worker_lease_ref=acquisition.lease.lease_id,
+                backend_route_ref=acquisition.lease.backend_id,
+                worker_id=acquisition.worker.worker_id,
+                worker_manifest_digest=acquisition.manifest.digest,
+                actor_id="worker-pool-api",
+                causation_id=acquisition.lease.lease_id,
+            )
+            if not bound.receipt.committed:
+                raise RuntimeError(
+                    "dynamic graph physical attempt binding was not committed"
+                )
+            graph_ref = {
+                "graph_id": bound.snapshot.graph_id,
+                "run_id": bound.snapshot.run_id,
+                "revision": bound.snapshot.revision,
+                "signature": bound.snapshot.signature,
+                "commit_id": bound.snapshot.commit_id,
+            }
+            state.metadata["worker_pool"] = {
+                "attempt_id": acquisition.attempt.attempt_id,
+                "attempt_number": acquisition.attempt.attempt_number,
+                "lease_id": acquisition.lease.lease_id,
+                "worker_id": acquisition.worker.worker_id,
+                "backend_id": acquisition.lease.backend_id,
+                "graph_ref": graph_ref,
+                "graph_commit": bound.receipt.to_dict(),
+                "operator_placement_causality": causal_binding,
+            }
+        except Exception as error:
+            if acquisition is not None:
+                compensation_errors: list[Exception] = []
+                try:
+                    self.pool.leases.cancel(
+                        acquisition.lease.lease_id,
+                        reason=(
+                            "worker-pool acquisition projection failed: "
+                            f"{type(error).__name__}"
+                        ),
+                    )
+                except Exception as compensation_error:
+                    compensation_errors.append(compensation_error)
+                if bound is not None and bound.receipt.committed:
+                    try:
+                        graph_compensation = self.topology.cancel_physical_attempt(
+                            graph_id_value,
+                            execute_node_id,
+                            physical_attempt_ref=acquisition.attempt.attempt_id,
+                            worker_lease_ref=acquisition.lease.lease_id,
+                            reason=(
+                                "worker-pool acquisition projection failed: "
+                                f"{type(error).__name__}"
+                            ),
+                            actor_id="worker-pool-api",
+                            causation_id=f"cancel:{acquisition.lease.lease_id}",
+                        )
+                        if not graph_compensation.receipt.committed:
+                            raise RuntimeError(
+                                "dynamic graph physical attempt compensation "
+                                "was not committed"
+                            )
+                    except Exception as compensation_error:
+                        compensation_errors.append(compensation_error)
+                if compensation_errors:
+                    raise ExceptionGroup(
+                        "worker-pool acquisition compensation failed",
+                        (error, *compensation_errors),
+                    ) from error
+            raise
+        return acquisition
+
+    def _bind_task_graph_acquisition(
+        self,
+        graph_id_value: str,
+        execute_node_id: str,
+        *,
+        physical_attempt_ref: str,
+        worker_lease_ref: str,
+        backend_route_ref: str,
+        worker_id: str,
+        worker_manifest_digest: str,
+        actor_id: str,
+        causation_id: str,
+    ):
+        """Atomically move logical graph custody onto the acquired worker.
+
+        ARG consumes the worker identity stored on every precompiled logical
+        node, while physical execution consumes the lease bound to the execute
+        node.  Updating only the latter left recovery successors paired with
+        stale predecessor identities and production correctly failed closed.
+        """
+
+        snapshot = self.graph_custody.current(graph_id_value)
+        execute_node = snapshot.node_map.get(execute_node_id)
+        if execute_node is None:
+            raise KeyError(execute_node_id)
+        builder = GraphDeltaBuilder(
+            snapshot,
+            branch_id="worker-acquisition-binding",
+            actor_id=actor_id,
+            causation_id=causation_id,
+            idempotency_key=(
+                f"worker-acquisition:{physical_attempt_ref}:"
+                f"{worker_lease_ref}"
+            ),
+        )
+        binding_id = (
+            f"worker:{worker_id}:{worker_manifest_digest[:16]}"
+        )
+        for node in snapshot.nodes:
+            if node.metadata.get("plan_node_projection") is not True:
+                continue
+            metadata = {
+                **dict(node.metadata),
+                "worker_id": worker_id,
+                "arg_binding_id": binding_id,
+                "worker_manifest_digest": worker_manifest_digest,
+            }
+            changes: dict[str, Any] = {"metadata": metadata}
+            if node.node_id == execute_node_id:
+                changes.update(
+                    {
+                        "physical_attempt_ref": physical_attempt_ref,
+                        "worker_lease_ref": worker_lease_ref,
+                        "backend_route_ref": backend_route_ref,
+                        "state": NodeExecutionState.LEASED,
+                    }
+                )
+                metadata.update(
+                    {
+                        "physical_attempt_owner": "WorkerLeaseManager",
+                        "lease_reference_only": True,
+                    }
+                )
+            builder.read_node(node.node_id)
+            builder.replace_node(
+                node.revise(**changes),
+                expected_revision=node.revision,
+            )
+        return self.graph_custody.commit(builder.build())
+
+    def cancel_task_graph_binding(
+        self,
+        state: TaskState,
+        *,
+        reason: str,
+        actor_id: str,
+        causation_id: str,
+        outcome_ref: str = "",
+    ) -> Mapping[str, Any] | None:
+        """Cancel the exact canonical graph binding after its lease closes."""
+
+        return self._terminalize_task_graph_binding(
+            state,
+            terminal_state=NodeExecutionState.CANCELLED,
+            reason=reason,
+            outcome_ref=outcome_ref,
+            actor_id=actor_id,
+            causation_id=causation_id,
+        )
+
+    def complete_task_graph_binding(
+        self,
+        state: TaskState,
+        *,
+        succeeded: bool,
+        reason: str,
+        outcome_ref: str,
+        actor_id: str,
+        causation_id: str,
+    ) -> Mapping[str, Any] | None:
+        """Commit a normal success or failure for the exact graph binding."""
+
+        return self._terminalize_task_graph_binding(
+            state,
+            terminal_state=(
+                NodeExecutionState.SUCCEEDED
+                if succeeded
+                else NodeExecutionState.FAILED
+            ),
+            reason=reason,
+            outcome_ref=outcome_ref,
+            actor_id=actor_id,
+            causation_id=causation_id,
+        )
+
+    def _terminalize_task_graph_binding(
+        self,
+        state: TaskState,
+        *,
+        terminal_state: NodeExecutionState,
+        reason: str,
+        outcome_ref: str,
+        actor_id: str,
+        causation_id: str,
+    ) -> Mapping[str, Any] | None:
+        """Make one exact canonical graph binding durably terminal."""
+
+        def record(receipt: Mapping[str, Any]) -> Mapping[str, Any]:
+            normalized = dict(receipt)
+            history = [
+                dict(item)
+                for item in state.metadata.get(
+                    "worker_pool_graph_terminal_history",
+                    (),
+                )
+                if isinstance(item, Mapping)
+            ]
+            identity = (
+                str(normalized.get("attempt_id") or ""),
+                str(normalized.get("lease_id") or ""),
+                str(normalized.get("state") or ""),
+            )
+            if not any(
+                (
+                    str(item.get("attempt_id") or ""),
+                    str(item.get("lease_id") or ""),
+                    str(item.get("state") or ""),
+                )
+                == identity
+                for item in history
+            ):
+                history.append(normalized)
+            state.metadata["worker_pool_graph_terminal_history"] = history
+            state.metadata["worker_pool_graph_terminal"] = normalized
+            return normalized
+
+        projection = state.metadata.get("worker_pool")
+        if not isinstance(projection, Mapping):
+            return None
+        graph_id_value = str(state.metadata.get("dynamic_graph_id") or "")
+        attempt_id = str(projection.get("attempt_id") or "")
+        lease_id = str(projection.get("lease_id") or "")
+        if not graph_id_value or not attempt_id or not lease_id:
+            return None
+        execute_node_id = next(
+            (
+                node.node_id
+                for node in state.plan_nodes.values()
+                if str(node.metadata.get("stage") or "") == "execute"
+            ),
+            state.root_node_id,
+        )
+        snapshot = self.graph_custody.current(graph_id_value)
+        node = snapshot.node_map.get(execute_node_id)
+        if node is None:
+            raise RuntimeError("dynamic graph execute node is unavailable")
+        if (
+            node.physical_attempt_ref != attempt_id
+            or node.worker_lease_ref != lease_id
+        ):
+            # Name both sides of the divergence.  A bare fence message cannot
+            # say whether the graph node or the TaskState projection is stale,
+            # which is the only question worth answering here.
+            raise RuntimeError(
+                "dynamic graph physical binding terminalization was fenced: "
+                f"node={execute_node_id} "
+                f"graph_attempt={node.physical_attempt_ref or '[unbound]'} "
+                f"graph_lease={node.worker_lease_ref or '[unbound]'} "
+                f"projection_attempt={attempt_id} "
+                f"projection_lease={lease_id} "
+                f"graph_revision={snapshot.revision}"
+            )
+        if node.terminal:
+            if node.state is not terminal_state:
+                raise RuntimeError(
+                    "dynamic graph terminal state conflicts with the "
+                    "canonical WorkerPool outcome"
+                )
+            committed_outcome_ref = str(
+                node.metadata.get("physical_attempt_outcome_ref") or ""
+            )
+            if committed_outcome_ref != str(outcome_ref or ""):
+                raise RuntimeError(
+                    "dynamic graph terminal outcome receipt conflicts with "
+                    "the canonical WorkerPool receipt"
+                )
+            return record({
+                "schema": "zyra.graph-physical-binding-terminal/v1",
+                "committed": True,
+                "replayed": True,
+                "graph_id": graph_id_value,
+                "node_id": execute_node_id,
+                "attempt_id": attempt_id,
+                "lease_id": lease_id,
+                "state": node.state.value,
+            })
+        if terminal_state is NodeExecutionState.CANCELLED:
+            result = self.topology.cancel_physical_attempt(
+                graph_id_value,
+                execute_node_id,
+                physical_attempt_ref=attempt_id,
+                worker_lease_ref=lease_id,
+                reason=reason,
+                outcome_ref=outcome_ref,
+                actor_id=actor_id,
+                causation_id=causation_id,
+            )
+        else:
+            result = self.topology.complete_physical_attempt(
+                graph_id_value,
+                execute_node_id,
+                physical_attempt_ref=attempt_id,
+                worker_lease_ref=lease_id,
+                succeeded=terminal_state is NodeExecutionState.SUCCEEDED,
+                reason=reason,
+                outcome_ref=outcome_ref,
+                actor_id=actor_id,
+                causation_id=causation_id,
+            )
+        if not result.receipt.committed:
+            raise RuntimeError(
+                "dynamic graph physical binding terminalization was not committed"
+            )
+        receipt = {
+            "schema": "zyra.graph-physical-binding-terminal/v1",
+            "committed": True,
+            "replayed": False,
+            "graph_id": graph_id_value,
+            "node_id": execute_node_id,
+            "attempt_id": attempt_id,
+            "lease_id": lease_id,
+            "state": result.snapshot.node_map[execute_node_id].state.value,
+            "graph_commit": result.receipt.to_dict(),
+        }
+        return record(receipt)
+
+    def reconcile_task_graph_binding(
+        self,
+        state: TaskState,
+        *,
+        reason: str,
+        actor_id: str,
+        causation_id: str,
+    ) -> Mapping[str, Any] | None:
+        """Replay the terminal WorkerPool outcome into GraphStateCustody."""
+
+        projection = state.metadata.get("worker_pool")
+        if not isinstance(projection, Mapping):
+            return None
+        lease_id = str(projection.get("lease_id") or "")
+        attempt_id = str(projection.get("attempt_id") or "")
+        lease = self.pool.store.get_lease(lease_id) if lease_id else None
+        if lease is not None and not lease.terminal:
+            return None
+        execution_receipt = next(
+            (
+                item
+                for item in self.pool.store.receipts_for_task(state.task_id)
+                if item.attempt_id == attempt_id
+                and item.lease_id == lease_id
+            ),
+            None,
+        )
+        if execution_receipt is not None:
+            if execution_receipt.outcome in {
+                ExecutionOutcome.CANCELLED,
+                ExecutionOutcome.FENCED,
+            }:
+                return self.cancel_task_graph_binding(
+                    state,
+                    reason=reason,
+                    actor_id=actor_id,
+                    causation_id=causation_id,
+                    outcome_ref=execution_receipt.receipt_id,
+                )
+            return self.complete_task_graph_binding(
+                state,
+                succeeded=(
+                    execution_receipt.outcome is ExecutionOutcome.SUCCEEDED
+                ),
+                reason=reason,
+                outcome_ref=execution_receipt.receipt_id,
+                actor_id=actor_id,
+                causation_id=causation_id,
+            )
+        return self.cancel_task_graph_binding(
+            state,
+            reason=reason,
+            actor_id=actor_id,
+            causation_id=causation_id,
+        )
+
+    def recover_task_acquisition(
+        self,
+        state: TaskState,
+        *,
+        idempotency_key: str,
+    ) -> Mapping[str, Any] | None:
+        """Recover a lease+graph commit lost before TaskState checkpointing."""
+
+        if not idempotency_key:
+            return None
+        before = state.metadata.get("worker_pool")
+        if not isinstance(before, Mapping):
+            return None
+        matches = tuple(
+            lease
+            for lease in self.pool.store.list_leases(task_id=state.task_id)
+            if lease.idempotency_key == idempotency_key
+            and lease.run_id == state.run_id
+        )
+        if not matches:
+            return None
+        if len(matches) != 1:
+            raise RuntimeError(
+                "worker acquisition idempotency key resolved ambiguously"
+            )
+        lease = matches[0]
+        if lease.lease_id == str(before.get("lease_id") or ""):
+            return None
+        attempt = self.pool.store.require_attempt(lease.attempt_id)
+        projected_attempt_id = str(before.get("attempt_id") or "")
+        if (
+            attempt.task_id != state.task_id
+            or attempt.run_id != state.run_id
+            or not self._attempt_descends_from(
+                attempt_id=attempt.attempt_id,
+                ancestor_attempt_id=projected_attempt_id,
+                task_id=state.task_id,
+                run_id=state.run_id,
+            )
+        ):
+            raise RuntimeError(
+                "recovered worker acquisition lineage does not match task state"
+            )
+        worker = self.pool.store.require_worker(lease.worker_id)
+        graph_id_value = str(state.metadata.get("dynamic_graph_id") or "")
+        if not graph_id_value:
+            raise RuntimeError(
+                "recovered worker acquisition lost its dynamic graph identity"
+            )
+        execute_node_id = next(
+            (
+                node.node_id
+                for node in state.plan_nodes.values()
+                if str(node.metadata.get("stage") or "") == "execute"
+            ),
+            state.root_node_id,
+        )
+        snapshot = self.graph_custody.current(graph_id_value)
+        node = snapshot.node_map.get(execute_node_id)
+        if node is None:
+            raise RuntimeError("recovered worker acquisition node is unavailable")
+        graph_commit: Mapping[str, Any]
+        projection_applied = True
+        if (
+            node.physical_attempt_ref == attempt.attempt_id
+            and node.worker_lease_ref == lease.lease_id
+        ):
+            graph_commit = {
+                "schema": "zyra.graph-binding-recovery/v1",
+                "committed": True,
+                "replayed": True,
+                "commit_id": snapshot.commit_id,
+                "revision": snapshot.revision,
+                "signature": snapshot.signature,
+            }
+        elif (
+            node.terminal
+            and node.physical_attempt_ref
+            == str(before.get("attempt_id") or "")
+            and node.worker_lease_ref == str(before.get("lease_id") or "")
+        ):
+            if lease.terminal:
+                # The successor lease never reached GraphStateCustody.  Keep
+                # TaskState on its already-terminal prior projection, but
+                # return the canonical terminal successor so the caller can
+                # persist an idempotent rejected route for this key.
+                projection_applied = False
+                graph_commit = {
+                    "schema": "zyra.graph-binding-recovery/v1",
+                    "committed": False,
+                    "replayed": True,
+                    "binding_absent": True,
+                    "commit_id": snapshot.commit_id,
+                    "revision": snapshot.revision,
+                    "signature": snapshot.signature,
+                }
+            else:
+                manifest = self.pool.store.latest_manifest(worker.worker_id)
+                if manifest is None:
+                    raise RuntimeError(
+                        "recovered worker acquisition manifest is unavailable"
+                    )
+                rebound = self._bind_task_graph_acquisition(
+                    graph_id_value,
+                    execute_node_id,
+                    physical_attempt_ref=attempt.attempt_id,
+                    worker_lease_ref=lease.lease_id,
+                    backend_route_ref=lease.backend_id,
+                    worker_id=worker.worker_id,
+                    worker_manifest_digest=manifest.digest,
+                    actor_id="worker-pool-api",
+                    causation_id=lease.lease_id,
+                )
+                if not rebound.receipt.committed:
+                    raise RuntimeError(
+                        "recovered worker acquisition graph binding was rejected"
+                    )
+                snapshot = rebound.snapshot
+                graph_commit = rebound.receipt.to_dict()
+        else:
+            raise RuntimeError(
+                "recovered worker acquisition conflicts with canonical graph"
+            )
+        graph_ref = {
+            "graph_id": snapshot.graph_id,
+            "run_id": snapshot.run_id,
+            "revision": snapshot.revision,
+            "signature": snapshot.signature,
+            "commit_id": snapshot.commit_id,
+        }
+        after = {
+            "attempt_id": attempt.attempt_id,
+            "attempt_number": attempt.attempt_number,
+            "lease_id": lease.lease_id,
+            "worker_id": worker.worker_id,
+            "backend_id": lease.backend_id,
+            "graph_ref": graph_ref,
+            "graph_commit": dict(graph_commit),
+            "operator_placement_causality": dict(
+                lease.metadata.get("operator_placement_causality") or {}
+            ),
+        }
+        if projection_applied:
+            state.metadata["worker_pool"] = after
+            if lease.terminal:
+                self.reconcile_task_graph_binding(
+                    state,
+                    reason=(
+                        "recovered successor lease became terminal before "
+                        "TaskState checkpoint"
+                    ),
+                    actor_id="worker-pool-recovery",
+                    causation_id=(
+                        f"worker-pool-recovery-terminal:{lease.lease_id}"
+                    ),
+                )
+        else:
+            after = dict(before)
+        return {
+            "before": dict(before),
+            "after": dict(after),
+            "lease": lease,
+            "attempt": attempt,
+            "worker": worker,
+            "terminal": lease.terminal,
+            "projection_applied": projection_applied,
+        }
+
+    def _attempt_descends_from(
+        self,
+        *,
+        attempt_id: str,
+        ancestor_attempt_id: str,
+        task_id: str,
+        run_id: str,
+    ) -> bool:
+        """Prove that one physical attempt is a later member of a known lineage.
+
+        GraphStateCustody can durably advance through several recovery attempts
+        before the older TaskState projection is checkpointed.  Recovery must
+        therefore accept any verified descendant, not only a direct child.  A
+        decreasing attempt number bounds the walk and rejects cycles, siblings,
+        missing ancestors, and cross-task/run references without trusting the
+        graph binding alone.
+        """
+
+        if not attempt_id or not ancestor_attempt_id:
+            return False
+        current = self.pool.store.get_attempt(attempt_id)
+        if current is None:
+            return False
+        seen: set[str] = set()
+        remaining = max(1, int(current.attempt_number))
+        while remaining > 0:
+            if (
+                current.attempt_id in seen
+                or current.task_id != task_id
+                or current.run_id != run_id
+            ):
+                return False
+            seen.add(current.attempt_id)
+            parent_id = str(current.parent_attempt_id or "")
+            if not parent_id or parent_id in seen:
+                return False
+            parent = self.pool.store.get_attempt(parent_id)
+            if (
+                parent is None
+                or parent.task_id != task_id
+                or parent.run_id != run_id
+                or parent.attempt_number >= current.attempt_number
+            ):
+                return False
+            if parent.attempt_id == ancestor_attempt_id:
+                return True
+            current = parent
+            remaining -= 1
+        return False
+
+    def recover_task_acquisition_from_graph(
+        self,
+        state: TaskState,
+    ) -> Mapping[str, Any] | None:
+        """Repair TaskState when GraphStateCustody committed the successor first."""
+
+        projection = state.metadata.get("worker_pool")
+        if not isinstance(projection, Mapping):
+            return None
+        graph_id_value = str(state.metadata.get("dynamic_graph_id") or "")
+        if not graph_id_value:
+            return None
+        execute_node_id = next(
+            (
+                node.node_id
+                for node in state.plan_nodes.values()
+                if str(node.metadata.get("stage") or "") == "execute"
+            ),
+            state.root_node_id,
+        )
+        node = self.graph_custody.current(graph_id_value).node_map.get(execute_node_id)
+        if node is None:
+            raise RuntimeError("canonical graph execute node is unavailable")
+        if (
+            node.physical_attempt_ref == str(projection.get("attempt_id") or "")
+            and node.worker_lease_ref == str(projection.get("lease_id") or "")
+        ):
+            return None
+        if not node.physical_attempt_ref or not node.worker_lease_ref:
+            return None
+        lease = self.pool.store.get_lease(node.worker_lease_ref)
+        if lease is None or lease.attempt_id != node.physical_attempt_ref:
+            raise RuntimeError(
+                "canonical graph physical binding has no matching WorkerPool lease"
+            )
+        recovered = self.recover_task_acquisition(
+            state,
+            idempotency_key=lease.idempotency_key,
+        )
+        if recovered is None or not bool(recovered.get("projection_applied")):
+            raise RuntimeError(
+                "canonical graph successor could not be projected into TaskState"
+            )
+        return recovered
+
+    def _verified_terminal_receipt_enrichment(
+        self,
+        state: TaskState,
+        *,
+        lease: Any,
+        execution_receipt: Any,
+        current: Mapping[str, Any],
+    ) -> Mapping[str, Any]:
+        """Admit only enrichment bound to the canonical execution receipt."""
+
+        canonical_metadata = dict(execution_receipt.metadata or {})
+        canonical_policy_artifact = canonical_metadata.get(
+            "physical_dispatch_policy_artifact_ref"
+        )
+        policy_artifact: StableArtifactRef | None = None
+        artifact_dispatch: PhysicalDispatchReceipt | None = None
+        if canonical_policy_artifact:
+            if not isinstance(canonical_policy_artifact, Mapping):
+                raise RuntimeError(
+                    "canonical physical dispatch policy artifact ref is invalid"
+                )
+            policy_artifact = StableArtifactRef.from_mapping(
+                canonical_policy_artifact
+            )
+            artifact_dispatch = self._read_terminal_dispatch_artifact(
+                state,
+                policy_artifact,
+            )
+
+        raw_dispatch = current.get("physical_dispatch_receipt")
+        raw_validation = current.get("physical_dispatch_validation")
+        if raw_dispatch is None and raw_validation is None:
+            if artifact_dispatch is None:
+                return {}
+            dispatch = artifact_dispatch
+            validation = PhysicalDispatchReceiptValidator().validate(
+                dispatch
+            ).to_dict()
+        else:
+            if not isinstance(raw_dispatch, Mapping) or not isinstance(
+                raw_validation,
+                Mapping,
+            ):
+                raise RuntimeError(
+                    "terminal physical dispatch enrichment is incomplete"
+                )
+            dispatch = PhysicalDispatchReceipt.from_dict(raw_dispatch)
+            validation = PhysicalDispatchReceiptValidator().validate(
+                dispatch
+            ).to_dict()
+            if (
+                artifact_dispatch is not None
+                and dispatch.to_dict() != artifact_dispatch.to_dict()
+            ):
+                raise RuntimeError(
+                    "terminal physical dispatch receipt failed canonical "
+                    "binding: artifact custody conflict"
+                )
+        binding = dict(
+            state.metadata.get("operator_placement_binding") or {}
+        )
+        identity = dict(dispatch.physical_identity)
+        signals = dict(dispatch.input_signals)
+        binding_unsigned = dict(binding)
+        binding_digest = str(
+            binding_unsigned.pop("binding_digest", "")
+        )
+        checks = {
+            "validation_exact": (
+                raw_validation is None
+                or dict(raw_validation) == validation
+            ),
+            "real_gate_closed": validation.get("real_gate_closed") is True,
+            "canonical_digest": (
+                dispatch.digest
+                == str(
+                    canonical_metadata.get(
+                        "physical_dispatch_receipt_digest"
+                    )
+                    or ""
+                )
+            ),
+            "lease_exact": dispatch.lease_id == lease.lease_id,
+            "attempt_exact": (
+                dispatch.physical_attempt_id == lease.attempt_id
+            ),
+            "worker_exact": (
+                str(signals.get("worker_id") or "")
+                == str(binding.get("worker_id") or "")
+                == lease.worker_id
+            ),
+            "binding_digest_exact": (
+                bool(binding_digest)
+                and binding_digest == canonical_digest(binding_unsigned)
+            ),
+            "placement_exact": (
+                dispatch.placement_decision_id
+                == str(binding.get("resource_decision_id") or "")
+            ),
+            "binding_lease_exact": (
+                str(binding.get("lease_id") or "") == lease.lease_id
+            ),
+            "binding_attempt_exact": (
+                str(binding.get("attempt_id") or "")
+                == lease.attempt_id
+            ),
+            "process_exact": (
+                str(identity.get("failure_boundary_id") or "")
+                == str(binding.get("worker_process_identity") or "")
+            ),
+            "endpoint_exact": (
+                str(identity.get("endpoint") or "")
+                == str(binding.get("worker_endpoint") or "")
+            ),
+            "manifest_exact": (
+                dispatch.worker_manifest_ref.digest
+                == str(binding.get("worker_manifest_digest") or "")
+            ),
+        }
+        failed = sorted(name for name, passed in checks.items() if not passed)
+        if failed:
+            raise RuntimeError(
+                "terminal physical dispatch enrichment failed canonical "
+                "binding: " + ",".join(failed)
+            )
+        result: dict[str, Any] = {
+            "physical_dispatch_receipt": dispatch.to_dict(),
+            "physical_dispatch_validation": validation,
+        }
+        raw_policy_artifact = current.get(
+            "physical_dispatch_policy_artifact_ref"
+        )
+        if policy_artifact is not None:
+            if policy_artifact.digest != canonical_digest(
+                dispatch.to_dict()
+            ):
+                raise RuntimeError(
+                    "terminal physical dispatch policy artifact digest "
+                    "conflicts with the verified receipt"
+                )
+            if (
+                raw_policy_artifact is not None
+                and (
+                    not isinstance(raw_policy_artifact, Mapping)
+                    or dict(raw_policy_artifact)
+                    != dict(canonical_policy_artifact)
+                )
+            ):
+                raise RuntimeError(
+                    "terminal physical dispatch policy artifact ref "
+                    "conflicts with canonical execution custody"
+                )
+            result["physical_dispatch_policy_artifact_ref"] = (
+                policy_artifact.to_dict()
+            )
+        elif raw_policy_artifact is not None:
+            raise RuntimeError(
+                "terminal physical dispatch policy artifact ref has no "
+                "canonical execution custody"
+            )
+        current_memory = current.get("memory_mutation_receipt")
+        canonical_memory = canonical_metadata.get(
+            "memory_mutation_receipt"
+        )
+        if current_memory is not None:
+            if (
+                not isinstance(current_memory, Mapping)
+                or not isinstance(canonical_memory, Mapping)
+                or dict(current_memory) != dict(canonical_memory)
+            ):
+                raise RuntimeError(
+                    "terminal memory mutation receipt conflicts with the "
+                    "canonical execution receipt"
+                )
+            result["memory_mutation_receipt"] = dict(canonical_memory)
+        return result
+
+    def _read_terminal_dispatch_artifact(
+        self,
+        state: TaskState,
+        policy_artifact: StableArtifactRef,
+    ) -> PhysicalDispatchReceipt:
+        """Read a canonical dispatch receipt through ArtifactStore custody."""
+
+        if self.artifact_store is None:
+            raise RuntimeError(
+                "terminal physical dispatch artifact owner is unavailable"
+            )
+        if policy_artifact.media_type not in {
+            "application/json",
+            "application/ld+json",
+        }:
+            raise RuntimeError(
+                "terminal physical dispatch artifact media type is invalid"
+            )
+        artifact = ArtifactRef(
+            artifact_id=policy_artifact.ref_id,
+            kind=ArtifactKind.STRUCTURED_DATA,
+            uri=policy_artifact.uri,
+            title="canonical physical dispatch receipt",
+            metadata={
+                "sha256": policy_artifact.digest,
+                "revision": f"sha256:{policy_artifact.digest}",
+                "media_type": policy_artifact.media_type,
+            },
+        )
+        try:
+            resolver = getattr(self.artifact_store, "resolve_path", None)
+            root = getattr(self.artifact_store, "root", None)
+            if callable(resolver) and root is not None:
+                resolved = Path(resolver(artifact)).resolve()
+                expected_directory = (
+                    Path(root).resolve() / state.run_id / state.task_id
+                ).resolve()
+                if (
+                    resolved.parent != expected_directory
+                    or resolved.stem != policy_artifact.ref_id
+                ):
+                    raise ValueError(
+                        "artifact URI is outside the canonical run/task custody"
+                    )
+            observed = self.artifact_store.verify(
+                artifact,
+                expected_revision=f"sha256:{policy_artifact.digest}",
+            )
+            if str(getattr(observed, "sha256", "")) != policy_artifact.digest:
+                raise ValueError(
+                    "observed artifact digest differs from canonical custody"
+                )
+            chunks: list[bytes] = []
+            total = 0
+            for chunk in self.artifact_store.iter_bytes(
+                artifact,
+                expected_revision=f"sha256:{policy_artifact.digest}",
+            ):
+                total += len(chunk)
+                if total > 16 * 1024 * 1024:
+                    raise ValueError(
+                        "physical dispatch artifact exceeds the replay limit"
+                    )
+                chunks.append(bytes(chunk))
+            value = json.loads(b"".join(chunks).decode("utf-8"))
+            if not isinstance(value, Mapping):
+                raise ValueError(
+                    "physical dispatch artifact is not a JSON object"
+                )
+            dispatch = PhysicalDispatchReceipt.from_dict(value)
+            if canonical_digest(dispatch.to_dict()) != policy_artifact.digest:
+                raise ValueError(
+                    "physical dispatch contract differs from artifact digest"
+                )
+            return dispatch
+        except Exception as error:
+            raise RuntimeError(
+                "terminal physical dispatch artifact verification failed"
+            ) from error
+
+    def ensure_task_lease(
+        self,
+        state: TaskState,
+        *,
+        payload: Mapping[str, Any] | None = None,
+    ):
+        """Keep a pending task attached to one valid physical attempt.
+
+        A task may be created with ``auto_run=false`` and resumed after a lease
+        deadline or API restart.  The expired lease is first made terminal and
+        fenced; only then is a successor physical attempt allocated.  The
+        logical 03D task identifier remains unchanged.
+        """
+
+        projection = state.metadata.get("worker_pool")
+        lease = None
+        if isinstance(projection, Mapping):
+            lease = self.pool.store.get_lease(str(projection.get("lease_id") or ""))
+        if lease is not None and not lease.terminal and lease.expired_at():
+            self.pool.leases.expire(lease.lease_id, reason="task resumed after lease deadline")
+            lease = self.pool.store.require_lease(lease.lease_id)
+        if lease is not None and not lease.terminal:
+            self._refresh_owned_local_lease_worker(lease)
+            self.ensure_default_local_worker()
+            return None
+        self.reconcile_task_graph_binding(
+            state,
+            reason="task lease was terminal before rebind",
+            actor_id="worker-pool-rebind",
+            causation_id=(
+                "worker-pool-rebind:"
+                + str(
+                    (projection or {}).get("lease_id")
+                    if isinstance(projection, Mapping)
+                    else "missing"
+                )
+            ),
+        )
+        return self.acquire_for_task(state, payload=payload)
+
+    def finalize_task(
+        self,
+        state: TaskState,
+        *,
+        success: bool,
+        summary: str,
+        event_refs: tuple[str, ...] = (),
+        gateway_receipt_ref: str = "",
+        metadata: Mapping[str, Any] | None = None,
+    ) -> Mapping[str, Any] | None:
+        projection = state.metadata.get("worker_pool")
+        if not isinstance(projection, Mapping):
+            return None
+        lease = self.pool.store.get_lease(str(projection.get("lease_id") or ""))
+        if lease is None:
+            self.reconcile_task_graph_binding(
+                state,
+                reason="task finalization found no physical lease",
+                actor_id="worker-pool-finalize",
+                causation_id=(
+                    "worker-pool-finalize-missing:"
+                    + str(projection.get("lease_id") or "")
+                ),
+            )
+            return None
+        if lease.terminal:
+            existing = next(
+                (
+                    item
+                    for item in self.pool.store.receipts_for_task(state.task_id)
+                    if item.attempt_id == lease.attempt_id
+                    and item.lease_id == lease.lease_id
+                ),
+                None,
+            )
+            self.reconcile_task_graph_binding(
+                state,
+                reason="task finalization replayed a terminal physical lease",
+                actor_id="worker-pool-finalize",
+                causation_id=f"worker-pool-finalize-replay:{lease.lease_id}",
+            )
+            if existing is not None:
+                persisted = existing.to_dict()
+                current = state.metadata.get("worker_pool_receipt")
+                enrichment_source: Mapping[str, Any] = persisted
+                current_matches = (
+                    isinstance(current, Mapping)
+                    and str(current.get("receipt_id") or "")
+                    == str(persisted.get("receipt_id") or "")
+                )
+                if current_matches:
+                    enrichment_source = current
+                placement_binding = state.metadata.get(
+                    "operator_placement_binding"
+                )
+                claimed_enrichment = current_matches and any(
+                    key in enrichment_source
+                    for key in (
+                        "physical_dispatch_receipt",
+                        "physical_dispatch_validation",
+                        "physical_dispatch_policy_artifact_ref",
+                        "memory_mutation_receipt",
+                    )
+                )
+                # A recovery continuation deliberately clears the spent
+                # placement binding before rerouting.  Its historical
+                # terminal WorkerPool receipt remains canonical, but it must
+                # not be promoted to the current generation's physical
+                # dispatch receipt.  Validate strictly whenever TaskState
+                # still claims enrichment or retains the exact binding;
+                # otherwise replay only the un-enriched historical receipt.
+                if claimed_enrichment or (
+                    isinstance(placement_binding, Mapping)
+                    and bool(placement_binding)
+                ):
+                    persisted.update(
+                        self._verified_terminal_receipt_enrichment(
+                            state,
+                            lease=lease,
+                            execution_receipt=existing,
+                            current=enrichment_source,
+                        )
+                    )
+                state.metadata["worker_pool_receipt"] = persisted
+                return persisted
+            return None
+        self._refresh_owned_local_lease_worker(lease)
+        self.pool.leases.start_attempt(
+            lease.lease_id,
+            worker_id=lease.worker_id,
+            fence_token=lease.fence_token,
+            fence_epoch=lease.fence_epoch,
+            backend_dispatch_id=f"task-graph:{state.task_id}",
+        )
+        receipt = self.pool.leases.complete(
+            lease.lease_id,
+            worker_id=lease.worker_id,
+            fence_token=lease.fence_token,
+            fence_epoch=lease.fence_epoch,
+            outcome=ExecutionOutcome.SUCCEEDED if success else ExecutionOutcome.FAILED,
+            summary=summary,
+            artifact_refs=tuple(item.artifact_id for item in state.artifacts),
+            event_refs=tuple(str(item) for item in event_refs if str(item)),
+            gateway_receipt_ref=(
+                gateway_receipt_ref or f"task-graph:{state.task_id}"
+            ),
+            metadata={
+                "default_task_graph": True,
+                **dict(metadata or {}),
+            },
+        )
+        state.metadata["worker_pool_receipt"] = receipt.to_dict()
+        self.complete_task_graph_binding(
+            state,
+            succeeded=success,
+            reason=summary,
+            outcome_ref=receipt.receipt_id,
+            actor_id="worker-pool-finalize",
+            causation_id=f"worker-pool-finalize:{receipt.receipt_id}",
+        )
+        return receipt.to_dict()
+
+    def _mutate_graph(self, graph_id_value: str, payload: Mapping[str, Any]) -> WorkerPoolApiResponse:
+        operation = str(payload.get("operation") or "")
+        actor_id = str(payload.get("actor_id") or "graph-api")
+        causation_id = str(payload.get("causation_id") or new_id("graph-cause"))
+        if operation == "add_node":
+            node = GraphNode.from_dict(dict(payload.get("node") or {}))
+            result = self.topology.add_node(graph_id_value, node, actor_id=actor_id, causation_id=causation_id)
+        elif operation == "remove_node":
+            result = self.topology.remove_node(
+                graph_id_value,
+                str(payload.get("node_id") or ""),
+                actor_id=actor_id,
+                causation_id=causation_id,
+            )
+        elif operation == "replace_node":
+            node = GraphNode.from_dict(dict(payload.get("node") or {}))
+            result = self.topology.replace_node(graph_id_value, node, actor_id=actor_id, causation_id=causation_id)
+        elif operation == "add_edge":
+            edge = GraphEdge.from_dict(dict(payload.get("edge") or {}))
+            result = self.topology.add_edge(graph_id_value, edge, actor_id=actor_id, causation_id=causation_id)
+        elif operation == "remove_edge":
+            result = self.topology.remove_edge(
+                graph_id_value,
+                str(payload.get("edge_id") or ""),
+                actor_id=actor_id,
+                causation_id=causation_id,
+            )
+        elif operation == "set_role":
+            result = self.topology.set_role(
+                graph_id_value,
+                str(payload.get("node_id") or ""),
+                str(payload.get("role") or ""),
+                actor_id=actor_id,
+                causation_id=causation_id,
+            )
+        elif operation == "set_capabilities":
+            result = self.topology.set_capabilities(
+                graph_id_value,
+                str(payload.get("node_id") or ""),
+                tuple(str(item) for item in payload.get("capabilities") or ()),
+                actor_id=actor_id,
+                causation_id=causation_id,
+            )
+        else:
+            return self._error(HTTPStatus.BAD_REQUEST, "graph_operation_invalid", "unsupported graph mutation")
+        status = HTTPStatus.OK if result.receipt.committed else HTTPStatus.CONFLICT
+        return self._response(status, result.to_dict())
+
+    @staticmethod
+    def _headers() -> Mapping[str, str]:
+        return {
+            "Cache-Control": "no-store, max-age=0",
+            "X-Zyra-Worker-State-Owner": "WorkerPoolStore",
+            "X-Zyra-Graph-State-Owner": "GraphStateCustody",
+            "X-Zyra-Logical-Task-Owner": "typescript.AgentTaskRuntime",
+        }
+
+    def _ok(self, body: Mapping[str, Any]) -> WorkerPoolApiResponse:
+        return self._response(HTTPStatus.OK, body)
+
+    def _response(self, status: HTTPStatus, body: Mapping[str, Any]) -> WorkerPoolApiResponse:
+        return WorkerPoolApiResponse(status=status, body=dict(body), headers=self._headers())
+
+    def _error(
+        self,
+        status: HTTPStatus,
+        code: str,
+        message: str,
+        *,
+        detail: Mapping[str, Any] | None = None,
+    ) -> WorkerPoolApiResponse:
+        return self._response(status, {"error": code, "message": message, "detail": dict(detail or {})})

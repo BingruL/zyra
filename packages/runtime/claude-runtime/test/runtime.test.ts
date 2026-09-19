@@ -1,0 +1,8929 @@
+import assert from "node:assert/strict";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import test from "node:test";
+
+import {
+  ClaudeRuntimeCore,
+  RuntimeSession,
+  type ArtifactReceipt,
+  type ArtifactRequest,
+  type CompletionGateRequest,
+  type CompletionGateResult,
+  type JsonObject,
+  type RuntimeEvent,
+  type RuntimeHost,
+  type RuntimeRunInput,
+  type ToolBatch,
+  type ToolExecutionRequest,
+  type ToolExecutionResponse,
+} from "../src/index.ts";
+import { projectToolOutputForRuntime } from "../src/tools/model-result-projection.ts";
+import {
+  assertProviderRouteRenewalLineage,
+  bindProviderControlPlaneChildRoute,
+  emitProviderAssistantPresentationFrames,
+  providerControlPlaneEvidenceFrames,
+  providerControlPlaneToolSteps,
+} from "../src/provider-control-plane-runtime.ts";
+import type { ProviderRouteLease } from "../../provider-control-plane/src/contracts.ts";
+import {
+  DEEPSEEK_PROVIDER_ID,
+  DEEPSEEK_FLASH_MODEL_ID,
+  installDeepSeekFlashProfile,
+  ProviderControlPlane,
+} from "../../provider-control-plane/src/index.ts";
+import {
+  PROGRESSIVE_EXECUTION_SNAPSHOT_VERSION,
+  ProgressiveExecutionRuntime,
+} from "../src/loop/progressive-execution-runtime.ts";
+import {
+  detectReasoningStall,
+  SemanticStallRuntime,
+} from "../src/loop/semantic-stall-runtime.ts";
+import {
+  durableCompactionSummary,
+  e01RuntimeEventPayload,
+  isAlternativeVerificationInspection,
+  isClearlyEnvironmentRecoveryTool,
+  isClearlyPreDeliveryInspection,
+  isClearlyRepairDrivingTool,
+  isGeneratedDeliveryInspection,
+  isGeneratedDeliveryMutation,
+  isFailedVerificationHarnessMutation,
+  isPrivateVerificationInfrastructureInspection,
+  isValidationOnlyMutation,
+  isTargetedRepairInspection,
+  isTaskAuthoredInlineVerificationProbeTool,
+  isClearlyVerificationDrivingTool,
+  isVerificationDrivingToolResult,
+  isEnvironmentRecoveryToolResult,
+  budgetAdjustedCompactionThreshold,
+  budgetForcesCompaction,
+  budgetDrivenDelegationSteer,
+  budgetDelegationSteerEnabled,
+  modelCompactionPrompt,
+  preDeliveryInspectionGuidance,
+  runtimeLineageEventPayload,
+  shouldCheckpointRuntimePhase,
+  shouldBlockValidationOnlyMutation,
+  verificationScopeForTool,
+  verificationScopeForToolResult,
+  verificationHarnessPathForTool,
+  verificationHarnessPathForToolResult,
+} from "../src/query-engine.ts";
+import { forkedSkillResourceBudget } from "../src/skills/runtime.ts";
+
+class MemoryHost implements RuntimeHost {
+  readonly events: RuntimeEvent[] = [];
+  readonly batches: ToolBatch[] = [];
+  readonly artifacts: ArtifactReceipt[] = [];
+  readonly checkpoints: JsonObject[] = [];
+  aborted = false;
+
+  async emitEvent(event: RuntimeEvent): Promise<void> {
+    this.events.push(event);
+  }
+
+  async checkpointState(snapshot: JsonObject): Promise<void> {
+    this.checkpoints.push(structuredClone(snapshot));
+  }
+
+  async executeBatch(
+    batch: ToolBatch,
+    requests: ToolExecutionRequest[],
+  ): Promise<ToolExecutionResponse[]> {
+    this.batches.push(batch);
+    return requests.map((request) => ({
+      tool_call_id: request.toolCallId,
+      ok: request.arguments.fail !== true,
+      summary: request.arguments.fail === true ? "failed" : "executed " + request.toolName,
+      output: (request.arguments.large === true
+        ? { content: "x".repeat(1000) }
+        : { arguments: request.arguments }) as JsonObject,
+      artifacts: [],
+      error: request.arguments.fail === true ? "tool_failed" : null,
+      metadata: {
+        host: "memory",
+        workspace_mutation_committed: String(
+          request.toolName === "write" && request.arguments.fail !== true,
+        ),
+      },
+    }));
+  }
+
+  async externalize(request: ArtifactRequest): Promise<ArtifactReceipt> {
+    const artifact = {
+      artifact_id: "artifact-" + String(this.artifacts.length + 1),
+      kind: request.kind,
+      uri: "memory://" + request.requestId,
+      title: request.title,
+      metadata: request.metadata,
+    };
+    this.artifacts.push(artifact);
+    return artifact;
+  }
+
+  isAborted(): boolean {
+    return this.aborted;
+  }
+}
+
+interface E01RuntimeView {
+  journal: {
+    revision: number;
+    state: {
+      provider?: { revision?: number };
+      query?: { revision?: number };
+      context?: { revision?: number };
+    };
+  };
+  query: { revision: number };
+  compact: {
+    boundaries: unknown[];
+    cleanup: {
+      generation: number;
+      classifierApprovalsCleared: number;
+      speculativeChecksCleared: number;
+      sessionMessageCacheCleared: number;
+      lastQuerySource: string;
+    };
+  };
+  telemetry: {
+    compactGeneration: number;
+    prompts: unknown[];
+    samples: unknown[];
+    events: Array<{ name: string; attributes: Record<string, unknown> }>;
+  };
+  recovery: {
+    contexts: unknown[];
+    cooldowns: Array<{ key: string; untilMs: number; reason: string }>;
+  };
+  providerPrompt: { lastPrompt: { fingerprint: string } | null };
+  providerRequests: {
+    requests: Array<{ requestId: string; status: string }>;
+    attempts: Array<{
+      requestId: string;
+      status: string;
+    }>;
+    chunks: Array<{ attemptId: string; sequence: number }>;
+    transitions: Array<{
+      kind: string;
+      occurredAt: number;
+      payload: Record<string, unknown>;
+    }>;
+  };
+  providerResponses: {
+    builders: Array<{ requestId: string; status: string }>;
+    responses: Array<{ requestId: string; stopReason: string }>;
+  };
+  providerRouting: {
+    states: Array<{ routeId: string; status: string; inFlight: number; successes: number; failures: number }>;
+  };
+  providerRateLimits: {
+    buckets: Array<{ limitId: string; reserved: number; consumed: number }>;
+    reservations: Array<{ requestId: string; status: string }>;
+  };
+  provider: {
+    requests: Array<{ state: string; request: { requestId: string } }>;
+  };
+  providerTransport: {
+    requests: Array<{ state: string; status: number | null }>;
+  };
+  providerCredentials: {
+    records: Array<{ status: string; totalSuccesses: number; totalFailures: number }>;
+  };
+  tools: {
+    calls: Array<{ state: string; toolName: string }>;
+    leases: Array<{ releasedAt: string | null }>;
+  };
+  toolResults: {
+    accumulators: Array<{ status: string; success: boolean | null }>;
+    deliveries: Array<{ success: boolean; deliveryDigest: string }>;
+  };
+  session: {
+    status: string;
+    messages: unknown[];
+    effects: Array<{ state: string }>;
+  };
+  custody: {
+    providers: Array<{ state: string; routeId: string; attemptId: string }>;
+    tools: Array<{ state: string; effectId: string | null; deliveryId: string | null }>;
+    turns: Array<{ state: string; toolCallIds: string[] }>;
+    messages: Array<{ source: string }>;
+  };
+}
+
+function e01State(result: Awaited<ReturnType<ClaudeRuntimeCore["run"]>>): E01RuntimeView {
+  return result.sessionSnapshot.e01Runtime as unknown as E01RuntimeView;
+}
+
+function input(overrides: Partial<RuntimeRunInput> = {}): RuntimeRunInput {
+  return {
+    runId: "run-1",
+    taskId: "task-1",
+    nodeId: "node-1",
+    workerRequestId: "worker-request-1",
+    sessionId: "session-1",
+    messages: [{ role: "user", content: "execute" }],
+    turns: [
+      [
+        { tool_name: "read", arguments: { path: "a" } },
+        { tool_name: "read", arguments: { path: "b" } },
+        { tool_name: "write", arguments: { path: "c", content: "done" } },
+      ],
+      [{ tool_name: "read", arguments: { path: "c" } }],
+    ],
+    tools: [
+      {
+        name: "read",
+        purpose: "read",
+        source: "test",
+        input_schema: {
+          type: "object",
+          required: ["path"],
+          properties: { path: { type: "string" } },
+        },
+        output_schema: {},
+        metadata: { read_only: "true", concurrency_safe: "true" },
+      },
+      {
+        name: "write",
+        purpose: "write",
+        source: "test",
+        input_schema: {
+          type: "object",
+          required: ["path", "content"],
+          properties: {
+            path: { type: "string" },
+            content: { type: "string" },
+          },
+        },
+        output_schema: {},
+        metadata: { read_only: "false", concurrency_safe: "false" },
+      },
+    ],
+    config: {},
+    ...overrides,
+  };
+}
+
+test("forked skills reserve parent closeout and cap inherited provider timeouts", () => {
+  const now = 1_900_000_000_000;
+  const budget = forkedSkillResourceBudget({
+    external_deadline_epoch_ms: now + 95_000,
+    closeout_reserve_seconds: 40,
+    model_api_timeout_milliseconds: 900_000,
+    model_stream_total_timeout_seconds: 1_200,
+  }, 80_000, now);
+
+  assert.equal(budget.deadlineEpochMs, now + 55_000);
+  assert.equal(budget.closeoutReserveSeconds, 11);
+  assert.equal(budget.modelApiTimeoutMilliseconds, 44_000);
+  assert.equal(budget.modelStreamTotalTimeoutMilliseconds, 44_000);
+  assert.throws(
+    () => forkedSkillResourceBudget({
+      external_deadline_epoch_ms: now + 25_000,
+      closeout_reserve_seconds: 30,
+    }, 90_000, now),
+    /parent closeout window is active/i,
+  );
+
+  const defaulted = forkedSkillResourceBudget({}, 600_000, now);
+  assert.equal(defaulted.modelApiTimeoutMilliseconds, 120_000);
+  assert.equal(defaulted.modelStreamTotalTimeoutMilliseconds, 120_000);
+});
+
+test("runtime lineage events expose only complete internal parent bindings", () => {
+  const selected = {
+    metadata: {
+      runtime_lineage: {
+        schema: "zyra.runtime-lineage/v1",
+        relation: "skill",
+        relation_id: "skill-invocation-variant",
+        parent_run_id: "parent-run",
+        parent_task_id: "parent-task",
+        parent_session_id: "parent-session",
+        parent_worker_request_id: "parent-worker",
+        ignored: "not-public",
+      },
+    },
+  } as unknown as RuntimeRunInput;
+  assert.deepEqual(runtimeLineageEventPayload(selected), {
+    schema: "zyra.runtime-lineage/v1",
+    relation: "skill",
+    relation_id: "skill-invocation-variant",
+    parent_run_id: "parent-run",
+    parent_task_id: "parent-task",
+    parent_session_id: "parent-session",
+    parent_worker_request_id: "parent-worker",
+  });
+  selected.metadata = {
+    runtime_lineage: {
+      schema: "zyra.runtime-lineage/v1",
+      relation: "agent",
+      relation_id: "agent-variant",
+      parent_run_id: "parent-run",
+      parent_task_id: "parent-task",
+      parent_session_id: "parent-session",
+    },
+  };
+  assert.equal(runtimeLineageEventPayload(selected), null);
+});
+
+test("runtime owns multi-turn lifecycle and read-only batches", async () => {
+  const host = new MemoryHost();
+  const result = await new ClaudeRuntimeCore().run(input(), host);
+  assert.equal(result.ok, true);
+  assert.equal(result.turnCount, 2);
+  assert.equal(result.toolCallCount, 4);
+  assert.deepEqual(
+    host.batches.map((batch) => batch.executionMode),
+    ["concurrent_read_only", "serial_non_read_only", "concurrent_read_only"],
+  );
+  assert.equal(result.metadata.canonical_runtime_owner, "typescript");
+  assert.equal(result.sessionSnapshot.canonical_owner, "typescript");
+  assert.ok(e01State(result).query.revision > 0);
+  assert.ok((e01State(result).journal.state.query?.revision ?? 0) > 0);
+  assert.ok(host.events.some((event) => event.phase === "stream_request_start"));
+  assert.ok(host.events.some((event) => event.phase === "session_completed"));
+  assert.ok(host.events.some((event) => event.phase === "model_stream_frame"));
+  assert.ok(host.events.some((event) => event.phase === "message_delta"));
+  assert.ok(host.checkpoints.length > 0);
+  assert.ok(host.checkpoints.every((checkpoint) => checkpoint.e01Runtime !== undefined));
+  assert.ok(host.checkpoints.every((checkpoint) => checkpoint.checkpointPhase !== "model_stream_frame"));
+  assert.ok(host.checkpoints.every((checkpoint) => checkpoint.checkpointPhase !== "message_delta"));
+});
+
+test("runtime records only completed successful forked skill obligations", async () => {
+  class SkillReceiptHost extends MemoryHost {
+    constructor(private readonly childOk: boolean) {
+      super();
+    }
+
+    override async executeBatch(
+      batch: ToolBatch,
+      requests: ToolExecutionRequest[],
+    ): Promise<ToolExecutionResponse[]> {
+      this.batches.push(batch);
+      return requests.map((request) => ({
+        tool_call_id: request.toolCallId,
+        ok: true,
+        summary: "skill coordinator returned",
+        output: {
+          invocation: {
+            status: "completed",
+            output: { ok: this.childOk },
+            metadata: {
+              child_task_id: `child-${this.childOk ? "passed" : "failed"}`,
+              execution_mode: "fork",
+            },
+          },
+        },
+        artifacts: [],
+        error: null,
+        metadata: { host: "memory" },
+      }));
+    }
+  }
+  const skillInput = input({
+    turns: [[{ tool_name: "skill", arguments: { skill: "verification" } }]],
+    tools: [{
+      name: "skill",
+      purpose: "execute skill",
+      source: "test",
+      input_schema: {
+        type: "object",
+        required: ["skill"],
+        properties: { skill: { type: "string" } },
+      },
+      output_schema: {},
+      metadata: { read_only: "false", concurrency_safe: "false" },
+    }],
+  });
+
+  const failed = await new ClaudeRuntimeCore().run(skillInput, new SkillReceiptHost(false));
+  const failedEvidence = failed.sessionSnapshot.obligationEvidence as JsonObject;
+  assert.deepEqual(failedEvidence.successful_skill_invocations, []);
+
+  const passed = await new ClaudeRuntimeCore().run(skillInput, new SkillReceiptHost(true));
+  const passedEvidence = passed.sessionSnapshot.obligationEvidence as JsonObject;
+  const invocations = passedEvidence.successful_skill_invocations as JsonObject[];
+  assert.equal(invocations.length, 1);
+  assert.equal(invocations[0]?.name, "verification");
+  assert.equal(invocations[0]?.child_task_id, "child-passed");
+  assert.equal(invocations[0]?.execution_mode, "fork");
+});
+
+test("runtime unions checkpoint and task-handoff obligation evidence", async () => {
+  const result = await new ClaudeRuntimeCore().run(input({
+    turns: [],
+    metadata: {
+      task_handoff_obligation_evidence: {
+        schema: "zyra.runtime-obligation-evidence/v1",
+        successful_skill_invocations: [{
+          name: "service-inspector",
+          tool_call_id: "skill-before-recovery",
+        }],
+        successful_executed_paths: [{
+          path: "scripts/reproduce.py",
+          tool_call_id: "path-before-recovery",
+          workspace_mutation_count: 3,
+        }],
+        workspace_mutation_count: 3,
+      },
+    },
+    restoredState: {
+      obligationEvidence: {
+        schema: "zyra.runtime-obligation-evidence/v1",
+        successful_skill_invocations: [{
+          name: "release-checker",
+          tool_call_id: "skill-after-recovery",
+        }],
+        successful_executed_paths: [{
+          path: "scripts/reproduce.py",
+          tool_call_id: "path-after-recovery",
+          workspace_mutation_count: 4,
+        }],
+        workspace_mutation_count: 4,
+      },
+    },
+  }), new MemoryHost());
+
+  const evidence = result.sessionSnapshot.obligationEvidence as JsonObject;
+  assert.deepEqual(
+    (evidence.successful_skill_invocations as JsonObject[]).map((item) => item.name),
+    ["service-inspector", "release-checker"],
+  );
+  assert.deepEqual(evidence.successful_executed_paths, [{
+    path: "scripts/reproduce.py",
+    tool_call_id: "path-after-recovery",
+    workspace_mutation_count: 4,
+  }]);
+  assert.equal(evidence.workspace_mutation_count, 4);
+});
+
+test("runtime records exact script execution but rejects source inspection", async () => {
+  const shellTool = {
+    name: "shell",
+    purpose: "execute shell",
+    source: "test",
+    input_schema: {
+      type: "object",
+      required: ["command"],
+      properties: { command: { type: "string" } },
+    },
+    output_schema: {},
+    metadata: { read_only: "false", concurrency_safe: "false" },
+  };
+  const metadata = {
+    delivery_contract: {
+      required_executed_paths: ["deliverables/reproduce.ps1"],
+    },
+  };
+  const inspected = await new ClaudeRuntimeCore().run(input({
+    turns: [[{
+      tool_name: "shell",
+      arguments: { command: "Get-Content deliverables/reproduce.ps1" },
+    }]],
+    tools: [shellTool],
+    metadata,
+  }), new MemoryHost());
+  assert.deepEqual(
+    (inspected.sessionSnapshot.obligationEvidence as JsonObject).successful_executed_paths,
+    [],
+  );
+
+  const executed = await new ClaudeRuntimeCore().run(input({
+    turns: [[{
+      tool_name: "shell",
+      arguments: { command: "pwsh -File deliverables/reproduce.ps1" },
+    }]],
+    tools: [shellTool],
+    metadata,
+  }), new MemoryHost());
+  assert.equal(
+    ((executed.sessionSnapshot.obligationEvidence as JsonObject)
+      .successful_executed_paths as JsonObject[]).length,
+    1,
+  );
+});
+
+test("runtime records terminal verification receipts without command content", async () => {
+  const shellTool = {
+    name: "shell",
+    purpose: "execute shell",
+    source: "test",
+    input_schema: {
+      type: "object",
+      required: ["command"],
+      properties: { command: { type: "string" } },
+    },
+    output_schema: {},
+    metadata: { read_only: "false", concurrency_safe: "false" },
+  };
+  const result = await new ClaudeRuntimeCore().run(input({
+    turns: [[{
+      tool_name: "shell",
+      arguments: { command: "python -m pytest tests/unit" },
+    }]],
+    tools: [shellTool],
+  }), new MemoryHost());
+
+  const evidence = result.sessionSnapshot.obligationEvidence as JsonObject;
+  const receipts = evidence.verification_command_receipts as JsonObject[];
+  assert.equal(receipts.length, 1);
+  assert.equal(receipts[0]?.schema, "zyra.verification-command-receipt/v1");
+  assert.equal(receipts[0]?.status, "passed");
+  assert.equal(receipts[0]?.scope, "shell:pytest:tests/unit");
+  assert.equal(Object.hasOwn(receipts[0] ?? {}, "command"), false);
+});
+
+test("runtime checkpoints durable recovery boundaries instead of observations", () => {
+  for (const phase of [
+    "session_started",
+    "model_request_prepared",
+    "model_stream_report",
+    "tool_batch_completed",
+    "turn_end",
+    "context_compacted",
+    "completion_stop_blocked",
+    "semantic_stall_redirected",
+    "session_suspended",
+    "query_session_snapshot",
+  ]) {
+    assert.equal(shouldCheckpointRuntimePhase(phase), true, phase);
+  }
+  for (const phase of [
+    "message_delta",
+    "model_stream_frame",
+    "turn_started",
+    "stream_request_start",
+    "tool_loop_plan",
+    "tool_call_started",
+    "tool_call_completed",
+    "tool_use_summary",
+    "upstream_query_continuation",
+    "progressive_verification_requested",
+  ]) {
+    assert.equal(shouldCheckpointRuntimePhase(phase), false, phase);
+  }
+});
+
+test("semantic stall detector catches rewording-free reasoning loops", () => {
+  const paragraph = [
+    "We should continue carefully by checking the same general situation",
+    "and maintaining steady progress without naming a concrete implementation",
+    "detail or performing the required action in the governed workspace.",
+  ].join(" ");
+  const detection = detectReasoningStall(
+    Array.from({ length: 8 }, () => paragraph).join("\n\n"),
+  );
+  assert.equal(detection?.kind, "reasoning_loop");
+  assert.match(detection?.reason ?? "", /near-identical|low-information/u);
+});
+
+test("semantic stall detector fingerprints Chinese reasoning loops", () => {
+  const variants = [
+    "继续谨慎评估当前方案，反复确认总体方向，但没有执行任何工具或完成工作区中的具体修改。",
+    "仍然谨慎评估这个方案，持续确认整体方向，却没有调用工具，也没有完成工作区里的具体修改。",
+  ];
+  const detection = detectReasoningStall(
+    Array.from({ length: 8 }, (_, index) => variants[index % variants.length]).join("\n\n"),
+  );
+  assert.equal(detection?.kind, "reasoning_loop");
+  assert.match(detection?.reason ?? "", /near-identical|low-information/u);
+});
+
+test("semantic stall tool guard canonicalizes arguments and restores its sequence", () => {
+  const first = new SemanticStallRuntime({
+    modelName: "other-model",
+    constraints: { semantic_stall_tool_call_threshold: 3 },
+  });
+  const proposal = (argumentsValue: JsonObject) => first.inspectProviderRound("", [{
+    tool_name: "read",
+    arguments: argumentsValue,
+  }]);
+  assert.equal(proposal({ path: "a", intent: "first" }), null);
+  assert.equal(proposal({ intent: "second", path: "a" }), null);
+
+  const restored = new SemanticStallRuntime({
+    modelName: "other-model",
+    constraints: { semantic_stall_tool_call_threshold: 3 },
+    restored: first.snapshot(),
+  });
+  const detection = restored.inspectProviderRound("", [{
+    tool_name: "read",
+    arguments: { path: "a", __intent: "restored" },
+  }]);
+  assert.equal(detection?.kind, "repeated_tool_call");
+  assert.equal(detection?.consecutiveCount, 3);
+  assert.equal(restored.snapshot().lastToolName, "read");
+  assert.ok(restored.snapshot().lastToolSignature.length > 0);
+});
+
+test("semantic stall tool guard exempts polling tools", () => {
+  const supervisor = new SemanticStallRuntime({
+    modelName: "deepseek-flash",
+    constraints: { semantic_stall_tool_call_threshold: 2 },
+  });
+  for (let index = 0; index < 5; index += 1) {
+    assert.equal(supervisor.inspectProviderRound("", [{
+      tool_name: "shell_wait",
+      arguments: { job_id: "job-1" },
+    }]), null);
+  }
+  assert.equal(supervisor.snapshot().consecutiveIdenticalToolCalls, 0);
+});
+
+test("runtime discards a DeepSeek reasoning loop and resumes with a concrete action", async () => {
+  const originalFetch = globalThis.fetch;
+  let requestCount = 0;
+  const requestBodies: JsonObject[] = [];
+  const paragraph = [
+    "We should keep reviewing the same broad situation with steady caution",
+    "while preserving momentum without naming a concrete implementation",
+    "detail or performing the required workspace action at this time.",
+  ].join(" ");
+  globalThis.fetch = (async (
+    _resource: Parameters<typeof fetch>[0],
+    init?: Parameters<typeof fetch>[1],
+  ) => {
+    requestCount += 1;
+    requestBodies.push(JSON.parse(String(init?.body ?? "{}")) as JsonObject);
+    const choice = requestCount === 1
+      ? {
+        index: 0,
+        delta: {
+          reasoning_content: Array.from({ length: 8 }, () => paragraph).join("\n\n"),
+        },
+        finish_reason: "stop",
+      }
+      : requestCount === 2
+        ? {
+          index: 0,
+          delta: {
+            tool_calls: [{
+              index: 0,
+              id: "semantic-recovery-write",
+              type: "function",
+              function: {
+                name: "write",
+                arguments: JSON.stringify({ path: "result.txt", content: "done" }),
+              },
+            }],
+          },
+          finish_reason: "tool_calls",
+        }
+        : {
+          index: 0,
+          delta: { content: "The concrete delivery is complete." },
+          finish_reason: "stop",
+        };
+    const payload = {
+      id: `semantic-reasoning-provider-${requestCount}`,
+      object: "chat.completion.chunk",
+      model: "deepseek-flash",
+      choices: [choice],
+      usage: { prompt_tokens: 8, completion_tokens: 5, total_tokens: 13 },
+    };
+    return new Response(`data: ${JSON.stringify(payload)}\n\ndata: [DONE]\n\n`, {
+      status: 200,
+      headers: { "content-type": "text/event-stream" },
+    });
+  }) as unknown as typeof fetch;
+  try {
+    const host = new MemoryHost();
+    const result = await new ClaudeRuntimeCore().run(input({
+      turns: [],
+      config: {
+        maxTurns: 8,
+        modelName: "deepseek-flash",
+        runtimeConstraints: {
+          model_transport: "http_sse",
+          model_api_base_url: "https://provider.invalid/v1",
+          model_api_key: "test-only-provider-key",
+        },
+      },
+    }), host);
+
+    assert.equal(result.ok, true);
+    assert.equal(requestCount, 3);
+    assert.equal(result.toolCallCount, 1);
+    assert.equal(host.batches.length, 1);
+    assert.ok(host.events.some((event) =>
+      event.phase === "semantic_stall_redirected"
+      && event.kind === "reasoning_loop"
+      && event.discarded_provider_output === true
+    ));
+    assert.ok((requestBodies[1].messages as JsonObject[]).some((message) =>
+      /semantic stall supervisor discarded.*concrete next action/iu.test(
+        String(message.content ?? ""),
+      )
+    ));
+    assert.equal(result.metadata.semantic_stall_reasoning_detections, "1");
+    assert.ok(host.checkpoints.some((checkpoint) =>
+      checkpoint.semanticStall !== undefined
+      && checkpoint.checkpointPhase === "semantic_stall_redirected"
+    ));
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("runtime blocks an equivalent cross-turn tool loop before another side effect", async () => {
+  const originalFetch = globalThis.fetch;
+  let requestCount = 0;
+  const requestBodies: JsonObject[] = [];
+  globalThis.fetch = (async (
+    _resource: Parameters<typeof fetch>[0],
+    init?: Parameters<typeof fetch>[1],
+  ) => {
+    requestCount += 1;
+    requestBodies.push(JSON.parse(String(init?.body ?? "{}")) as JsonObject);
+    const choice = requestCount <= 3
+      ? {
+        index: 0,
+        delta: {
+          tool_calls: [{
+            index: 0,
+            id: `repeated-read-${requestCount}`,
+            type: "function",
+            function: {
+              name: "read",
+              arguments: requestCount % 2 === 0
+                ? JSON.stringify({ intent: "inspect again", path: "a" })
+                : JSON.stringify({ path: "a", intent: "inspect" }),
+            },
+          }],
+        },
+        finish_reason: "tool_calls",
+      }
+      : requestCount === 4
+        ? {
+          index: 0,
+          delta: {
+            tool_calls: [{
+              index: 0,
+              id: "redirected-write",
+              type: "function",
+              function: {
+                name: "write",
+                arguments: JSON.stringify({ path: "result.txt", content: "progress" }),
+              },
+            }],
+          },
+          finish_reason: "tool_calls",
+        }
+        : {
+          index: 0,
+          delta: { content: "Completed after changing strategy." },
+          finish_reason: "stop",
+        };
+    const payload = {
+      id: `semantic-tool-provider-${requestCount}`,
+      object: "chat.completion.chunk",
+      model: "other-model",
+      choices: [choice],
+      usage: { prompt_tokens: 8, completion_tokens: 5, total_tokens: 13 },
+    };
+    return new Response(`data: ${JSON.stringify(payload)}\n\ndata: [DONE]\n\n`, {
+      status: 200,
+      headers: { "content-type": "text/event-stream" },
+    });
+  }) as unknown as typeof fetch;
+  try {
+    const host = new MemoryHost();
+    const result = await new ClaudeRuntimeCore().run(input({
+      turns: [],
+      config: {
+        maxTurns: 8,
+        modelName: "other-model",
+        runtimeConstraints: {
+          model_transport: "http_sse",
+          model_api_base_url: "https://provider.invalid/v1",
+          model_api_key: "test-only-provider-key",
+          semantic_stall_tool_call_threshold: 3,
+        },
+      },
+    }), host);
+
+    assert.equal(result.ok, true);
+    assert.equal(requestCount, 5);
+    assert.equal(result.toolCallCount, 3);
+    assert.equal(host.batches.length, 3);
+    assert.deepEqual(host.batches.map((batch) => batch.steps[0].tool_name), [
+      "read",
+      "read",
+      "write",
+    ]);
+    assert.ok(host.events.some((event) =>
+      event.phase === "semantic_stall_redirected"
+      && event.kind === "repeated_tool_call"
+      && event.tool_execution_blocked === true
+    ));
+    assert.ok((requestBodies[3].messages as JsonObject[]).some((message) =>
+      /same read call.*Do not repeat that call/iu.test(String(message.content ?? ""))
+    ));
+    assert.equal(result.metadata.semantic_stall_tool_loop_detections, "1");
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("provider evidence keeps structural frames without replaying content tokens", () => {
+  type Frame = Parameters<typeof providerControlPlaneEvidenceFrames>[0][number];
+  const frame = (kind: Frame["kind"], sequence: number): Frame => ({
+    frameId: `frame-${sequence}`,
+    dispatchId: "dispatch-1",
+    routeId: "route-1",
+    sequence,
+    kind,
+    text: kind.endsWith("_delta") ? "token" : null,
+    toolCallId: kind === "tool_call_delta" ? "call-1" : null,
+    toolName: kind === "tool_call_delta" ? "read" : null,
+    jsonDelta: kind === "tool_call_delta" ? "{}" : null,
+    usage: {},
+    providerEvent: kind === "response_end" ? "done" : null,
+    createdAt: sequence,
+    metadata: {},
+  });
+  const evidence = providerControlPlaneEvidenceFrames([
+    frame("thinking_delta", 1),
+    frame("text_delta", 2),
+    frame("tool_call_delta", 3),
+    frame("usage", 4),
+    frame("response_end", 5),
+  ]);
+  assert.deepEqual(evidence.map((item) => item.kind), [
+    "tool_call_delta",
+    "usage",
+    "response_end",
+  ]);
+  assert.equal(evidence[0]?.jsonDelta, null);
+});
+
+test("provider assistant presentation emits only bounded text deltas", async () => {
+  type Frame = Parameters<typeof emitProviderAssistantPresentationFrames>[0][number];
+  const frame = (
+    kind: Frame["kind"],
+    sequence: number,
+    text: string | null = null,
+    jsonDelta: string | null = null,
+  ): Frame => ({
+    frameId: `frame-${sequence}`,
+    dispatchId: "dispatch-presentation",
+    routeId: "route-presentation",
+    sequence,
+    kind,
+    text,
+    toolCallId: kind === "tool_call_delta" ? "call-private" : null,
+    toolName: kind === "tool_call_delta" ? "shell" : null,
+    jsonDelta,
+    usage: {},
+    providerEvent: null,
+    createdAt: sequence,
+    metadata: {},
+  });
+  const text = `开始 ${"你🙂a".repeat(700)} 结束`;
+  const emitted: Array<{ phase: string; payload: JsonObject }> = [];
+
+  await emitProviderAssistantPresentationFrames([
+    frame("response_start", 1),
+    frame("thinking_delta", 2, "private reasoning"),
+    frame("tool_call_delta", 3, null, '{"secret":"private tool arguments"}'),
+    frame("text_delta", 4, text),
+    frame("response_end", 5),
+  ], async (phase, payload = {}) => {
+    emitted.push({ phase, payload });
+  });
+
+  assert.equal(emitted[0]?.phase, "assistant_text_started");
+  assert.equal(emitted.at(-1)?.phase, "assistant_text_ended");
+  // Reasoning opens and settles on its own stream, strictly before the answer
+  // closes, so deliberation is never concatenated into the reply.
+  const phases = emitted.map((event) => event.phase);
+  assert.ok(phases.indexOf("reasoning_started") > phases.indexOf("assistant_text_started"));
+  assert.ok(phases.indexOf("reasoning_delta") < phases.indexOf("assistant_text_delta"));
+  assert.ok(phases.indexOf("reasoning_ended") < phases.indexOf("assistant_text_ended"));
+  const reasoningDeltas = emitted.filter((event) => event.phase === "reasoning_delta");
+  assert.equal(reasoningDeltas.length, 1);
+  assert.equal(reasoningDeltas[0]?.payload.content, "private reasoning");
+  assert.equal(reasoningDeltas[0]?.payload.delta_kind, "reasoning");
+  assert.ok(String(reasoningDeltas[0]?.payload.stream_id).endsWith(":reasoning"));
+  const deltas = emitted.filter((event) => event.phase === "assistant_text_delta");
+  assert.ok(deltas.length > 1);
+  assert.equal(deltas.map((event) => String(event.payload.content ?? "")).join(""), text);
+  assert.ok(deltas.every((event) =>
+    Buffer.byteLength(String(event.payload.content ?? ""), "utf8") <= 1_024
+  ));
+  // Reasoning is redacted like text, but tool arguments stay private: they are
+  // never published on any presentation stream.
+  assert.doesNotMatch(JSON.stringify(emitted), /private tool arguments/u);
+  assert.ok(emitted.every((event) =>
+    event.payload.assistant_message_id
+      === "message:assistant:provider:dispatch-presentation"
+  ));
+});
+
+test("provider assistant presentation synthesizes one start for delta-first streams", async () => {
+  type Frame = Parameters<typeof emitProviderAssistantPresentationFrames>[0][number];
+  const frame = (kind: Frame["kind"], sequence: number, text: string | null = null): Frame => ({
+    frameId: `delta-first-${sequence}`,
+    dispatchId: "dispatch-delta-first",
+    routeId: "route-delta-first",
+    sequence,
+    kind,
+    text,
+    toolCallId: null,
+    toolName: null,
+    jsonDelta: null,
+    usage: {},
+    providerEvent: null,
+    createdAt: sequence,
+    metadata: {},
+  });
+  const emitted: string[] = [];
+  const emit = async (phase: string): Promise<void> => {
+    emitted.push(phase);
+  };
+  const state = {
+    startedStreamIds: new Set<string>(),
+    endedStreamIds: new Set<string>(),
+    startedReasoningStreamIds: new Set<string>(),
+    endedReasoningStreamIds: new Set<string>(),
+  };
+
+  await emitProviderAssistantPresentationFrames([
+    frame("text_delta", 1, "first"),
+  ], emit, state);
+  await emitProviderAssistantPresentationFrames([
+    frame("text_delta", 2, "second"),
+    frame("response_end", 3),
+  ], emit, state);
+
+  assert.deepEqual(emitted, [
+    "assistant_text_started",
+    "assistant_text_delta",
+    "assistant_text_delta",
+    "assistant_text_ended",
+  ]);
+});
+
+test("reasoning presentation opens and settles without any assistant answer", async () => {
+  // A round can deliberate and then act without ever emitting answer text
+  // (tool-only rounds).  The reasoning stream must still have a well-formed
+  // lifecycle in that case rather than an orphaned start, and the synthesized
+  // assistant start must not swallow the reasoning text.
+  type Frame = Parameters<typeof emitProviderAssistantPresentationFrames>[0][number];
+  const frame = (kind: Frame["kind"], sequence: number, text: string | null = null): Frame => ({
+    frameId: `reasoning-only-${sequence}`,
+    dispatchId: "dispatch-reasoning-only",
+    routeId: "route-reasoning-only",
+    sequence,
+    kind,
+    text,
+    toolCallId: null,
+    toolName: null,
+    jsonDelta: null,
+    usage: {},
+    providerEvent: null,
+    createdAt: sequence,
+    metadata: {},
+  });
+  const emitted: Array<{ phase: string; payload: JsonObject }> = [];
+
+  await emitProviderAssistantPresentationFrames([
+    frame("response_start", 1),
+    frame("thinking_delta", 2, "weighing two reads "),
+    frame("thinking_delta", 3, "before touching the file"),
+    frame("response_end", 4),
+  ], async (phase, payload = {}) => {
+    emitted.push({ phase, payload });
+  });
+
+  const phases = emitted.map((event) => event.phase);
+  assert.ok(phases.includes("reasoning_started"));
+  assert.deepEqual(
+    emitted.filter((event) => event.phase === "reasoning_delta")
+      .map((event) => String(event.payload.content ?? "")),
+    ["weighing two reads ", "before touching the file"],
+  );
+  // The reasoning stream closes exactly once, and never carries answer text.
+  assert.equal(phases.filter((phase) => phase === "reasoning_ended").length, 1);
+  assert.equal(
+    emitted.filter((event) => event.phase !== "reasoning_delta")
+      .every((event) => event.payload.content === undefined),
+    true,
+  );
+  // Two provider frames collapse into the two bounded chunks above; the
+  // synthesized assistant lifecycle adds no reasoning content of its own.
+  assert.equal(
+    emitted.filter((event) => event.phase === "assistant_text_delta").length,
+    0,
+  );
+});
+
+test("provider evidence bounds fragmented tool arguments to one structural frame per call", () => {
+  type Frame = Parameters<typeof providerControlPlaneEvidenceFrames>[0][number];
+  const frames: Frame[] = [{
+    frameId: "tool-start",
+    dispatchId: "dispatch-large-tool",
+    routeId: "route-large-tool",
+    sequence: 1,
+    kind: "tool_call_delta",
+    text: null,
+    toolCallId: "call-large-tool",
+    toolName: "shell",
+    jsonDelta: "",
+    usage: {},
+    providerEvent: "chat.completion.chunk",
+    createdAt: 1,
+    metadata: { providerIndex: 0 },
+  }];
+  for (let sequence = 2; sequence <= 602; sequence += 1) {
+    frames.push({
+      ...frames[0]!,
+      frameId: `tool-argument-${sequence}`,
+      sequence,
+      toolCallId: null,
+      toolName: null,
+      jsonDelta: "x",
+      createdAt: sequence,
+    });
+  }
+  frames.push({
+    ...frames[0]!,
+    frameId: "usage",
+    sequence: 603,
+    kind: "usage",
+    toolCallId: null,
+    toolName: null,
+    jsonDelta: null,
+    createdAt: 603,
+  });
+
+  const evidence = providerControlPlaneEvidenceFrames(frames);
+  assert.equal(evidence.length, 2);
+  assert.deepEqual(evidence.map((frame) => frame.kind), ["tool_call_delta", "usage"]);
+  assert.equal(evidence[0]?.toolCallId, "call-large-tool");
+  assert.equal(evidence[0]?.jsonDelta, null);
+});
+
+test("provider route renewal accepts a verified multi-hop pinned lineage", () => {
+  const route = (
+    routeId: string,
+    previousRouteId: string | null,
+    createdAt: number,
+  ): ProviderRouteLease => ({
+    routeId,
+    previousRouteId,
+    createdAt,
+    expiresAt: createdAt + 1_000,
+    runId: "run-route",
+    taskId: "task-route",
+    nodeId: "node-route",
+    sessionId: "session-route",
+    turnId: "turn-route",
+    purpose: "reason",
+    catalogRevision: 7,
+    providerId: "deepseek",
+    modelId: "deepseek-flash",
+    credentialId: "credential-route",
+    credentialVersion: 3,
+    credentialFingerprint: "sha256:credential",
+    integrationId: "deepseek-bearer",
+    transportId: "openai_chat",
+    protocol: "openai_chat",
+    baseUrl: "https://api.deepseek.com",
+    allowedHosts: ["api.deepseek.com"],
+    endpointPath: "/chat/completions",
+    requestHeaders: {},
+    requestDefaults: {},
+    retryPolicy: {
+      maximumAttempts: 3,
+      baseDelayMilliseconds: 1,
+      maximumDelayMilliseconds: 10,
+      retryStatuses: [503],
+      rotateCredentialOnAuthenticationFailure: true,
+      rotateRouteOnProviderUnavailable: true,
+    },
+    reason: "provider routing; renewed expired route",
+    checksum: `sha256:${routeId}`,
+  });
+  const original = route("route-1", null, 1);
+  const child = route("route-2", original.routeId, 2);
+  const leaf = route("route-3", child.routeId, 3);
+  const routes = new Map([original, child, leaf].map((item) => [item.routeId, item]));
+
+  assert.equal(
+    assertProviderRouteRenewalLineage(
+      leaf,
+      original,
+      { runId: original.runId, taskId: original.taskId },
+      (routeId) => {
+        const selected = routes.get(routeId);
+        assert.ok(selected);
+        return selected;
+      },
+    ),
+    2,
+  );
+
+  const fork = route("route-fork", "route-unrelated", 4);
+  assert.throws(
+    () => assertProviderRouteRenewalLineage(
+      fork,
+      original,
+      { runId: original.runId, taskId: original.taskId },
+      (routeId) => {
+        const selected = routes.get(routeId);
+        assert.ok(selected);
+        return selected;
+      },
+    ),
+  );
+});
+
+test("provider control plane binds one reusable route to each child execution identity", async () => {
+  const directory = mkdtempSync(join(tmpdir(), "zyra-child-provider-route-"));
+  const databasePath = join(directory, "provider.sqlite3");
+  const controlPlane = new ProviderControlPlane({ databasePath });
+  let parentRoute: ProviderRouteLease;
+  try {
+    installDeepSeekFlashProfile(controlPlane, {
+      ZYRA_DEEPSEEK_ENABLED: "true",
+      DEEPSEEK_API_KEY: "child-route-test-secret",
+    });
+    parentRoute = controlPlane.acquireRoute({
+      runId: "run-child-route",
+      taskId: "task-parent-route",
+      nodeId: "node-parent-route",
+      sessionId: "session-parent-route",
+      turnId: "turn-parent-route",
+      purpose: "reason",
+      preferredProviderId: DEEPSEEK_PROVIDER_ID,
+      preferredModelId: DEEPSEEK_FLASH_MODEL_ID,
+      routeHint: `${DEEPSEEK_PROVIDER_ID}/${DEEPSEEK_FLASH_MODEL_ID}`,
+      constraints: {
+        providerIds: [DEEPSEEK_PROVIDER_ID],
+        modelIds: [DEEPSEEK_FLASH_MODEL_ID],
+        requiredInput: ["text"],
+        requiredOutput: ["text"],
+        requireTools: true,
+        requireStreaming: true,
+        minimumContextWindow: 0,
+        maximumInputPricePerMillion: null,
+        maximumOutputPricePerMillion: null,
+        excludedCredentialIds: [],
+        requiredScopes: [],
+      },
+      metadata: {},
+    });
+  } finally {
+    controlPlane.close();
+  }
+  const parent: RuntimeRunInput = {
+    runId: parentRoute.runId,
+    taskId: parentRoute.taskId,
+    nodeId: parentRoute.nodeId,
+    workerRequestId: "worker-parent-route",
+    sessionId: parentRoute.sessionId,
+    messages: [],
+    turns: [],
+    tools: [],
+    config: {
+      runtimeConstraints: {
+        provider_control_plane_required: true,
+        provider_control_plane_database_path: databasePath,
+        provider_route_id: parentRoute.routeId,
+        provider_route_checksum: parentRoute.checksum,
+        provider_catalog_revision: parentRoute.catalogRevision,
+        provider_credential_version: parentRoute.credentialVersion,
+        provider_credential_fingerprint: parentRoute.credentialFingerprint,
+        provider_transport_id: parentRoute.transportId,
+        provider_route_session_id: parentRoute.sessionId,
+        provider_route_turn_id: parentRoute.turnId,
+      },
+    },
+  };
+  const child: RuntimeRunInput = {
+    ...parent,
+    taskId: "task-child-route",
+    nodeId: "node-child-route",
+    workerRequestId: "worker-child-route",
+    sessionId: "session-child-route",
+    tools: [{
+      name: "file_read",
+      purpose: "read",
+      source: "builtin",
+      input_schema: { type: "object" },
+      output_schema: { type: "object" },
+      metadata: {},
+      execution_provenance: {},
+    }],
+  };
+  try {
+    const first = await bindProviderControlPlaneChildRoute(parent, child);
+    const second = await bindProviderControlPlaneChildRoute(parent, child);
+    const firstConstraints = first.config.runtimeConstraints as JsonObject;
+    const secondConstraints = second.config.runtimeConstraints as JsonObject;
+    assert.notEqual(firstConstraints.provider_route_id, parentRoute.routeId);
+    assert.equal(secondConstraints.provider_route_id, firstConstraints.provider_route_id);
+    assert.equal(firstConstraints.provider_route_session_id, child.sessionId);
+    assert.equal(firstConstraints.provider_id, parentRoute.providerId);
+    assert.equal(firstConstraints.provider_model_id, parentRoute.modelId);
+
+    const inspection = new ProviderControlPlane({ databasePath });
+    try {
+      const persistedParent = inspection.routes.requirePersisted(parentRoute.routeId);
+      assert.equal(persistedParent.taskId, parent.taskId);
+      assert.equal(persistedParent.sessionId, parent.sessionId);
+      const childRoutes = inspection.routes.list(child.runId, child.taskId);
+      assert.equal(childRoutes.length, 1);
+      assert.equal(childRoutes[0]?.taskId, child.taskId);
+      assert.equal(childRoutes[0]?.sessionId, child.sessionId);
+      assert.equal(childRoutes[0]?.nodeId, child.nodeId);
+    } finally {
+      inspection.close();
+    }
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test("provider control plane rejoins fragmented OpenAI tool arguments by provider index", () => {
+  type Frame = Parameters<typeof providerControlPlaneToolSteps>[0][number];
+  const frame = (
+    sequence: number,
+    providerIndex: number,
+    toolCallId: string | null,
+    toolName: string | null,
+    jsonDelta: string | null,
+  ): Frame => ({
+    frameId: `frame-${sequence}`,
+    dispatchId: "dispatch-1",
+    routeId: "route-1",
+    sequence,
+    kind: "tool_call_delta",
+    text: null,
+    toolCallId,
+    toolName,
+    jsonDelta,
+    usage: {},
+    providerEvent: "chat.completion.chunk",
+    createdAt: sequence,
+    metadata: { providerIndex },
+  });
+  const steps = providerControlPlaneToolSteps([
+    frame(1, 0, "call-shell", "shell", ""),
+    frame(2, 0, null, null, '{"command":"ls'),
+    frame(3, 0, null, null, ' -la"}'),
+    frame(4, 1, "call-read", "file_read", ""),
+    frame(5, 1, null, null, '{"path":"README.md"}'),
+  ]);
+  assert.deepEqual(steps.map((step) => ({
+    id: step.step_id,
+    name: step.tool_name,
+    arguments: step.arguments,
+  })), [
+    { id: "call-shell", name: "shell", arguments: { command: "ls -la" } },
+    { id: "call-read", name: "file_read", arguments: { path: "README.md" } },
+  ]);
+});
+
+test("session restore preserves the unique active turn boundary", () => {
+  const session = RuntimeSession.create(
+    "active-session",
+    "active-run-one",
+    "active-task",
+    "active-request",
+    [{ role: "user", content: "resume the active turn" }],
+  );
+  session.beginTurn(0, "resume the active turn");
+  const restored = RuntimeSession.restore(session.snapshot(), {
+    sessionId: "active-session",
+    runId: "active-run-two",
+    taskId: "active-task",
+    workerRequestId: "active-request",
+  });
+  assert.throws(() => restored.beginTurn(1, "must not overlap"), /query_turn_already_active/);
+  restored.completeTurn(false, "interrupted_before_resume");
+  assert.doesNotThrow(() => restored.beginTurn(1, "continue after deterministic settlement"));
+});
+
+test("runtime tool projection keeps gateway evidence identity without copying its audit envelope", () => {
+  const eventRefs = Array.from({ length: 200 }, (_, index) => `gateway-event-${index}-${"x".repeat(80)}`);
+  const output = {
+    stdout: "verified output",
+    return_code: 0,
+    gateway_receipt: {
+      schema: "zyra.gateway-execution-receipt.v1",
+      receipt_id: "gateway-execution:test",
+      receipt_digest: "sha256:receipt",
+      outcome: "committed",
+      result_digest: "sha256:result",
+      invocation: {
+        invocation_id: "gateway-invocation:test",
+        tool_call_id: "call-projection",
+        arguments_digest: "sha256:arguments",
+        policy_digest: "sha256:policy",
+        binding_digest: "sha256:binding",
+        identity: { worker_id: "worker", payload: "y".repeat(10_000) },
+      },
+      event_refs: eventRefs,
+      metadata: {
+        return_code: 0,
+        termination: "exited",
+        workspace_mutation_committed: false,
+        unbounded_diagnostics: "z".repeat(10_000),
+      },
+    },
+  } satisfies JsonObject;
+
+  const projected = projectToolOutputForRuntime(output);
+  const encoded = JSON.stringify(projected);
+  assert.ok(encoded.length < 2_000);
+  assert.equal(projected.stdout, "verified output");
+  assert.deepEqual(projected.gateway_receipt, {
+    schema: "zyra.gateway-execution-receipt.v1",
+    receipt_id: "gateway-execution:test",
+    receipt_digest: "sha256:receipt",
+    outcome: "committed",
+    result_digest: "sha256:result",
+    compacted_for_runtime: true,
+    invocation_ref: {
+      invocation_id: "gateway-invocation:test",
+      tool_call_id: "call-projection",
+      arguments_digest: "sha256:arguments",
+      policy_digest: "sha256:policy",
+      binding_digest: "sha256:binding",
+    },
+    metadata: {
+      return_code: 0,
+      termination: "exited",
+      workspace_mutation_committed: false,
+    },
+    event_ref_count: 200,
+  });
+
+  const session = RuntimeSession.create(
+    "projection-session",
+    "projection-run",
+    "projection-task",
+    "projection-request",
+    [{ role: "user", content: "Run the command" }],
+  );
+  session.beginTurn(0, "Run the command");
+  session.recordToolCall("call-projection", "shell");
+  session.recordToolResult("shell", {
+    tool_call_id: "call-projection",
+    ok: true,
+    summary: "Sandbox command completed",
+    output,
+    artifacts: [],
+    error: null,
+    metadata: {},
+  });
+  const recorded = JSON.parse(session.messages.at(-1)?.content ?? "{}") as {
+    output?: JsonObject;
+  };
+  assert.deepEqual(recorded.output, projected);
+  assert.ok(!session.messages.at(-1)?.content.includes("gateway-event-199"));
+});
+
+test("durable compaction summary keeps objective progress verification and open work", async () => {
+  const summary = await durableCompactionSummary({
+    trigger: "auto_threshold",
+    previousSummary: "",
+    systemPrompt: "runtime",
+    customInstructions: "preserve work",
+    tokenBudget: 4_096,
+    messages: [
+      {
+        id: "goal",
+        role: "user",
+        content: [{ type: "text", text: "Complete the release workflow." }],
+        createdAt: new Date(0).toISOString(),
+        turnIndex: null,
+        apiRound: 0,
+        synthetic: false,
+        metadata: {},
+      },
+      {
+        id: "decision",
+        role: "assistant",
+        content: [{ type: "text", text: "The migrations are complete; start the full stack next." }],
+        createdAt: new Date(0).toISOString(),
+        turnIndex: 18,
+        apiRound: 18,
+        synthetic: false,
+        metadata: {},
+      },
+      {
+        id: "verification",
+        role: "user",
+        content: [{
+          type: "tool_result",
+          toolUseId: "tests",
+          content: "138 passed; api_key=must-not-survive; postgresql://worker:db-password@db/task",
+          isError: false,
+          createdAt: new Date(0).toISOString(),
+          compacted: false,
+        }],
+        createdAt: new Date(0).toISOString(),
+        turnIndex: 18,
+        apiRound: 18,
+        synthetic: false,
+        metadata: {},
+      },
+    ],
+  });
+
+  assert.match(summary, /Complete the release workflow/);
+  assert.match(summary, /migrations are complete/);
+  assert.match(summary, /138 passed/);
+  assert.match(summary, /Open work/);
+  assert.match(summary, /not an implicit to-do list/);
+  assert.match(summary, /without repeating completed inspection/);
+  assert.doesNotMatch(summary, /must-not-survive/);
+  assert.doesNotMatch(summary, /db-password/);
+  assert.match(summary, /\[REDACTED\]/);
+});
+
+test("model compaction instructions require concrete source findings", async () => {
+  const prompt = modelCompactionPrompt({
+    trigger: "auto_threshold",
+    previousSummary: "",
+    systemPrompt: "runtime",
+    customInstructions: "preserve source work",
+    tokenBudget: 4_096,
+    messages: [],
+  });
+  assert.match(prompt, /retain concrete symbols, responsibilities, defects, and cross-file relationships/);
+  assert.match(prompt, /successful source read must not be summarized as unavailable or unknown/);
+  assert.match(prompt, /exact scope, exit code/);
+  assert.match(prompt, /specific edit already selected but not yet applied/);
+  assert.match(prompt, /active background job IDs/);
+  assert.match(prompt, /make that edit the immediate next action/);
+});
+
+test("durable compaction carries verified failures across consecutive summary generations", async () => {
+  const first = await durableCompactionSummary({
+    trigger: "auto_threshold",
+    previousSummary: "",
+    systemPrompt: "runtime",
+    customInstructions: "preserve verified outcomes",
+    tokenBudget: 4_096,
+    messages: [
+      {
+        id: "goal",
+        role: "user",
+        content: [{ type: "text", text: "Build and verify the release." }],
+        createdAt: new Date(0).toISOString(),
+        turnIndex: null,
+        apiRound: 0,
+        synthetic: false,
+        metadata: {},
+      },
+      {
+        id: "build-result",
+        role: "user",
+        content: [{
+          type: "tool_result",
+          toolUseId: "build-call",
+          content: JSON.stringify({
+            summary: "Sandbox command completed",
+            output: {
+              terminal_facts: { status: "completed", return_code: 0 },
+              content_preview: "Docker Hub authorization failed; BUILD_STATUS=17",
+              truncated: true,
+            },
+            error: null,
+            state: "succeeded",
+          }),
+          isError: false,
+          createdAt: new Date(0).toISOString(),
+          compacted: false,
+        }],
+        createdAt: new Date(0).toISOString(),
+        turnIndex: 1,
+        apiRound: 1,
+        synthetic: false,
+        metadata: {},
+      },
+    ],
+  });
+  assert.match(first, /BUILD_STATUS=17/);
+  assert.match(first, /return_code.{0,20}0/);
+
+  const second = await durableCompactionSummary({
+    trigger: "auto_threshold",
+    previousSummary: first,
+    systemPrompt: "runtime",
+    customInstructions: "preserve verified outcomes",
+    tokenBudget: 4_096,
+    messages: [{
+      id: "follow-up",
+      role: "assistant",
+      content: [{ type: "text", text: "Check whether the external registry recovered." }],
+      createdAt: new Date(1).toISOString(),
+      turnIndex: 2,
+      apiRound: 2,
+      synthetic: false,
+      metadata: {},
+    }],
+  });
+  assert.match(second, /Previous verified observations/);
+  assert.match(second, /BUILD_STATUS=17/);
+  assert.match(second, /Docker Hub authorization failed/);
+});
+
+test("durable compaction summary replaces recursive handoffs and retains concrete actions", async () => {
+  const prior = [
+    "## Active objective",
+    "Repair the release workflow.",
+    "",
+    "## Current work",
+    "The failing migration is isolated in services/api/migrations.py.",
+    "",
+    "## Open work",
+    "Patch the migration and rerun pytest.",
+  ].join("\n");
+  const summary = await durableCompactionSummary({
+    trigger: "auto_threshold",
+    previousSummary: prior,
+    systemPrompt: "runtime",
+    customInstructions: "preserve work",
+    tokenBudget: 4_096,
+    messages: [
+      {
+        id: "old-handoff",
+        role: "user",
+        content: [{ type: "text", text: `## Active objective\n${prior}` }],
+        createdAt: new Date(0).toISOString(),
+        turnIndex: null,
+        apiRound: 0,
+        synthetic: true,
+        metadata: { compact_summary: true },
+      },
+      {
+        id: "edit",
+        role: "assistant",
+        content: [{
+          type: "tool_use",
+          id: "edit-call",
+          name: "file_write",
+          input: { path: "services/api/migrations.py", content: "fixed" },
+        }],
+        createdAt: new Date(0).toISOString(),
+        turnIndex: 19,
+        apiRound: 19,
+        synthetic: false,
+        metadata: {},
+      },
+    ],
+  });
+
+  assert.match(summary, /Repair the release workflow/);
+  assert.match(summary, /services\/api\/migrations\.py/);
+  assert.match(summary, /Patch the migration and rerun pytest/);
+  assert.equal((summary.match(/## Active objective/g) ?? []).length, 1);
+  assert.doesNotMatch(summary, /## Active objective\n## Active objective/);
+});
+
+test("provider control checkpoints externalize cumulative prompt content", () => {
+  const marker = "large-provider-prompt-marker-".repeat(2_000);
+  const projected = e01RuntimeEventPayload("model_request_prepared", {
+    provider_request: {
+      request_id: "provider-request-one",
+      messages_digest: "sha256:prompt",
+      tools_digest: "sha256:tools",
+      messages: [{ role: "user", content: marker }],
+      tools: [{
+        type: "function",
+        function: {
+          name: "shell",
+          description: marker,
+          parameters: { type: "object", properties: { command: { type: "string" } } },
+        },
+      }],
+      system: [],
+    },
+  });
+  const serialized = JSON.stringify(projected);
+
+  assert.equal(serialized.includes(marker), false);
+  assert.match(serialized, /sha256:prompt/);
+  assert.match(serialized, /provider_control_plane/);
+  assert.ok(serialized.length < 2_000);
+});
+
+test("runtime rejects invalid tool arguments before the Python host", async () => {
+  const host = new MemoryHost();
+  const selected = input({
+    turns: [[{ tool_name: "read", arguments: {} }]],
+  });
+  const result = await new ClaudeRuntimeCore().run(selected, host);
+  assert.equal(result.ok, false);
+  assert.equal(result.stoppedReason, "schema_error");
+  assert.equal(host.batches.length, 0);
+  assert.ok(host.events.some((event) => event.phase === "tool_call_completed"));
+});
+
+test("runtime externalizes large tool results and compacts context", async () => {
+  const host = new MemoryHost();
+  const selected = input({
+    turns: [[
+      { tool_name: "read", arguments: { path: "a", large: true } },
+      { tool_name: "read", arguments: { path: "b", large: true } },
+    ]],
+    config: {
+      maxToolResultChars: 80,
+      maxQueryContextChars: 120,
+    },
+  });
+  const result = await new ClaudeRuntimeCore().run(selected, host);
+  const state = e01State(result);
+  const canonicalMessages = result.sessionSnapshot.messages as Array<{
+    message_id: string;
+    metadata: Record<string, unknown>;
+  }>;
+  assert.equal(result.ok, true);
+  assert.ok(result.artifacts.length >= 2);
+  assert.ok(result.contextCompactionCount >= 1);
+  assert.ok(state.compact.boundaries.length >= 1);
+  assert.equal(state.compact.cleanup.generation, 1);
+  assert.equal(state.compact.cleanup.classifierApprovalsCleared, 1);
+  assert.equal(state.compact.cleanup.speculativeChecksCleared, 1);
+  assert.equal(state.compact.cleanup.sessionMessageCacheCleared, 1);
+  assert.equal(state.compact.cleanup.lastQuerySource, "ClaudeRuntimeCore.run");
+  assert.equal(state.telemetry.compactGeneration, 1);
+  assert.ok(state.telemetry.events.some((event) => event.name === "provider.prompt_cache.compacted"));
+  assert.ok(canonicalMessages.some((message) => message.message_id.startsWith("compact-boundary-")));
+  assert.ok(canonicalMessages.some((message) => message.metadata.compact_boundary !== undefined));
+  assert.ok((state.journal.state.context?.revision ?? 0) > 0);
+  assert.ok(host.events.some((event) => event.phase === "tool_result_budget_exceeded"));
+  assert.ok(host.events.some((event) => event.phase === "context_compacted"));
+});
+
+test("runtime commits provider prompt usage and recovery state through default loop", async () => {
+  const originalFetch = globalThis.fetch;
+  let providerFetchCount = 0;
+  const providerBodies: JsonObject[] = [];
+  const providerUrls: string[] = [];
+  globalThis.fetch = (async (
+    resource: Parameters<typeof fetch>[0],
+    init?: Parameters<typeof fetch>[1],
+  ) => {
+    providerFetchCount += 1;
+    providerUrls.push(String(resource));
+    providerBodies.push(JSON.parse(String(init?.body ?? "{}")) as JsonObject);
+    if (providerFetchCount > 1) {
+      const finalEvent = {
+        id: "provider-final-message",
+        object: "chat.completion.chunk",
+        model: "zyra-local-code-model",
+        choices: [{ index: 0, delta: { content: "The requested file was inspected." }, finish_reason: "stop" }],
+        usage: { prompt_tokens: 20, completion_tokens: 6, total_tokens: 26 },
+      };
+      return new Response(`data: ${JSON.stringify(finalEvent)}\n\ndata: [DONE]\n\n`, {
+        status: 200,
+        headers: {
+          "content-type": "text/event-stream",
+          "request-id": "provider-final-upstream-request",
+          "x-kong-upstream-latency": "8",
+        },
+      });
+    }
+    const toolEvent = {
+      id: "provider-success-message",
+      object: "chat.completion.chunk",
+      model: "zyra-local-code-model",
+      choices: [{
+        index: 0,
+        delta: {
+          tool_calls: [{
+            index: 0,
+            id: "provider-success-tool",
+            type: "function",
+            function: { name: "read", arguments: JSON.stringify({ path: "a" }) },
+          }],
+        },
+        finish_reason: "tool_calls",
+      }],
+      usage: { prompt_tokens: 12, completion_tokens: 7, total_tokens: 19 },
+    };
+    return new Response(`data: ${JSON.stringify(toolEvent)}\n\ndata: [DONE]\n\n`, {
+      status: 200,
+      headers: {
+        "content-type": "text/event-stream",
+        "request-id": "provider-success-upstream-request",
+        "x-kong-upstream-latency": "12",
+      },
+    });
+  }) as unknown as typeof fetch;
+  const successHost = new MemoryHost();
+  let success: Awaited<ReturnType<ClaudeRuntimeCore["run"]>>;
+  try {
+    success = await new ClaudeRuntimeCore().run(input({
+      runId: "provider-success-run",
+      sessionId: "provider-success-session",
+      workerRequestId: "provider-success-request",
+      turns: [],
+      config: {
+        // One tool-bearing turn still owns a final provider-only response
+        // round; that round must not expand the executable tool budget.
+        maxTurns: 1,
+        runtimeConstraints: {
+          model_transport: "http_sse",
+          model_api_base_url: "https://provider.invalid/v1",
+          model_api_key: "test-only-provider-key",
+        },
+      },
+    }), successHost);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+  const successState = e01State(success);
+  assert.equal(success.ok, true);
+  assert.equal(providerFetchCount, 2);
+  assert.deepEqual(providerUrls, [
+    "https://provider.invalid/v1/chat/completions",
+    "https://provider.invalid/v1/chat/completions",
+  ]);
+  assert.equal(providerBodies[0].stream, true);
+  const providerTools = providerBodies[0].tools as JsonObject[];
+  const firstProviderTool = (providerTools[0]?.function ?? {}) as JsonObject;
+  const firstProviderParameters = (firstProviderTool.parameters ?? {}) as JsonObject;
+  const firstProviderProperties = (firstProviderParameters.properties ?? {}) as JsonObject;
+  const firstProviderPath = (firstProviderProperties.path ?? {}) as JsonObject;
+  assert.equal(providerTools.length, 2);
+  assert.equal(firstProviderTool.name, "read");
+  assert.equal(firstProviderTool.description, "read");
+  assert.equal(firstProviderParameters.type, "object");
+  assert.deepEqual(firstProviderParameters.required, ["path"]);
+  assert.equal(firstProviderParameters.additionalProperties, false);
+  assert.equal(firstProviderPath.type, "string");
+  assert.ok(Array.isArray(providerBodies[1].messages));
+  assert.ok((providerBodies[1].messages as JsonObject[]).some((message) => message.role === "tool"));
+  assert.equal(providerBodies[1].tools, undefined);
+  assert.equal(providerBodies[1].tool_choice, undefined);
+  assert.ok(
+    (providerBodies[1].messages as JsonObject[]).some((message) =>
+      /tool-turn budget is now exhausted.*Do not call any tool/i.test(
+        String(message.content ?? ""),
+      )
+    ),
+    JSON.stringify(providerBodies[1].messages),
+  );
+  assert.ok(successState.telemetry.prompts.length >= 1);
+  assert.equal(successState.telemetry.samples.length, 2);
+  assert.ok(successState.providerPrompt.lastPrompt?.fingerprint);
+  assert.deepEqual(successState.providerRequests.requests.map((item) => item.status), ["completed", "completed"]);
+  assert.deepEqual(successState.providerRequests.attempts.map((item) => item.status), ["succeeded", "succeeded"]);
+  assert.equal(successState.providerRequests.chunks.length, 2);
+  assert.deepEqual(successState.providerResponses.responses.map((item) => item.stopReason), ["tool_use", "end_turn"]);
+  assert.equal(successState.providerRouting.states.find((item) => item.routeId === "compatible-default")?.successes, 2);
+  assert.equal(successState.providerRouting.states.find((item) => item.routeId === "compatible-default")?.inFlight, 0);
+  assert.deepEqual(successState.providerRateLimits.reservations.map((item) => item.status), ["committed", "committed"]);
+  assert.equal(successState.providerRateLimits.buckets.find((item) => item.limitId === "compatible-default-requests")?.consumed, 2);
+  const gatewayEvent = successState.telemetry.events.find((item) =>
+    item.name === "provider.model_stream_report.gateway"
+  );
+  assert.equal(
+    gatewayEvent?.attributes.detected_gateway,
+    "kong",
+    JSON.stringify(successState.telemetry.events),
+  );
+  assert.deepEqual(successState.provider.requests.map((item) => item.state), ["completed", "completed"]);
+  assert.deepEqual(successState.providerTransport.requests.map((item) => item.state), ["completed", "completed"]);
+  assert.equal(successState.providerCredentials.records.length, 1);
+  assert.equal(successState.providerCredentials.records[0].totalSuccesses, 2);
+  assert.deepEqual(successState.tools.calls.map((item) => item.state), ["succeeded"]);
+  assert.ok(successState.tools.leases.every((item) => item.releasedAt !== null));
+  assert.deepEqual(successState.toolResults.accumulators.map((item) => item.status), ["sealed"]);
+  assert.deepEqual(successState.toolResults.deliveries.map((item) => item.success), [true]);
+  assert.deepEqual(successState.session.effects.map((item) => item.state), ["committed"]);
+  assert.ok(successState.session.messages.length >= 4);
+  assert.deepEqual(successState.custody.providers.map((item) => item.state), ["succeeded", "succeeded"]);
+  assert.deepEqual(successState.custody.tools.map((item) => item.state), ["succeeded"]);
+  assert.ok(successState.custody.tools.every((item) => item.effectId && item.deliveryId));
+  assert.deepEqual(successState.custody.turns.map((item) => item.state), ["completed"]);
+  assert.ok(successState.custody.messages.some((item) => item.source === "tool_result"));
+  assert.ok((successState.journal.state.provider?.revision ?? 0) > 0);
+  assert.ok(successHost.events.some((event) => event.phase === "model_request_prepared"));
+  assert.ok(successHost.events.some((event) => event.phase === "model_stream_report"));
+
+  const failureHost = new MemoryHost();
+  const failure = await new ClaudeRuntimeCore().run(input({
+    runId: "provider-failure-run",
+    sessionId: "provider-failure-session",
+    workerRequestId: "provider-failure-request",
+    config: { runtimeConstraints: { simulate_model_error: true } },
+  }), failureHost);
+  const failureState = e01State(failure);
+  assert.equal(failure.ok, false);
+  assert.equal(failure.stoppedReason, "model_error");
+  assert.ok(failureState.recovery.contexts.length >= 1);
+  assert.deepEqual(failureState.providerRequests.requests.map((item) => item.status), ["failed"]);
+  assert.deepEqual(failureState.providerRequests.attempts.map((item) => item.status), ["failed"]);
+  assert.deepEqual(failureState.providerResponses.builders.map((item) => item.status), ["failed"]);
+  assert.equal(failureState.providerRouting.states.find((item) => item.routeId === "local-default")?.failures, 1);
+  assert.deepEqual(failureState.providerRateLimits.reservations.map((item) => item.status), ["released"]);
+  assert.ok((failureState.journal.state.provider?.revision ?? 0) > 0);
+  assert.ok(failureHost.events.some((event) => event.phase === "api_retry_report"));
+});
+
+test("direct-response runtime calls the provider without exposing workspace tools", async () => {
+  const originalFetch = globalThis.fetch;
+  const providerBodies: JsonObject[] = [];
+  globalThis.fetch = (async (
+    _resource: Parameters<typeof fetch>[0],
+    init?: Parameters<typeof fetch>[1],
+  ) => {
+    providerBodies.push(JSON.parse(String(init?.body ?? "{}")) as JsonObject);
+    const event = {
+      id: "direct-response-message",
+      object: "chat.completion.chunk",
+      model: "deepseek-test-model",
+      choices: [{ index: 0, delta: { content: "ZYRA_DIRECT_OK" }, finish_reason: "stop" }],
+      usage: { prompt_tokens: 8, completion_tokens: 4, total_tokens: 12 },
+    };
+    return new Response(`data: ${JSON.stringify(event)}\n\ndata: [DONE]\n\n`, {
+      status: 200,
+      headers: { "content-type": "text/event-stream" },
+    });
+  }) as unknown as typeof fetch;
+  try {
+    const result = await new ClaudeRuntimeCore().run(input({
+      turns: [],
+      config: {
+        maxTurns: 3,
+        runtimeConstraints: {
+          model_transport: "http_sse",
+          model_api_base_url: "https://provider.invalid/v1",
+          model_api_key: "test-only-provider-key",
+          disable_model_tools: true,
+        },
+      },
+    }), new MemoryHost());
+
+    assert.equal(result.ok, true);
+    assert.equal(
+      (result.sessionSnapshot.modelIteration as JsonObject).finalText,
+      "ZYRA_DIRECT_OK",
+    );
+    assert.equal(result.toolCallCount, 0);
+    assert.equal(providerBodies.length, 1);
+    assert.equal(providerBodies[0].tools, undefined);
+    assert.equal(providerBodies[0].tool_choice, undefined);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("auto compaction preserves post-compact delivery verification and completion", async () => {
+  const originalFetch = globalThis.fetch;
+  const requestBodies: JsonObject[] = [];
+  let requestCount = 0;
+  let agentRequestCount = 0;
+  globalThis.fetch = (async (
+    _resource: Parameters<typeof fetch>[0],
+    init?: Parameters<typeof fetch>[1],
+  ) => {
+    requestCount += 1;
+    const body = JSON.parse(String(init?.body ?? "{}")) as JsonObject;
+    requestBodies.push(body);
+    const messages = body.messages as JsonObject[];
+    const isCompactionSummary = messages.some((message) =>
+      JSON.stringify(message.content ?? "").includes("Create a replacement handoff summary")
+    );
+    if (isCompactionSummary) {
+      const event = {
+        id: `compact-summary-response-${requestCount}`,
+        object: "chat.completion.chunk",
+        model: "zyra-local-code-model",
+        choices: [{
+          index: 0,
+          delta: { content: "## Active objective\nContinue the repair.\n\n## Current work\nThe latest read completed.\n\n## Pending work and next action\nContinue with the next tool." },
+          finish_reason: "stop",
+        }],
+        usage: { prompt_tokens: 600, completion_tokens: 40, total_tokens: 640 },
+      };
+      return new Response(`data: ${JSON.stringify(event)}\n\ndata: [DONE]\n\n`, {
+        status: 200,
+        headers: { "content-type": "text/event-stream" },
+      });
+    }
+    agentRequestCount += 1;
+    if (agentRequestCount <= 2) {
+      const event = {
+        id: `compact-tool-response-${agentRequestCount}`,
+        object: "chat.completion.chunk",
+        model: "zyra-local-code-model",
+        choices: [{
+          index: 0,
+          delta: {
+            tool_calls: [{
+              index: 0,
+                id: `compact-tool-${agentRequestCount}`,
+              type: "function",
+              function: {
+                name: "read",
+                arguments: JSON.stringify({ path: agentRequestCount === 1 ? "a" : "b" }),
+              },
+            }],
+          },
+          finish_reason: "tool_calls",
+        }],
+        usage: { prompt_tokens: 1_000, completion_tokens: 10, total_tokens: 1_010 },
+      };
+      return new Response(`data: ${JSON.stringify(event)}\n\ndata: [DONE]\n\n`, {
+        status: 200,
+        headers: { "content-type": "text/event-stream" },
+      });
+    }
+    if (agentRequestCount === 3) {
+      const event = {
+        id: "post-compact-write-response",
+        object: "chat.completion.chunk",
+        model: "zyra-local-code-model",
+        choices: [{
+          index: 0,
+          delta: {
+            tool_calls: [{
+              index: 0,
+              id: "post-compact-write",
+              type: "function",
+              function: {
+                name: "write",
+                arguments: JSON.stringify({ path: "src/fix.py", content: "fixed = True\n" }),
+              },
+            }],
+          },
+          finish_reason: "tool_calls",
+        }],
+        usage: { prompt_tokens: 240, completion_tokens: 20, total_tokens: 260 },
+      };
+      return new Response(`data: ${JSON.stringify(event)}\n\ndata: [DONE]\n\n`, {
+        status: 200,
+        headers: { "content-type": "text/event-stream" },
+      });
+    }
+    if (agentRequestCount === 4) {
+      const event = {
+        id: "post-compact-test-response",
+        object: "chat.completion.chunk",
+        model: "zyra-local-code-model",
+        choices: [{
+          index: 0,
+          delta: {
+            tool_calls: [{
+              index: 0,
+              id: "post-compact-test",
+              type: "function",
+              function: {
+                name: "shell",
+                arguments: JSON.stringify({ command: "python -m pytest tests/test_fix.py -q" }),
+              },
+            }],
+          },
+          finish_reason: "tool_calls",
+        }],
+        usage: { prompt_tokens: 260, completion_tokens: 20, total_tokens: 280 },
+      };
+      return new Response(`data: ${JSON.stringify(event)}\n\ndata: [DONE]\n\n`, {
+        status: 200,
+        headers: { "content-type": "text/event-stream" },
+      });
+    }
+    const event = {
+      id: "compact-final-response",
+      object: "chat.completion.chunk",
+      model: "zyra-local-code-model",
+      choices: [{ index: 0, delta: { content: "done" }, finish_reason: "stop" }],
+      usage: { prompt_tokens: 200, completion_tokens: 5, total_tokens: 205 },
+    };
+    return new Response(`data: ${JSON.stringify(event)}\n\ndata: [DONE]\n\n`, {
+      status: 200,
+      headers: { "content-type": "text/event-stream" },
+    });
+  }) as unknown as typeof fetch;
+  const marker = "original-provider-context-marker-".repeat(1_000);
+  const host = new MemoryHost();
+  let result: Awaited<ReturnType<ClaudeRuntimeCore["run"]>>;
+  try {
+    result = await new ClaudeRuntimeCore().run(input({
+      runId: "provider-compact-run",
+      sessionId: "provider-compact-session",
+      workerRequestId: "provider-compact-request",
+      messages: [{ role: "user", content: marker }],
+      turns: [],
+      metadata: {
+        delivery_contract: { workspace_mutation_required: true },
+      },
+      tools: [
+        ...(input().tools ?? []),
+        {
+          name: "shell",
+          purpose: "execute a shell command",
+          source: "test",
+          input_schema: {
+            type: "object",
+            required: ["command"],
+            properties: { command: { type: "string" } },
+          },
+          output_schema: {},
+          metadata: { read_only: "false", concurrency_safe: "false" },
+        },
+      ],
+      config: {
+        maxTurns: 6,
+        maxQueryContextChars: 500,
+        runtimeConstraints: {
+          model_transport: "http_sse",
+          model_api_base_url: "https://provider.invalid/v1",
+          model_api_key: "test-only-provider-key",
+        },
+      },
+    }), host);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+
+  assert.equal(result.ok, true);
+  assert.equal(agentRequestCount, 5);
+  assert.ok(result.contextCompactionCount >= 2);
+  const agentRequestBodies = requestBodies.filter((body) =>
+    !(body.messages as JsonObject[]).some((message) =>
+      JSON.stringify(message.content ?? "").includes("Create a replacement handoff summary")
+    )
+  );
+  assert.equal(JSON.stringify(agentRequestBodies[0]).includes(marker), true);
+  assert.equal(JSON.stringify(agentRequestBodies[1]).includes(marker), true);
+  assert.equal(JSON.stringify(agentRequestBodies[2]).includes(marker), false);
+  assert.match(JSON.stringify(agentRequestBodies[2]), /Compaction boundary/);
+  assert.deepEqual(
+    host.batches.flatMap((batch) => batch.steps.map((step) => step.tool_name)),
+    ["read", "read", "write", "shell"],
+  );
+  const evidence = result.sessionSnapshot.obligationEvidence as JsonObject;
+  assert.equal((evidence.verification_command_receipts as JsonObject[])[0]?.status, "passed");
+  const modelIteration = result.sessionSnapshot.modelIteration as JsonObject;
+  assert.equal(JSON.stringify(modelIteration.transcript ?? []).includes(marker), false);
+});
+
+test("runtime continues a length-truncated provider turn before accepting completion", async () => {
+  const originalFetch = globalThis.fetch;
+  let requestCount = 0;
+  const requestBodies: JsonObject[] = [];
+  globalThis.fetch = (async (
+    _resource: Parameters<typeof fetch>[0],
+    init?: Parameters<typeof fetch>[1],
+  ) => {
+    requestCount += 1;
+    requestBodies.push(JSON.parse(String(init?.body ?? "{}")) as JsonObject);
+    const choice = requestCount <= 3
+      ? { index: 0, delta: { content: "partial analysis" }, finish_reason: "length" }
+      : requestCount === 4
+      ? {
+        index: 0,
+        delta: {
+          tool_calls: [{
+            index: 0,
+            id: "post-truncation-read",
+            type: "function",
+            function: { name: "read", arguments: JSON.stringify({ path: "a" }) },
+          }],
+        },
+        finish_reason: "tool_calls",
+      }
+      : { index: 0, delta: { content: "Implementation completed." }, finish_reason: "stop" };
+    const payload = {
+      id: `truncation-provider-${requestCount}`,
+      object: "chat.completion.chunk",
+      model: "zyra-local-code-model",
+      choices: [choice],
+      usage: { prompt_tokens: 8, completion_tokens: 4, total_tokens: 12 },
+    };
+    return new Response(`data: ${JSON.stringify(payload)}\n\ndata: [DONE]\n\n`, {
+      status: 200,
+      headers: { "content-type": "text/event-stream" },
+    });
+  }) as unknown as typeof fetch;
+  try {
+    const host = new MemoryHost();
+    const result = await new ClaudeRuntimeCore().run(input({
+      runId: "provider-truncation-run",
+      sessionId: "provider-truncation-session",
+      workerRequestId: "provider-truncation-request",
+      turns: [],
+      config: {
+        maxTurns: 8,
+        runtimeConstraints: {
+          model_transport: "http_sse",
+          model_api_base_url: "https://provider.invalid/v1",
+          model_api_key: "test-only-provider-key",
+        },
+      },
+    }), host);
+
+    assert.equal(result.ok, true);
+    assert.equal(requestCount, 5);
+    assert.equal(host.batches.length, 1);
+    assert.equal(host.events.filter((event) =>
+      event.phase === "provider_length_continuation_requested"
+    ).length, 3);
+    assert.ok((requestBodies[1].messages as JsonObject[]).some((message) =>
+      /reached its output limit.*make a concrete tool call/i.test(String(message.content ?? ""))
+    ));
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("benchmark deadline closeout removes tools and returns a final response", async () => {
+  const originalFetch = globalThis.fetch;
+  const requestBodies: JsonObject[] = [];
+  globalThis.fetch = (async (
+    _resource: Parameters<typeof fetch>[0],
+    init?: Parameters<typeof fetch>[1],
+  ) => {
+    requestBodies.push(JSON.parse(String(init?.body ?? "{}")) as JsonObject);
+    const payload = {
+      id: "deadline-closeout-provider",
+      object: "chat.completion.chunk",
+      model: "zyra-local-code-model",
+      choices: [{
+        index: 0,
+        delta: { content: "Completed from durable workspace state." },
+        finish_reason: "stop",
+      }],
+      usage: { prompt_tokens: 8, completion_tokens: 5, total_tokens: 13 },
+    };
+    return new Response(`data: ${JSON.stringify(payload)}\n\ndata: [DONE]\n\n`, {
+      status: 200,
+      headers: { "content-type": "text/event-stream" },
+    });
+  }) as unknown as typeof fetch;
+  try {
+    const host = new MemoryHost();
+    const result = await new ClaudeRuntimeCore().run(input({
+      turns: [],
+      config: {
+        runtimeConstraints: {
+          model_transport: "http_sse",
+          model_api_base_url: "https://provider.invalid/v1",
+          model_api_key: "test-only-provider-key",
+          external_deadline_epoch_ms: Date.now() + 60_000,
+          closeout_reserve_seconds: 120,
+        },
+      },
+    }), host);
+
+    assert.equal(result.ok, true);
+    assert.equal(requestBodies.length, 1);
+    assert.equal(((requestBodies[0].tools as unknown[]) ?? []).length, 0);
+    assert.equal(host.batches.length, 0);
+    assert.equal(result.metadata.execution_closeout_requested, "true");
+    assert.ok(host.events.some((event) =>
+      event.phase === "execution_resource_budget_accepted"
+    ));
+    assert.ok(host.events.some((event) =>
+      event.phase === "execution_closeout_requested"
+      && event.tools_advertised === 0
+    ));
+    assert.ok(host.events.some((event) =>
+      event.phase === "execution_closeout_completed"
+    ));
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("benchmark deadline outside closeout keeps the open tool loop", async () => {
+  const originalFetch = globalThis.fetch;
+  const requestBodies: JsonObject[] = [];
+  globalThis.fetch = (async (
+    _resource: Parameters<typeof fetch>[0],
+    init?: Parameters<typeof fetch>[1],
+  ) => {
+    requestBodies.push(JSON.parse(String(init?.body ?? "{}")) as JsonObject);
+    const requestCount = requestBodies.length;
+    const choice = requestCount === 1
+      ? {
+        index: 0,
+        delta: {
+          tool_calls: [{
+            index: 0,
+            id: "deadline-far-read",
+            type: "function",
+            function: { name: "read", arguments: JSON.stringify({ path: "a" }) },
+          }],
+        },
+        finish_reason: "tool_calls",
+      }
+      : {
+        index: 0,
+        delta: { content: "Normal tool loop completed." },
+        finish_reason: "stop",
+      };
+    const payload = {
+      id: `deadline-far-provider-${requestCount}`,
+      object: "chat.completion.chunk",
+      model: "zyra-local-code-model",
+      choices: [choice],
+      usage: { prompt_tokens: 8, completion_tokens: 5, total_tokens: 13 },
+    };
+    return new Response(`data: ${JSON.stringify(payload)}\n\ndata: [DONE]\n\n`, {
+      status: 200,
+      headers: { "content-type": "text/event-stream" },
+    });
+  }) as unknown as typeof fetch;
+  try {
+    const host = new MemoryHost();
+    const result = await new ClaudeRuntimeCore().run(input({
+      turns: [],
+      config: {
+        runtimeConstraints: {
+          model_transport: "http_sse",
+          model_api_base_url: "https://provider.invalid/v1",
+          model_api_key: "test-only-provider-key",
+          external_deadline_epoch_ms: Date.now() + 600_000,
+          closeout_reserve_seconds: 60,
+        },
+      },
+    }), host);
+
+    assert.equal(result.ok, true);
+    assert.equal(requestBodies.length, 2);
+    assert.ok(((requestBodies[0].tools as unknown[]) ?? []).length > 0);
+    assert.equal(host.batches.length, 1);
+    assert.equal(result.metadata.execution_closeout_requested, "false");
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("benchmark deadline closeout retries textual DSML instead of accepting it", async () => {
+  const originalFetch = globalThis.fetch;
+  let requestCount = 0;
+  const requestBodies: JsonObject[] = [];
+  globalThis.fetch = (async (
+    _resource: Parameters<typeof fetch>[0],
+    init?: Parameters<typeof fetch>[1],
+  ) => {
+    requestCount += 1;
+    requestBodies.push(JSON.parse(String(init?.body ?? "{}")) as JsonObject);
+    const content = requestCount === 1
+      ? '<｜｜DSML｜｜tool_calls><｜｜DSML｜｜invoke name="shell">late inspection</｜｜DSML｜｜invoke>'
+      : "The requested artifact and required wait completed successfully.";
+    const payload = {
+      id: `deadline-dsml-provider-${requestCount}`,
+      object: "chat.completion.chunk",
+      model: "zyra-local-code-model",
+      choices: [{ index: 0, delta: { content }, finish_reason: "stop" }],
+      usage: { prompt_tokens: 8, completion_tokens: 5, total_tokens: 13 },
+    };
+    return new Response(`data: ${JSON.stringify(payload)}\n\ndata: [DONE]\n\n`, {
+      status: 200,
+      headers: { "content-type": "text/event-stream" },
+    });
+  }) as unknown as typeof fetch;
+  try {
+    const host = new MemoryHost();
+    const result = await new ClaudeRuntimeCore().run(input({
+      turns: [],
+      config: {
+        runtimeConstraints: {
+          model_transport: "http_sse",
+          model_api_base_url: "https://provider.invalid/v1",
+          model_api_key: "test-only-provider-key",
+          external_deadline_epoch_ms: Date.now() + 120_000,
+          closeout_reserve_seconds: 180,
+        },
+      },
+    }), host);
+
+    assert.equal(result.ok, true);
+    assert.equal(requestBodies.length, 2);
+    assert.ok(requestBodies.every((body) =>
+      ((body.tools as unknown[]) ?? []).length === 0
+    ));
+    assert.equal(host.batches.length, 0);
+    assert.ok(host.events.some((event) =>
+      event.phase === "execution_closeout_retry_requested"
+      && event.tools_advertised === 0
+    ));
+    assert.ok(host.events.some((event) =>
+      event.phase === "execution_closeout_completed"
+      && event.attempt === 2
+    ));
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("benchmark deadline crossing fences an unexecuted provider tool turn", async () => {
+  const originalFetch = globalThis.fetch;
+  const originalNow = Date.now;
+  let nowMs = 2_000_000_000_000;
+  let requestCount = 0;
+  const requestBodies: JsonObject[] = [];
+  Date.now = () => nowMs;
+  globalThis.fetch = (async (
+    _resource: Parameters<typeof fetch>[0],
+    init?: Parameters<typeof fetch>[1],
+  ) => {
+    requestCount += 1;
+    requestBodies.push(JSON.parse(String(init?.body ?? "{}")) as JsonObject);
+    const choice = requestCount === 1
+      ? {
+        index: 0,
+        delta: {
+          tool_calls: [{
+            index: 0,
+            id: "late-tool-proposal",
+            type: "function",
+            function: { name: "write", arguments: JSON.stringify({ path: "late", content: "no" }) },
+          }],
+        },
+        finish_reason: "tool_calls",
+      }
+      : {
+        index: 0,
+        delta: { content: "Finalized without starting the late side effect." },
+        finish_reason: "stop",
+      };
+    if (requestCount === 1) nowMs += 100_000;
+    const payload = {
+      id: `deadline-crossing-provider-${requestCount}`,
+      object: "chat.completion.chunk",
+      model: "zyra-local-code-model",
+      choices: [choice],
+      usage: { prompt_tokens: 8, completion_tokens: 5, total_tokens: 13 },
+    };
+    return new Response(`data: ${JSON.stringify(payload)}\n\ndata: [DONE]\n\n`, {
+      status: 200,
+      headers: { "content-type": "text/event-stream" },
+    });
+  }) as unknown as typeof fetch;
+  try {
+    const host = new MemoryHost();
+    const result = await new ClaudeRuntimeCore().run(input({
+      turns: [],
+      config: {
+        runtimeConstraints: {
+          model_transport: "http_sse",
+          model_api_base_url: "https://provider.invalid/v1",
+          model_api_key: "test-only-provider-key",
+          external_deadline_epoch_ms: nowMs + 120_000,
+          closeout_reserve_seconds: 60,
+        },
+      },
+    }), host);
+
+    assert.equal(result.ok, true);
+    assert.equal(requestBodies.length, 2);
+    assert.ok(((requestBodies[0].tools as unknown[]) ?? []).length > 0);
+    assert.equal(((requestBodies[1].tools as unknown[]) ?? []).length, 0);
+    assert.equal(host.batches.length, 0);
+    assert.equal(result.toolCallCount, 0);
+    assert.equal(result.metadata.execution_closeout_requested, "true");
+  } finally {
+    Date.now = originalNow;
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("runtime fails closed after bounded length continuations are exhausted", async () => {
+  const originalFetch = globalThis.fetch;
+  let requestCount = 0;
+  globalThis.fetch = (async () => {
+    requestCount += 1;
+    const payload = {
+      id: `bounded-truncation-provider-${requestCount}`,
+      object: "chat.completion.chunk",
+      model: "zyra-local-code-model",
+      choices: [{
+        index: 0,
+        delta: { content: `partial analysis ${requestCount}` },
+        finish_reason: "length",
+      }],
+      usage: { prompt_tokens: 8, completion_tokens: 4, total_tokens: 12 },
+    };
+    return new Response(`data: ${JSON.stringify(payload)}\n\ndata: [DONE]\n\n`, {
+      status: 200,
+      headers: { "content-type": "text/event-stream" },
+    });
+  }) as unknown as typeof fetch;
+  try {
+    const host = new MemoryHost();
+    const result = await new ClaudeRuntimeCore().run(input({
+      runId: "provider-truncation-exhausted-run",
+      sessionId: "provider-truncation-exhausted-session",
+      workerRequestId: "provider-truncation-exhausted-request",
+      turns: [],
+      config: {
+        maxTurns: 8,
+        runtimeConstraints: {
+          model_transport: "http_sse",
+          model_api_base_url: "https://provider.invalid/v1",
+          model_api_key: "test-only-provider-key",
+          max_length_continuations: 2,
+        },
+      },
+    }), host);
+
+    assert.equal(result.ok, false);
+    assert.equal(result.stoppedReason, "model_output_truncated");
+    assert.equal(requestCount, 3);
+    assert.equal(host.events.filter((event) =>
+      event.phase === "provider_length_continuation_requested"
+    ).length, 2);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("runtime lets canonical recovery policy stop a non-retryable provider request", async () => {
+  const originalFetch = globalThis.fetch;
+  let requestCount = 0;
+  globalThis.fetch = (async () => {
+    requestCount += 1;
+    return new Response("invalid api key", { status: 401 });
+  }) as unknown as typeof fetch;
+  try {
+    const result = await new ClaudeRuntimeCore().run(input({
+      runId: "provider-auth-run",
+      sessionId: "provider-auth-session",
+      workerRequestId: "provider-auth-request",
+      config: {
+        runtimeConstraints: {
+          model_transport: "http_sse",
+          model_api_base_url: "https://provider.invalid/v1",
+          api_retry_max_attempts: 3,
+        },
+      },
+    }), new MemoryHost());
+    const state = e01State(result);
+    assert.equal(result.ok, false);
+    assert.equal(result.stoppedReason, "model_stream_failed");
+    assert.equal(requestCount, 1);
+    assert.equal(state.recovery.contexts.length, 1);
+    assert.ok((state.journal.state.provider?.revision ?? 0) > 0);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("model loop observes a failed command and completes a later repair", async () => {
+  class RecoveringHost extends MemoryHost {
+    executionCount = 0;
+
+    override async executeBatch(
+      batch: ToolBatch,
+      requests: ToolExecutionRequest[],
+    ): Promise<ToolExecutionResponse[]> {
+      this.executionCount += 1;
+      if (this.executionCount === 1) {
+        this.batches.push(batch);
+        return requests.map((request) => ({
+          tool_call_id: request.toolCallId,
+          ok: false,
+          summary: "Command exited with a recoverable conflict",
+          output: { return_code: 1, stderr: "merge conflict" },
+          artifacts: [],
+          error: "sandbox_command_failed",
+          metadata: { termination: "exited", recovery_required: "false" },
+        }));
+      }
+      return super.executeBatch(batch, requests);
+    }
+  }
+
+  const originalFetch = globalThis.fetch;
+  let requestCount = 0;
+  globalThis.fetch = (async () => {
+    requestCount += 1;
+    const toolCall = requestCount <= 2
+      ? {
+        index: 0,
+        id: requestCount === 1 ? "conflicting-command" : "repair-command",
+        type: "function",
+        function: {
+          name: "read",
+          arguments: JSON.stringify({ path: requestCount === 1 ? "conflict" : "resolved" }),
+        },
+      }
+      : null;
+    const payload = {
+      id: `recoverable-provider-${requestCount}`,
+      object: "chat.completion.chunk",
+      model: "zyra-local-code-model",
+      choices: [{
+        index: 0,
+        delta: toolCall === null
+          ? { content: "Conflict resolved." }
+          : { tool_calls: [toolCall] },
+        finish_reason: toolCall === null ? "stop" : "tool_calls",
+      }],
+      usage: { prompt_tokens: 8, completion_tokens: 4, total_tokens: 12 },
+    };
+    return new Response(`data: ${JSON.stringify(payload)}\n\ndata: [DONE]\n\n`, {
+      status: 200,
+      headers: { "content-type": "text/event-stream" },
+    });
+  }) as unknown as typeof fetch;
+  try {
+    const host = new RecoveringHost();
+    const result = await new ClaudeRuntimeCore().run(input({
+      runId: "tool-recovery-run",
+      sessionId: "tool-recovery-session",
+      workerRequestId: "tool-recovery-request",
+      turns: [],
+      config: {
+        runtimeConstraints: {
+          model_transport: "http_sse",
+          model_api_base_url: "https://provider.invalid/v1",
+          model_api_key: "test-only-provider-key",
+        },
+      },
+    }), host);
+    assert.equal(result.ok, true);
+    assert.equal(requestCount, 3);
+    assert.equal(host.executionCount, 2);
+    assert.ok(host.events.some((event) => event.phase === "continue"));
+    assert.deepEqual(e01State(result).tools.calls.map((item) => item.state), [
+      "failed",
+      "succeeded",
+    ]);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("model loop can inspect and repair after a settled sandbox command timeout", async () => {
+  class TimeoutRecoveringHost extends MemoryHost {
+    executionCount = 0;
+
+    override async executeBatch(
+      batch: ToolBatch,
+      requests: ToolExecutionRequest[],
+    ): Promise<ToolExecutionResponse[]> {
+      this.executionCount += 1;
+      if (this.executionCount === 1) {
+        this.batches.push(batch);
+        return requests.map((request) => ({
+          tool_call_id: request.toolCallId,
+          ok: false,
+          summary: "Sandbox command reached its execution deadline",
+          output: { termination: "timed_out" },
+          artifacts: [],
+          error: "process_timeout",
+          metadata: {
+            termination: "timed_out",
+            recovery_required: "true",
+            command_timeout_settled: "true",
+            model_recovery_allowed: "true",
+            process_tree_controlled: "true",
+          },
+        }));
+      }
+      return super.executeBatch(batch, requests);
+    }
+  }
+
+  const originalFetch = globalThis.fetch;
+  let requestCount = 0;
+  globalThis.fetch = (async () => {
+    requestCount += 1;
+    const toolCall = requestCount <= 2
+      ? {
+        index: 0,
+        id: requestCount === 1 ? "long-command" : "inspect-after-timeout",
+        type: "function",
+        function: {
+          name: "read",
+          arguments: JSON.stringify({ path: requestCount === 1 ? "install" : "state" }),
+        },
+      }
+      : null;
+    const payload = {
+      id: `timeout-recovery-provider-${requestCount}`,
+      object: "chat.completion.chunk",
+      model: "zyra-local-code-model",
+      choices: [{
+        index: 0,
+        delta: toolCall === null
+          ? { content: "Recovered after inspecting the timed-out command." }
+          : { tool_calls: [toolCall] },
+        finish_reason: toolCall === null ? "stop" : "tool_calls",
+      }],
+      usage: { prompt_tokens: 8, completion_tokens: 4, total_tokens: 12 },
+    };
+    return new Response(`data: ${JSON.stringify(payload)}\n\ndata: [DONE]\n\n`, {
+      status: 200,
+      headers: { "content-type": "text/event-stream" },
+    });
+  }) as unknown as typeof fetch;
+  try {
+    const host = new TimeoutRecoveringHost();
+    const result = await new ClaudeRuntimeCore().run(input({
+      runId: "settled-timeout-recovery-run",
+      sessionId: "settled-timeout-recovery-session",
+      workerRequestId: "settled-timeout-recovery-request",
+      turns: [],
+      config: {
+        runtimeConstraints: {
+          model_transport: "http_sse",
+          model_api_base_url: "https://provider.invalid/v1",
+          model_api_key: "test-only-provider-key",
+        },
+      },
+    }), host);
+    assert.equal(result.ok, true);
+    assert.equal(requestCount, 3);
+    assert.equal(host.executionCount, 2);
+    assert.ok(host.events.some((event) =>
+      event.phase === "watchdog_signal"
+      && ((event.watchdog_signal ?? {}) as JsonObject).action === "continue"
+    ));
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("model loop can replan after a settled sandbox process start failure", async () => {
+  class StartFailureRecoveringHost extends MemoryHost {
+    executionCount = 0;
+
+    override async executeBatch(
+      batch: ToolBatch,
+      requests: ToolExecutionRequest[],
+    ): Promise<ToolExecutionResponse[]> {
+      this.executionCount += 1;
+      if (this.executionCount === 1) {
+        this.batches.push(batch);
+        return requests.map((request) => ({
+          tool_call_id: request.toolCallId,
+          ok: false,
+          summary: "Sandbox command failed before the process started",
+          output: {
+            termination: "failed_to_start",
+            recovery_hint: "Change the structured executable/argv before retrying.",
+          },
+          artifacts: [],
+          error: "process_start_failed",
+          metadata: {
+            termination: "failed_to_start",
+            recovery_required: "true",
+            command_start_failure_settled: "true",
+            model_recovery_allowed: "true",
+            process_tree_controlled: "true",
+            workspace_mutation_committed: "false",
+          },
+        }));
+      }
+      return super.executeBatch(batch, requests);
+    }
+  }
+
+  const originalFetch = globalThis.fetch;
+  let requestCount = 0;
+  globalThis.fetch = (async () => {
+    requestCount += 1;
+    const toolCall = requestCount <= 2
+      ? {
+        index: 0,
+        id: requestCount === 1 ? "missing-command" : "replacement-command",
+        type: "function",
+        function: {
+          name: "read",
+          arguments: JSON.stringify({ path: requestCount === 1 ? "missing" : "available" }),
+        },
+      }
+      : null;
+    const payload = {
+      id: `start-failure-recovery-provider-${requestCount}`,
+      object: "chat.completion.chunk",
+      model: "zyra-local-code-model",
+      choices: [{
+        index: 0,
+        delta: toolCall === null
+          ? { content: "Recovered with a different executable." }
+          : { tool_calls: [toolCall] },
+        finish_reason: toolCall === null ? "stop" : "tool_calls",
+      }],
+      usage: { prompt_tokens: 8, completion_tokens: 4, total_tokens: 12 },
+    };
+    return new Response(`data: ${JSON.stringify(payload)}\n\ndata: [DONE]\n\n`, {
+      status: 200,
+      headers: { "content-type": "text/event-stream" },
+    });
+  }) as unknown as typeof fetch;
+  try {
+    const host = new StartFailureRecoveringHost();
+    const result = await new ClaudeRuntimeCore().run(input({
+      runId: "settled-start-failure-recovery-run",
+      sessionId: "settled-start-failure-recovery-session",
+      workerRequestId: "settled-start-failure-recovery-request",
+      turns: [],
+      config: {
+        runtimeConstraints: {
+          model_transport: "http_sse",
+          model_api_base_url: "https://provider.invalid/v1",
+          model_api_key: "test-only-provider-key",
+        },
+      },
+    }), host);
+    assert.equal(result.ok, true);
+    assert.equal(requestCount, 3);
+    assert.equal(host.executionCount, 2);
+    assert.ok(host.events.some((event) =>
+      event.phase === "watchdog_signal"
+      && ((event.watchdog_signal ?? {}) as JsonObject).action === "continue"
+    ));
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("model loop stops three identical failed tool calls instead of burning the turn budget", async () => {
+  class AlwaysFailingHost extends MemoryHost {
+    executionCount = 0;
+
+    override async executeBatch(
+      batch: ToolBatch,
+      requests: ToolExecutionRequest[],
+    ): Promise<ToolExecutionResponse[]> {
+      this.executionCount += 1;
+      this.batches.push(batch);
+      return requests.map((request) => ({
+        tool_call_id: request.toolCallId,
+        ok: false,
+        summary: "SandboxGateway rejected the command",
+        output: { reason: "remove shell composition" },
+        artifacts: [],
+        error: "ValueError",
+        metadata: { termination: "exited", recovery_required: "false" },
+      }));
+    }
+  }
+
+  const originalFetch = globalThis.fetch;
+  let requestCount = 0;
+  globalThis.fetch = (async () => {
+    requestCount += 1;
+    const payload = {
+      id: `repeated-failure-provider-${requestCount}`,
+      object: "chat.completion.chunk",
+      model: "zyra-local-code-model",
+      choices: [{
+        index: 0,
+        delta: {
+          tool_calls: [{
+            index: 0,
+            id: `repeated-command-${requestCount}`,
+            type: "function",
+            function: {
+              name: "read",
+              arguments: JSON.stringify({ path: "unchanged" }),
+            },
+          }],
+        },
+        finish_reason: "tool_calls",
+      }],
+      usage: { prompt_tokens: 8, completion_tokens: 4, total_tokens: 12 },
+    };
+    return new Response(`data: ${JSON.stringify(payload)}\n\ndata: [DONE]\n\n`, {
+      status: 200,
+      headers: { "content-type": "text/event-stream" },
+    });
+  }) as unknown as typeof fetch;
+  try {
+    const host = new AlwaysFailingHost();
+    const result = await new ClaudeRuntimeCore().run(input({
+      runId: "repeated-failure-run",
+      sessionId: "repeated-failure-session",
+      workerRequestId: "repeated-failure-request",
+      turns: [],
+      config: {
+        maxTurns: 20,
+        runtimeConstraints: {
+          model_transport: "http_sse",
+          model_api_base_url: "https://provider.invalid/v1",
+          model_api_key: "test-only-provider-key",
+        },
+      },
+    }), host);
+
+    assert.equal(result.ok, false);
+    assert.equal(result.stoppedReason, "repeated_tool_failure");
+    assert.equal(host.executionCount, 3);
+    assert.equal(requestCount, 3);
+    assert.equal(result.metadata.repeated_tool_failure_trips, "1");
+    assert.ok(host.events.some((event) =>
+      event.phase === "watchdog_signal"
+      && ((event.watchdog_signal ?? {}) as JsonObject).action === "stop"
+    ));
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("model loop fails closed when a tool outcome requires reconciliation", async () => {
+  class IndeterminateHost extends MemoryHost {
+    override async executeBatch(
+      batch: ToolBatch,
+      requests: ToolExecutionRequest[],
+    ): Promise<ToolExecutionResponse[]> {
+      this.batches.push(batch);
+      return requests.map((request) => ({
+        tool_call_id: request.toolCallId,
+        ok: false,
+        summary: "Command timed out with an indeterminate outcome",
+        output: {},
+        artifacts: [],
+        error: "tool_execution_timeout",
+        metadata: { termination: "timed_out", recovery_required: "true" },
+      }));
+    }
+  }
+
+  const originalFetch = globalThis.fetch;
+  let requestCount = 0;
+  globalThis.fetch = (async () => {
+    requestCount += 1;
+    const payload = {
+      id: "indeterminate-provider-message",
+      object: "chat.completion.chunk",
+      model: "zyra-local-code-model",
+      choices: [{
+        index: 0,
+        delta: {
+          tool_calls: [{
+            index: 0,
+            id: "indeterminate-command",
+            type: "function",
+            function: { name: "read", arguments: JSON.stringify({ path: "a" }) },
+          }],
+        },
+        finish_reason: "tool_calls",
+      }],
+      usage: { prompt_tokens: 8, completion_tokens: 4, total_tokens: 12 },
+    };
+    return new Response(`data: ${JSON.stringify(payload)}\n\ndata: [DONE]\n\n`, {
+      status: 200,
+      headers: { "content-type": "text/event-stream" },
+    });
+  }) as unknown as typeof fetch;
+  try {
+    const host = new IndeterminateHost();
+    const result = await new ClaudeRuntimeCore().run(input({
+      runId: "tool-indeterminate-run",
+      sessionId: "tool-indeterminate-session",
+      workerRequestId: "tool-indeterminate-request",
+      turns: [],
+      config: {
+        runtimeConstraints: {
+          model_transport: "http_sse",
+          model_api_base_url: "https://provider.invalid/v1",
+          model_api_key: "test-only-provider-key",
+        },
+      },
+    }), host);
+    assert.equal(result.ok, false);
+    assert.equal(result.stoppedReason, "tool_execution_timeout");
+    assert.equal(requestCount, 1);
+    const watchdog = host.events.find((event) => event.phase === "watchdog_signal");
+    assert.equal((watchdog?.watchdog_signal as JsonObject).action, "stop");
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("runtime clears canonical recovery state after a retry succeeds", async () => {
+  const originalFetch = globalThis.fetch;
+  let requestCount = 0;
+  globalThis.fetch = (async () => {
+    requestCount += 1;
+    if (requestCount === 1) {
+      return new Response("temporary provider failure", {
+        status: 503,
+        headers: { "retry-after": "0.6" },
+      });
+    }
+    const payload = requestCount === 2
+      ? {
+        id: "retry-provider-message",
+        object: "chat.completion.chunk",
+        model: "zyra-local-code-model",
+        choices: [{
+          index: 0,
+          delta: {
+            tool_calls: [{
+              index: 0,
+              id: "retry-tool-call",
+              type: "function",
+              function: { name: "read", arguments: JSON.stringify({ path: "a" }) },
+            }],
+          },
+          finish_reason: "tool_calls",
+        }],
+        usage: { prompt_tokens: 4, completion_tokens: 3, total_tokens: 7 },
+      }
+      : {
+        id: "retry-provider-final",
+        object: "chat.completion.chunk",
+        model: "zyra-local-code-model",
+        choices: [{ index: 0, delta: { content: "Retry completed." }, finish_reason: "stop" }],
+        usage: { prompt_tokens: 8, completion_tokens: 2, total_tokens: 10 },
+      };
+    return new Response(`data: ${JSON.stringify(payload)}\n\ndata: [DONE]\n\n`, {
+      status: 200,
+      headers: { "content-type": "text/event-stream" },
+    });
+  }) as unknown as typeof fetch;
+  try {
+    const retryHost = new MemoryHost();
+    const result = await new ClaudeRuntimeCore().run(input({
+      runId: "provider-retry-run",
+      sessionId: "provider-retry-session",
+      workerRequestId: "provider-retry-request",
+      config: {
+        runtimeConstraints: {
+          model_transport: "http_sse",
+          model_api_base_url: "https://provider.invalid/v1",
+          api_retry_max_attempts: 2,
+        },
+      },
+    }), retryHost);
+    const state = e01State(result);
+    assert.equal(result.ok, true);
+    assert.equal(requestCount, 3);
+    assert.equal(state.recovery.contexts.length, 0);
+    const failedRetryReport = retryHost.events.find((event) => {
+      const stream = (event.model_stream ?? {}) as JsonObject;
+      return event.phase === "model_stream_report" && stream.ok === false;
+    });
+    const failedRetryStream = (failedRetryReport?.model_stream ?? {}) as JsonObject;
+    const retryPlan = (failedRetryStream.recovery_plan ?? {}) as JsonObject;
+    assert.equal(retryPlan.delayMs, 600);
+    assert.ok(retryHost.events.some((event) => event.phase === "api_retry_report"));
+    assert.ok((state.journal.state.provider?.revision ?? 0) > 0);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("runtime restores its exact TypeScript snapshot", async () => {
+  const firstHost = new MemoryHost();
+  const first = await new ClaudeRuntimeCore().run(input({
+    turns: [[{ tool_name: "read", arguments: { path: "a" } }]],
+  }), firstHost);
+  const resumedHost = new MemoryHost();
+  const resumed = await new ClaudeRuntimeCore().run(input({
+    turns: [[{ tool_name: "read", arguments: { path: "b" } }]],
+    restoredState: first.sessionSnapshot,
+  }), resumedHost);
+  const firstState = e01State(first);
+  const resumedState = e01State(resumed);
+  assert.equal(resumed.ok, true);
+  assert.equal(resumed.metadata.restored, "true");
+  assert.equal(
+    (resumed.sessionSnapshot.lineage as { restored?: boolean } | null)?.restored,
+    true,
+  );
+  assert.ok(resumedState.journal.revision > firstState.journal.revision);
+  assert.ok(resumedState.query.revision > firstState.query.revision);
+  assert.ok(resumedState.session.messages.length > firstState.session.messages.length);
+  assert.ok(resumedHost.events.some((event) => event.phase === "context_restored"));
+});
+
+test("runtime stops on max turns, abort and model error", async () => {
+  const maxTurns = await new ClaudeRuntimeCore().run(input({
+    config: { maxTurns: 1 },
+  }), new MemoryHost());
+  assert.equal(maxTurns.ok, false);
+  assert.equal(maxTurns.stoppedReason, "max_turns_exceeded");
+  assert.equal(maxTurns.turnCount, 1);
+
+  const abortedHost = new MemoryHost();
+  abortedHost.aborted = true;
+  const aborted = await new ClaudeRuntimeCore().run(input(), abortedHost);
+  assert.equal(aborted.ok, false);
+  assert.equal(aborted.stoppedReason, "user_cancelled");
+
+  const modelError = await new ClaudeRuntimeCore().run(input({
+    config: { runtimeConstraints: { simulate_model_error: true } },
+  }), new MemoryHost());
+  assert.equal(modelError.ok, false);
+  assert.equal(modelError.stoppedReason, "model_error");
+});
+
+test("runtime projects control commands and failure recovery signals", async () => {
+  const controlHost = new MemoryHost();
+  const controlled = await new ClaudeRuntimeCore().run(input({
+    turns: [[{ tool_name: "read", arguments: { path: "a" } }]],
+    config: {
+      controlCommands: [
+        { name: "context" },
+        { name: "resume" },
+        { name: "doctor", artifact_policy: "artifact" },
+      ],
+    },
+  }), controlHost);
+  assert.equal(controlled.ok, true);
+  assert.equal(controlled.metadata.control_command_count, "3");
+  assert.equal(controlled.metadata.runtime_state_control_mutations, "3");
+  assert.equal(controlled.metadata.session_lifecycle_resume_plans, "1");
+  assert.ok(controlHost.events.some((event) => event.phase === "control_command"));
+  assert.ok(controlled.artifacts.some((artifact) => artifact.title.includes("Claude control command")));
+
+  const failureHost = new MemoryHost();
+  const failed = await new ClaudeRuntimeCore().run(input({
+    turns: [[{ tool_name: "read", arguments: { path: "a", fail: true } }]],
+  }), failureHost);
+  assert.equal(failed.ok, false);
+  assert.ok(failureHost.events.some((event) => event.phase === "tool_failure_signal"));
+  assert.ok(failureHost.events.some((event) => event.phase === "watchdog_signal"));
+});
+
+test("required delivery turns an analysis-only final into an incremental tool action", async () => {
+  const originalFetch = globalThis.fetch;
+  let requestCount = 0;
+  globalThis.fetch = (async () => {
+    requestCount += 1;
+    const choice = requestCount === 1
+      ? { index: 0, delta: { content: "I have enough information to describe the change." }, finish_reason: "stop" }
+      : requestCount === 2
+        ? {
+          index: 0,
+          delta: {
+            tool_calls: [{
+              index: 0,
+              id: "progressive-write",
+              type: "function",
+              function: { name: "write", arguments: '{"path":"draft.txt","content":"minimum result"}' },
+            }],
+          },
+          finish_reason: "tool_calls",
+        }
+        : { index: 0, delta: { content: "The durable result was created and checked." }, finish_reason: "stop" };
+    return new Response(`data: ${JSON.stringify({
+      id: `progressive-${requestCount}`,
+      object: "chat.completion.chunk",
+      model: "zyra-local-code-model",
+      choices: [choice],
+    })}\n\ndata: [DONE]\n\n`, {
+      status: 200,
+      headers: { "content-type": "text/event-stream" },
+    });
+  }) as unknown as typeof fetch;
+  try {
+    const host = new MemoryHost();
+    const result = await new ClaudeRuntimeCore().run(input({
+      turns: [],
+      metadata: {
+        delivery_contract: {
+          workspace_mutation_required: true,
+          verification_required: false,
+        },
+      },
+      config: {
+        runtimeConstraints: {
+          model_transport: "http_sse",
+          model_api_base_url: "https://provider.invalid/v1",
+        },
+      },
+    }), host);
+
+    assert.equal(result.ok, true);
+    assert.equal(requestCount, 3);
+    assert.equal(host.batches.length, 1);
+    assert.equal(host.batches[0]?.steps[0]?.tool_name, "write");
+    assert.ok(
+      host.events.some((event) => event.phase === "progressive_action_requested"),
+      JSON.stringify(host.events.map((event) => event.phase)),
+    );
+    assert.equal(result.metadata.progressive_real_actions, "1");
+    assert.equal(result.metadata.progressive_action_nudges, "1");
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("objective completion stop hook continues the same provider session", async () => {
+  const originalFetch = globalThis.fetch;
+  let requestCount = 0;
+  globalThis.fetch = (async () => {
+    requestCount += 1;
+    const choice = requestCount === 1
+      ? {
+        index: 0,
+        delta: {
+          tool_calls: [{
+            index: 0,
+            id: "completion-stop-write",
+            type: "function",
+            function: {
+              name: "write",
+              arguments: '{"path":"result.txt","content":"partial"}',
+            },
+          }],
+        },
+        finish_reason: "tool_calls",
+      }
+      : {
+        index: 0,
+        delta: {
+          content: requestCount === 2
+            ? "I am done after the first partial artifact."
+            : "The required delivery is now complete.",
+        },
+        finish_reason: "stop",
+      };
+    return new Response(`data: ${JSON.stringify({
+      id: `completion-stop-${requestCount}`,
+      object: "chat.completion.chunk",
+      model: "zyra-local-code-model",
+      choices: [choice],
+    })}\n\ndata: [DONE]\n\n`, {
+      status: 200,
+      headers: { "content-type": "text/event-stream" },
+    });
+  }) as unknown as typeof fetch;
+  class CompletionStopHost extends MemoryHost {
+    completionChecks = 0;
+
+    async evaluateCompletion(
+      request: CompletionGateRequest,
+    ): Promise<CompletionGateResult> {
+      this.completionChecks += 1;
+      assert.equal(
+        request.obligationEvidence.schema,
+        "zyra.runtime-obligation-evidence/v1",
+      );
+      if (this.completionChecks === 1) {
+        assert.equal(request.finalText, "I am done after the first partial artifact.");
+        return {
+          passed: false,
+          reason: "required output is still missing",
+          failedChecks: ["required_paths_present"],
+          continuationMessage: "Continue and finish result.txt before stopping.",
+        };
+      }
+      return {
+        passed: true,
+        reason: "objective delivery checks passed",
+        failedChecks: [],
+        continuationMessage: "",
+      };
+    }
+  }
+  try {
+    const host = new CompletionStopHost();
+    const result = await new ClaudeRuntimeCore().run(input({
+      turns: [],
+      metadata: {
+        delivery_contract: {
+          workspace_mutation_required: true,
+          verification_required: false,
+          required_paths: ["result.txt"],
+        },
+      },
+      config: {
+        runtimeConstraints: {
+          model_transport: "http_sse",
+          model_api_base_url: "https://provider.invalid/v1",
+        },
+      },
+    }), host);
+
+    assert.equal(result.ok, true);
+    assert.equal(requestCount, 3);
+    assert.equal(host.completionChecks, 2);
+    assert.equal(result.metadata.completion_stop_continuations, "1");
+    assert.ok(host.events.some((event) => event.phase === "completion_stop_blocked"));
+    assert.ok(host.events.some((event) => event.phase === "completion_stop_released"));
+    const stopCheckpoint = host.checkpoints.find(
+      (checkpoint) => checkpoint.checkpointPhase === "completion_stop_blocked",
+    );
+    assert.equal(
+      (stopCheckpoint?.completionStop as JsonObject | undefined)?.continuationCount,
+      1,
+    );
+    assert.equal(
+      (stopCheckpoint?.obligationEvidence as JsonObject | undefined)?.schema,
+      "zyra.runtime-obligation-evidence/v1",
+    );
+    assert.match(
+      JSON.stringify(stopCheckpoint?.modelIteration),
+      /Continue and finish result\.txt before stopping\./,
+    );
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("objective completion stop hook fails closed after its bounded retries", async () => {
+  const originalFetch = globalThis.fetch;
+  let requestCount = 0;
+  globalThis.fetch = (async () => {
+    requestCount += 1;
+    const choice = requestCount === 1
+      ? {
+        index: 0,
+        delta: {
+          tool_calls: [{
+            index: 0,
+            id: "completion-stop-partial",
+            type: "function",
+            function: {
+              name: "write",
+              arguments: '{"path":"partial.txt","content":"partial"}',
+            },
+          }],
+        },
+        finish_reason: "tool_calls",
+      }
+      : { index: 0, delta: { content: "Stopping early." }, finish_reason: "stop" };
+    return new Response(`data: ${JSON.stringify({
+      id: `completion-stop-exhaustion-${requestCount}`,
+      object: "chat.completion.chunk",
+      model: "zyra-local-code-model",
+      choices: [choice],
+    })}\n\ndata: [DONE]\n\n`, {
+      status: 200,
+      headers: { "content-type": "text/event-stream" },
+    });
+  }) as unknown as typeof fetch;
+  class RejectingCompletionHost extends MemoryHost {
+    async evaluateCompletion(): Promise<CompletionGateResult> {
+      return {
+        passed: false,
+        reason: "required output is missing",
+        failedChecks: ["required_paths_present"],
+        continuationMessage: "Continue the task and create the missing output.",
+      };
+    }
+  }
+  try {
+    const host = new RejectingCompletionHost();
+    const result = await new ClaudeRuntimeCore().run(input({
+      turns: [],
+      metadata: {
+        delivery_contract: {
+          workspace_mutation_required: true,
+          verification_required: false,
+          required_paths: ["complete.txt"],
+        },
+      },
+      config: {
+        runtimeConstraints: {
+          model_transport: "http_sse",
+          model_api_base_url: "https://provider.invalid/v1",
+          max_completion_stop_continuations: 1,
+        },
+      },
+    }), host);
+
+    assert.equal(result.ok, false);
+    assert.equal(result.stoppedReason, "completion_stop_exhausted");
+    assert.equal(requestCount, 3);
+    assert.equal(result.metadata.completion_stop_continuations, "1");
+    assert.ok(host.events.some((event) => event.phase === "completion_stop_exhausted"));
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("delivered workspace state requests behavioral verification before final response", async () => {
+  const originalFetch = globalThis.fetch;
+  let requestCount = 0;
+  globalThis.fetch = (async () => {
+    requestCount += 1;
+    const choice = requestCount === 1
+      ? {
+        index: 0,
+        delta: {
+          tool_calls: [{
+            index: 0,
+            id: "verified-write",
+            type: "function",
+            function: {
+              name: "write",
+              arguments: '{"path":"result.txt","content":"delivered"}',
+            },
+          }],
+        },
+        finish_reason: "tool_calls",
+      }
+      : requestCount === 2
+        ? {
+          index: 0,
+          delta: { content: "The requested result is complete." },
+          finish_reason: "stop",
+        }
+        : requestCount === 3
+          ? {
+            index: 0,
+            delta: {
+              tool_calls: [{
+                index: 0,
+                id: "behavioral-test",
+                type: "function",
+                function: {
+                  name: "shell",
+                  arguments: '{"command":"python -m pytest tests -q"}',
+                },
+              }],
+            },
+            finish_reason: "tool_calls",
+          }
+          : {
+            index: 0,
+            delta: { content: "The requested result is complete and the tests passed." },
+            finish_reason: "stop",
+          };
+    return new Response(`data: ${JSON.stringify({
+      id: `verification-progress-${requestCount}`,
+      object: "chat.completion.chunk",
+      model: "zyra-local-code-model",
+      choices: [choice],
+    })}\n\ndata: [DONE]\n\n`, {
+      status: 200,
+      headers: { "content-type": "text/event-stream" },
+    });
+  }) as unknown as typeof fetch;
+  try {
+    const host = new MemoryHost();
+    const result = await new ClaudeRuntimeCore().run(input({
+      turns: [],
+      metadata: {
+        delivery_contract: {
+          workspace_mutation_required: true,
+        },
+      },
+      tools: [
+        ...(input().tools ?? []),
+        {
+          name: "shell",
+          purpose: "execute a shell command",
+          source: "test",
+          input_schema: {
+            type: "object",
+            required: ["command"],
+            properties: { command: { type: "string" } },
+          },
+          output_schema: {},
+          metadata: { read_only: "false", concurrency_safe: "false" },
+        },
+      ],
+      config: {
+        runtimeConstraints: {
+          model_transport: "http_sse",
+          model_api_base_url: "https://provider.invalid/v1",
+        },
+      },
+    }), host);
+
+    assert.equal(result.ok, true);
+    assert.equal(requestCount, 4);
+    assert.deepEqual(
+      host.batches.flatMap((batch) => batch.steps.map((step) => step.tool_name)),
+      ["write", "shell"],
+    );
+    assert.ok(
+      host.events.some((event) => event.phase === "progressive_verification_requested"),
+      JSON.stringify(host.events.map((event) => event.phase)),
+    );
+    assert.equal(result.metadata.progressive_verifications, "1");
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("required delivery redirects repeated read-only inspection into execution", async () => {
+  const originalFetch = globalThis.fetch;
+  const requestBodies: string[] = [];
+  let requestCount = 0;
+  globalThis.fetch = (async (_input: unknown, init?: RequestInit) => {
+    requestCount += 1;
+    requestBodies.push(String(init?.body ?? ""));
+    const choice = requestCount <= 2
+      ? {
+        index: 0,
+        delta: {
+          tool_calls: [{
+            index: 0,
+            id: `inspection-${requestCount}`,
+            type: "function",
+            function: {
+              name: "read",
+              arguments: JSON.stringify({ path: `source-${requestCount}.ts` }),
+            },
+          }],
+        },
+        finish_reason: "tool_calls",
+      }
+      : requestCount === 3
+        ? {
+          index: 0,
+          delta: {
+            tool_calls: [{
+              index: 0,
+              id: "delivery-write",
+              type: "function",
+              function: {
+                name: "write",
+                arguments: '{"path":"result.txt","content":"delivered"}',
+              },
+            }],
+          },
+          finish_reason: "tool_calls",
+        }
+        : {
+          index: 0,
+          delta: { content: "The requested result was implemented and verified." },
+          finish_reason: "stop",
+        };
+    return new Response(`data: ${JSON.stringify({
+      id: `inspection-progress-${requestCount}`,
+      object: "chat.completion.chunk",
+      model: "zyra-local-code-model",
+      choices: [choice],
+    })}\n\ndata: [DONE]\n\n`, {
+      status: 200,
+      headers: { "content-type": "text/event-stream" },
+    });
+  }) as unknown as typeof fetch;
+  try {
+    const host = new MemoryHost();
+    const result = await new ClaudeRuntimeCore().run(input({
+      turns: [],
+      metadata: {
+        delivery_contract: {
+          workspace_mutation_required: true,
+          verification_required: false,
+        },
+      },
+      config: {
+        runtimeConstraints: {
+          model_transport: "http_sse",
+          model_api_base_url: "https://provider.invalid/v1",
+          pre_delivery_observation_nudge_after: 2,
+        },
+      },
+    }), host);
+
+    assert.equal(result.ok, true);
+    assert.equal(requestCount, 4);
+    assert.deepEqual(
+      host.batches.flatMap((batch) => batch.steps.map((step) => step.tool_name)),
+      ["read", "read", "write"],
+    );
+    assert.match(requestBodies[2] ?? "", /Stop broad repository inspection/);
+    assert.match(requestBodies[2] ?? "", /map every public requirement and acceptance condition/);
+    assert.ok(
+      host.events.some((event) => (
+        event.phase === "progressive_action_requested"
+        && event.consecutive_pre_delivery_observations === 2
+      )),
+    );
+    assert.equal(result.metadata.progressive_action_nudges, "1");
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("unverified restored delivery requests verification after a tool observation", async () => {
+  const originalFetch = globalThis.fetch;
+  const requestBodies: string[] = [];
+  let requestCount = 0;
+  globalThis.fetch = (async (_input: unknown, init?: RequestInit) => {
+    requestCount += 1;
+    requestBodies.push(String(init?.body ?? ""));
+    const choice = requestCount === 1
+      ? {
+        index: 0,
+        delta: {
+          tool_calls: [{
+            index: 0,
+            id: "post-restore-read",
+            type: "function",
+            function: { name: "read", arguments: '{"path":"tests/public/test_metrics.py"}' },
+          }],
+        },
+        finish_reason: "tool_calls",
+      }
+      : requestCount === 2
+        ? {
+          index: 0,
+          delta: {
+            tool_calls: [{
+              index: 0,
+              id: "post-restore-tests",
+              type: "function",
+              function: { name: "shell", arguments: '{"command":"python -m pytest tests -q"}' },
+            }],
+          },
+          finish_reason: "tool_calls",
+        }
+        : {
+          index: 0,
+          delta: { content: "The restored delivery is now behaviorally verified." },
+          finish_reason: "stop",
+        };
+    return new Response(`data: ${JSON.stringify({
+      id: `post-tool-verification-${requestCount}`,
+      object: "chat.completion.chunk",
+      model: "zyra-local-code-model",
+      choices: [choice],
+    })}\n\ndata: [DONE]\n\n`, {
+      status: 200,
+      headers: { "content-type": "text/event-stream" },
+    });
+  }) as unknown as typeof fetch;
+  try {
+    const host = new MemoryHost();
+    const result = await new ClaudeRuntimeCore().run(input({
+      turns: [],
+      metadata: {
+        delivery_contract: { workspace_mutation_required: true },
+        task_handoff_progress: {
+          requiredDeliveryMissing: false,
+          workspaceMutationCount: 3,
+          verificationCount: 0,
+        },
+      },
+      tools: [
+        ...(input().tools ?? []),
+        {
+          name: "shell",
+          purpose: "execute a shell command",
+          source: "test",
+          input_schema: {
+            type: "object",
+            required: ["command"],
+            properties: { command: { type: "string" } },
+          },
+          output_schema: {},
+          metadata: { read_only: "false", concurrency_safe: "false" },
+        },
+      ],
+      config: {
+        runtimeConstraints: {
+          model_transport: "http_sse",
+          model_api_base_url: "https://provider.invalid/v1",
+        },
+      },
+    }), host);
+
+    assert.equal(result.ok, true);
+    assert.equal(requestCount, 3);
+    assert.deepEqual(
+      host.batches.flatMap((batch) => batch.steps.map((step) => step.tool_name)),
+      ["read", "shell"],
+    );
+    assert.match(requestBodies[1] ?? "", /Before continuing broad inspection/);
+    assert.match(requestBodies[1] ?? "", /owning test runner/);
+    assert.match(requestBodies[1] ?? "", /Preserve the test command's real exit status/);
+    assert.ok(host.events.some((event) => (
+      event.phase === "progressive_verification_requested"
+      && event.post_tool === true
+    )));
+    assert.equal(result.metadata.progressive_verifications, "1");
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("required delivery circuit declines further inspection and accepts the next edit", async () => {
+  const originalFetch = globalThis.fetch;
+  let requestCount = 0;
+  globalThis.fetch = (async () => {
+    requestCount += 1;
+    const choice = requestCount <= 5
+      ? {
+        index: 0,
+        delta: {
+          tool_calls: [{
+            index: 0,
+            id: `circuit-read-${requestCount}`,
+            type: "function",
+            function: { name: "read", arguments: JSON.stringify({ path: `source-${requestCount}.ts` }) },
+          }],
+        },
+        finish_reason: "tool_calls",
+      }
+      : requestCount === 6
+        ? {
+          index: 0,
+          delta: {
+            tool_calls: [{
+              index: 0,
+              id: "circuit-write",
+              type: "function",
+              function: { name: "write", arguments: '{"path":"result.txt","content":"delivered"}' },
+            }],
+          },
+          finish_reason: "tool_calls",
+        }
+        : { index: 0, delta: { content: "Implemented and verified." }, finish_reason: "stop" };
+    return new Response(`data: ${JSON.stringify({
+      id: `inspection-circuit-${requestCount}`,
+      object: "chat.completion.chunk",
+      model: "zyra-local-code-model",
+      choices: [choice],
+    })}\n\ndata: [DONE]\n\n`, {
+      status: 200,
+      headers: { "content-type": "text/event-stream" },
+    });
+  }) as unknown as typeof fetch;
+  try {
+    const host = new MemoryHost();
+    const result = await new ClaudeRuntimeCore().run(input({
+      turns: [],
+      metadata: {
+        delivery_contract: {
+          workspace_mutation_required: true,
+          verification_required: false,
+        },
+      },
+      config: {
+        runtimeConstraints: {
+          model_transport: "http_sse",
+          model_api_base_url: "https://provider.invalid/v1",
+          pre_delivery_observation_nudge_after: 2,
+          pre_delivery_inspection_block_after_nudges: 2,
+        },
+      },
+    }), host);
+
+    assert.equal(result.ok, true);
+    assert.equal(requestCount, 7);
+    assert.deepEqual(
+      host.batches.flatMap((batch) => batch.steps.map((step) => step.tool_name)),
+      ["read", "read", "read", "read", "write"],
+    );
+    assert.ok(host.events.some((event) => event.phase === "pre_delivery_inspection_blocked"));
+    assert.equal(result.metadata.progressive_action_nudges, "2");
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("required delivery circuit applies cross-session handoff progress before tools run", async () => {
+  const originalFetch = globalThis.fetch;
+  let requestCount = 0;
+  globalThis.fetch = (async () => {
+    requestCount += 1;
+    const choice = requestCount === 1
+      ? {
+        index: 0,
+        delta: {
+          tool_calls: [{
+            index: 0,
+            id: "continued-read",
+            type: "function",
+            function: { name: "read", arguments: '{"path":"another-source.ts"}' },
+          }],
+        },
+        finish_reason: "tool_calls",
+      }
+      : requestCount === 2
+        ? {
+          index: 0,
+          delta: {
+            tool_calls: [{
+              index: 0,
+              id: "continued-write",
+              type: "function",
+              function: { name: "write", arguments: '{"path":"result.txt","content":"delivered"}' },
+            }],
+          },
+          finish_reason: "tool_calls",
+        }
+        : { index: 0, delta: { content: "Implemented and verified." }, finish_reason: "stop" };
+    return new Response(`data: ${JSON.stringify({
+      id: `continued-circuit-${requestCount}`,
+      object: "chat.completion.chunk",
+      model: "zyra-local-code-model",
+      choices: [choice],
+    })}\n\ndata: [DONE]\n\n`, {
+      status: 200,
+      headers: { "content-type": "text/event-stream" },
+    });
+  }) as unknown as typeof fetch;
+  try {
+    const host = new MemoryHost();
+    const result = await new ClaudeRuntimeCore().run(input({
+      turns: [],
+      metadata: {
+        delivery_contract: {
+          workspace_mutation_required: true,
+          verification_required: false,
+        },
+        task_handoff_progress: {
+          requiredDeliveryMissing: true,
+          providerRounds: 9,
+          preDeliveryObservationCount: 6,
+          consecutivePreDeliveryObservations: 6,
+          actionNudgeCount: 4,
+          lastActionNudgeObservationCount: 6,
+          lastActionNudgeProviderRound: 7,
+        },
+      },
+      config: {
+        runtimeConstraints: {
+          model_transport: "http_sse",
+          model_api_base_url: "https://provider.invalid/v1",
+          pre_delivery_inspection_block_after_nudges: 3,
+        },
+      },
+    }), host);
+
+    assert.equal(result.ok, true);
+    assert.equal(requestCount, 3);
+    assert.deepEqual(
+      host.batches.flatMap((batch) => batch.steps.map((step) => step.tool_name)),
+      ["write"],
+    );
+    assert.ok(host.events.some((event) => event.phase === "pre_delivery_inspection_blocked"));
+    assert.equal(result.metadata.progressive_action_nudges, "4");
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("failed delivery attempt permits one recovery inspection before the circuit closes again", async () => {
+  const originalFetch = globalThis.fetch;
+  let requestCount = 0;
+  globalThis.fetch = (async () => {
+    requestCount += 1;
+    const tool = requestCount === 1
+      ? { name: "write", arguments: '{"path":"result.txt","content":"stale","fail":true}' }
+      : requestCount <= 3
+        ? { name: "read", arguments: JSON.stringify({ path: `target-${requestCount}.txt` }) }
+        : requestCount === 4
+          ? { name: "write", arguments: '{"path":"result.txt","content":"delivered"}' }
+          : null;
+    const choice = tool
+      ? {
+        index: 0,
+        delta: {
+          tool_calls: [{
+            index: 0,
+            id: `recovery-inspection-${requestCount}`,
+            type: "function",
+            function: tool,
+          }],
+        },
+        finish_reason: "tool_calls",
+      }
+      : { index: 0, delta: { content: "Implemented and verified." }, finish_reason: "stop" };
+    return new Response(`data: ${JSON.stringify({
+      id: `recovery-inspection-round-${requestCount}`,
+      object: "chat.completion.chunk",
+      model: "zyra-local-code-model",
+      choices: [choice],
+    })}\n\ndata: [DONE]\n\n`, {
+      status: 200,
+      headers: { "content-type": "text/event-stream" },
+    });
+  }) as unknown as typeof fetch;
+  try {
+    const host = new MemoryHost();
+    const result = await new ClaudeRuntimeCore().run(input({
+      turns: [],
+      metadata: {
+        delivery_contract: {
+          workspace_mutation_required: true,
+          verification_required: false,
+        },
+        task_handoff_progress: {
+          requiredDeliveryMissing: true,
+          providerRounds: 9,
+          actionNudgeCount: 4,
+        },
+      },
+      config: {
+        runtimeConstraints: {
+          model_transport: "http_sse",
+          model_api_base_url: "https://provider.invalid/v1",
+          pre_delivery_inspection_block_after_nudges: 3,
+        },
+      },
+    }), host);
+
+    assert.equal(result.ok, true);
+    assert.equal(requestCount, 5);
+    assert.deepEqual(
+      host.batches.flatMap((batch) => batch.steps.map((step) => step.tool_name)),
+      ["write", "read", "write"],
+    );
+    assert.equal(
+      host.events.filter((event) => event.phase === "pre_delivery_inspection_blocked").length,
+      1,
+    );
+    assert.equal(result.metadata.progressive_real_actions, "2");
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("progressive execution requests action after analysis-only loops and records delivery", () => {
+  let clock = 1_000;
+  const progressive = new ProgressiveExecutionRuntime({
+    now: () => clock,
+    constraints: {},
+    deliveryContract: {
+      workspace_mutation_required: true,
+      verification_required: false,
+    },
+  });
+  progressive.observeProviderRound("Inspect the repository and consider options.", 0);
+  clock += 1_000;
+  progressive.observeProviderRound("Inspect the repository and consider options.", 0);
+  const stalled = progressive.decide(1_000, 10_000);
+
+  assert.equal(stalled.action, "nudge_action");
+  assert.equal(stalled.snapshot.requiredDeliveryMissing, true);
+  assert.equal(stalled.snapshot.repeatedAnalysisRounds, 1);
+
+  progressive.observeToolResult({
+    toolCallId: "write-1",
+    toolName: "write",
+    arguments: { path: "result.txt" },
+    turnIndex: 0,
+    stepIndex: 0,
+    batchId: "batch-1",
+    batchIndex: 0,
+    batchSize: 1,
+    executionMode: "serial_non_read_only",
+    metadata: {},
+  }, {
+    tool_call_id: "write-1",
+    ok: true,
+    summary: "created an incremental result",
+    output: {},
+    artifacts: [{ artifact_id: "artifact-1", kind: "file", uri: "workspace:result.txt", title: "result" }],
+    metadata: {
+      physical_effect_executed: "true",
+      workspace_mutation_committed: "true",
+    },
+  }, false);
+  const delivered = progressive.decide(2_000, 10_000);
+
+  assert.equal(delivered.action, "continue");
+  assert.equal(delivered.snapshot.requiredDeliveryMissing, false);
+  assert.equal(delivered.snapshot.workspaceMutationCount, 1);
+  assert.equal(delivered.snapshot.artifactCount, 1);
+});
+
+test("progressive execution closes broad inspection sooner after a delivery stalls", () => {
+  const progressive = new ProgressiveExecutionRuntime({
+    constraints: {},
+    deliveryContract: {
+      workspace_mutation_required: true,
+      verification_required: false,
+    },
+  });
+  const request = (index: number): ToolExecutionRequest => ({
+    toolCallId: `read-${index}`,
+    toolName: "file_read",
+    arguments: { path: `source-${index}.ts` },
+    turnIndex: index,
+    stepIndex: 0,
+    batchId: `batch-${index}`,
+    batchIndex: 0,
+    batchSize: 1,
+    executionMode: "concurrent_read_only",
+    metadata: {},
+  });
+  const response = (toolCallId: string): ToolExecutionResponse => ({
+    tool_call_id: toolCallId,
+    ok: true,
+    summary: "source inspected",
+    output: {},
+    artifacts: [],
+    metadata: {},
+  });
+
+  progressive.observeToolResult({
+    ...request(0),
+    toolCallId: "delivery",
+    toolName: "write",
+    arguments: { path: "result.ts" },
+    executionMode: "serial_non_read_only",
+  }, {
+    ...response("delivery"),
+    summary: "result committed",
+    metadata: { workspace_mutation_committed: "true" },
+  }, false);
+
+  for (let index = 1; index <= 4; index += 1) {
+    progressive.observeToolResult(request(index), response(`read-${index}`), true);
+  }
+  assert.equal(progressive.decide(1_000, 10_000).action, "nudge_action");
+  progressive.recordActionNudge();
+  assert.equal(progressive.inspectionCircuitOpen(), false);
+
+  for (let index = 5; index <= 8; index += 1) {
+    progressive.observeToolResult(request(index), response(`read-${index}`), true);
+  }
+  assert.equal(progressive.decide(1_000, 10_000).action, "nudge_action");
+  const blocked = progressive.recordActionNudge();
+  assert.equal(blocked.postDeliveryActionNudgeCount, 2);
+  assert.equal(progressive.inspectionCircuitOpen(), true);
+});
+
+test("progressive execution keeps verification debt until a behavioral command passes", () => {
+  const progressive = new ProgressiveExecutionRuntime({
+    deliveryContract: { workspace_mutation_required: true },
+  });
+  const response = (
+    toolCallId: string,
+    workspaceMutationCommitted = false,
+  ): ToolExecutionResponse => ({
+    tool_call_id: toolCallId,
+    ok: true,
+    summary: "command completed",
+    output: {},
+    artifacts: [],
+    metadata: {
+      workspace_mutation_committed: String(workspaceMutationCommitted),
+    },
+  });
+  const request = (
+    toolCallId: string,
+    metadata: JsonObject = {},
+  ): ToolExecutionRequest => ({
+    toolCallId,
+    toolName: "shell",
+    arguments: { command: "command" },
+    turnIndex: 0,
+    stepIndex: 0,
+    batchId: "batch-verification",
+    batchIndex: 0,
+    batchSize: 1,
+    executionMode: "serial_non_read_only",
+    metadata,
+  });
+
+  progressive.observeToolResult(
+    request("delivery"),
+    response("delivery", true),
+    false,
+  );
+  assert.equal(progressive.decide(1_000, 10_000).action, "nudge_verification");
+
+  progressive.observeToolResult(
+    request("format-check"),
+    response("format-check"),
+    true,
+  );
+  assert.equal(progressive.snapshot().verificationCount, 0);
+  const nudged = progressive.recordVerificationNudge();
+  assert.equal(nudged.verificationNudgeCount, 1);
+
+  progressive.observeToolResult(
+    request("tests", { progressive_verification_driving: true }),
+    response("tests"),
+    false,
+  );
+  assert.equal(progressive.snapshot().verificationCount, 1);
+  assert.equal(progressive.decide(1_000, 10_000).action, "continue");
+
+  progressive.observeToolResult(
+    request("later-delivery"),
+    response("later-delivery", true),
+    false,
+  );
+  assert.equal(progressive.snapshot().verificationCount, 0);
+  assert.equal(progressive.snapshot().verificationNudgeCount, 0);
+  assert.equal(progressive.decide(1_000, 10_000).action, "nudge_verification");
+});
+
+test("progressive execution restores unverified delivery debt across fenced sessions", () => {
+  const progressive = new ProgressiveExecutionRuntime({
+    deliveryContract: { workspace_mutation_required: true },
+    continuityProgress: {
+      requiredDeliveryMissing: false,
+      providerRounds: 12,
+      realActionCount: 9,
+      workspaceMutationCount: 3,
+      verificationCount: 0,
+      verificationNudgeCount: 1,
+      lastVerificationNudgeProviderRound: 12,
+      artifactCount: 0,
+    },
+  });
+
+  const restored = progressive.snapshot();
+  assert.equal(restored.requiredDeliveryMissing, false);
+  assert.equal(restored.workspaceMutationCount, 3);
+  assert.equal(restored.verificationCount, 0);
+  assert.equal(restored.verificationNudgeCount, 1);
+  assert.equal(progressive.decide(1_000, 10_000).action, "nudge_verification");
+});
+
+test("progressive execution does not treat command execution as a workspace mutation", () => {
+  const progressive = new ProgressiveExecutionRuntime({
+    deliveryContract: { workspace_mutation_required: true },
+  });
+
+  progressive.observeToolResult({
+    toolCallId: "shell-1",
+    toolName: "shell",
+    arguments: { executable: "git", argv: ["status", "--short"] },
+    turnIndex: 0,
+    stepIndex: 0,
+    batchId: "batch-1",
+    batchIndex: 0,
+    batchSize: 1,
+    executionMode: "serial_non_read_only",
+    metadata: {},
+  }, {
+    tool_call_id: "shell-1",
+    ok: true,
+    summary: "command completed",
+    output: {},
+    artifacts: [],
+    metadata: { physical_effect_executed: "true" },
+  }, false);
+
+  const observed = progressive.snapshot();
+  assert.equal(observed.realActionCount, 1);
+  assert.equal(observed.workspaceMutationCount, 0);
+  assert.equal(observed.requiredDeliveryMissing, true);
+  assert.equal(observed.preDeliveryObservationCount, 1);
+  assert.equal(observed.consecutivePreDeliveryObservations, 1);
+  assert.match(observed.progressReasons.join("\n"), /pre_delivery_non_delivery_action/);
+  assert.doesNotMatch(observed.progressReasons.join("\n"), /workspace_mutation_committed/);
+});
+
+test("progressive execution counts each background job once and observes its terminal result", () => {
+  const progressive = new ProgressiveExecutionRuntime({
+    deliveryContract: { workspace_mutation_required: true },
+  });
+  const request = (toolCallId: string, toolName: string, jobId?: string): ToolExecutionRequest => ({
+    toolCallId,
+    toolName,
+    arguments: jobId ? { job_id: jobId } : {},
+    turnIndex: 0,
+    stepIndex: 0,
+    batchId: "batch-background",
+    batchIndex: 0,
+    batchSize: 1,
+    executionMode: "serial_non_read_only",
+    metadata: {},
+  });
+  const response = (
+    toolCallId: string,
+    status: "running" | "completed",
+    jobId: string,
+  ): ToolExecutionResponse => ({
+    tool_call_id: toolCallId,
+    ok: true,
+    summary: status,
+    output: { status, job_id: jobId },
+    artifacts: [],
+    metadata: {},
+  });
+
+  assert.equal(progressive.backgroundShellSlotsRemaining(), 2);
+  progressive.observeToolResult(
+    request("shell-start", "shell"),
+    response("shell-start", "running", "job-one"),
+    false,
+  );
+  assert.equal(progressive.backgroundShellSlotsRemaining(), 1);
+  progressive.observeToolResult(
+    request("shell-poll-duplicate", "shell_wait", "job-one"),
+    response("shell-poll-duplicate", "running", "job-one"),
+    true,
+  );
+  assert.equal(progressive.snapshot().activeBackgroundCount, 1);
+  progressive.observeToolResult(
+    request("agent-running", "Agent"),
+    response("agent-running", "running", "agent-task-one"),
+    false,
+  );
+  assert.equal(progressive.snapshot().activeBackgroundCount, 1);
+  progressive.observeToolResult(
+    request("shell-start-second", "shell"),
+    response("shell-start-second", "running", "job-two"),
+    false,
+  );
+  assert.equal(progressive.backgroundShellSlotsRemaining(), 0);
+  progressive.observeToolResult(
+    request("shell-poll", "shell_wait", "job-two"),
+    response("shell-poll", "running", "job-two"),
+    true,
+  );
+  assert.equal(progressive.snapshot().activeBackgroundCount, 2);
+  assert.equal(progressive.backgroundShellSlotsRemaining(), 0);
+  assert.equal(progressive.snapshot().preDeliveryObservationCount, 0);
+
+  progressive.observeToolResult(
+    request("shell-complete", "shell_wait", "job-one"),
+    response("shell-complete", "completed", "job-one"),
+    true,
+  );
+  assert.equal(progressive.snapshot().activeBackgroundCount, 1);
+  assert.equal(progressive.backgroundShellSlotsRemaining(), 1);
+  assert.equal(progressive.snapshot().preDeliveryObservationCount, 1);
+  progressive.observeToolResult(
+    request("shell-complete-second", "shell_wait", "job-two"),
+    response("shell-complete-second", "completed", "job-two"),
+    true,
+  );
+  assert.equal(progressive.snapshot().activeBackgroundCount, 0);
+  assert.equal(progressive.backgroundShellSlotsRemaining(), 2);
+});
+
+test("background verification launch cannot clear an earlier failed semantic scope", () => {
+  const progressive = new ProgressiveExecutionRuntime({
+    deliveryContract: { workspace_mutation_required: true },
+    continuityProgress: {
+      requiredDeliveryMissing: false,
+      workspaceMutationCount: 2,
+      repairMutationCount: 2,
+      unresolvedVerificationScopes: ["shell:afctl:test:integration"],
+      unresolvedVerificationFailures: [{
+        scope: "shell:afctl:test:integration",
+        failedChecks: ["opaque-state"],
+        failedCount: 1,
+        failureKind: "reported_checks",
+        attemptCount: 2,
+        lastObservedWorkspaceMutationCount: 2,
+      }],
+      targetedRepairReserveVersion: 4,
+    },
+  });
+  progressive.observeToolResult({
+    toolCallId: "integration-background-start",
+    toolName: "shell",
+    arguments: { command: "python tools/afctl.py test integration" },
+    turnIndex: 0,
+    stepIndex: 0,
+    batchId: "integration-background-start",
+    batchIndex: 0,
+    batchSize: 1,
+    executionMode: "serial_non_read_only",
+    metadata: {
+      progressive_verification_driving: true,
+      progressive_verification_scope: "shell:afctl:test:integration",
+    },
+  }, {
+    tool_call_id: "integration-background-start",
+    ok: true,
+    summary: "Sandbox command is still running in the background.",
+    output: { status: "running", job_id: "job-integration" },
+    artifacts: [],
+    metadata: { background_status: "running" },
+  }, false);
+
+  const snapshot = progressive.snapshot();
+  assert.equal(snapshot.verificationCount, 0);
+  assert.deepEqual(snapshot.unresolvedVerificationScopes, ["shell:afctl:test:integration"]);
+  assert.equal(snapshot.unresolvedVerificationFailures[0].attemptCount, 2);
+  assert.doesNotMatch(snapshot.progressReasons.join("\n"), /post_delivery_verification_passed/);
+});
+
+test("runtime stops admitting shell commands until active background jobs are reconciled", async () => {
+  class BackgroundHost extends MemoryHost {
+    readonly shellRequests: ToolExecutionRequest[] = [];
+
+    override async executeBatch(
+      batch: ToolBatch,
+      requests: ToolExecutionRequest[],
+    ): Promise<ToolExecutionResponse[]> {
+      this.batches.push(batch);
+      this.shellRequests.push(...requests);
+      return requests.map((request) => ({
+        tool_call_id: request.toolCallId,
+        ok: true,
+        summary: "Sandbox command is still running in the background.",
+        output: { status: "running", job_id: `job-${request.toolCallId}` },
+        artifacts: [],
+        metadata: { background_status: "running" },
+      }));
+    }
+  }
+
+  const host = new BackgroundHost();
+  await new ClaudeRuntimeCore().run(input({
+    turns: [
+      [{ tool_name: "shell", arguments: { command: "echo first" } }],
+      [{ tool_name: "shell", arguments: { command: "echo second" } }],
+      [{ tool_name: "shell", arguments: { command: "echo third" } }],
+    ],
+    tools: [{
+      name: "shell",
+      purpose: "shell",
+      source: "test",
+      input_schema: {
+        type: "object",
+        required: ["command"],
+        properties: { command: { type: "string" } },
+      },
+      output_schema: {},
+      metadata: { read_only: "false", concurrency_safe: "false" },
+    }],
+  }), host);
+
+  assert.equal(host.shellRequests.length, 2);
+  assert.deepEqual(
+    host.shellRequests.map((request) => request.arguments.command),
+    ["echo first", "echo second"],
+  );
+  assert.ok(host.checkpoints.some((checkpoint) =>
+    JSON.stringify(checkpoint).includes("active_background_shell_limit_reached")
+  ));
+});
+
+test("bounded named-source inspections do not consume background shell slots", async () => {
+  class CompletedShellHost extends MemoryHost {
+    readonly shellRequests: ToolExecutionRequest[] = [];
+
+    override async executeBatch(
+      batch: ToolBatch,
+      requests: ToolExecutionRequest[],
+    ): Promise<ToolExecutionResponse[]> {
+      this.batches.push(batch);
+      this.shellRequests.push(...requests);
+      return requests.map((request) => ({
+        tool_call_id: request.toolCallId,
+        ok: true,
+        summary: "command completed",
+        output: { status: "completed", return_code: 0 },
+        artifacts: [],
+        metadata: { workspace_mutation_committed: "false" },
+      }));
+    }
+  }
+
+  const host = new CompletedShellHost();
+  await new ClaudeRuntimeCore().run(input({
+    turns: [[
+      { tool_name: "shell", arguments: { command: "sed -n '1,20p' src/one.py" } },
+      { tool_name: "shell", arguments: { command: "sed -n '1,20p' src/two.py" } },
+      { tool_name: "shell", arguments: { command: "sed -n '1,20p' src/three.py" } },
+    ]],
+    tools: [{
+      name: "shell",
+      purpose: "shell",
+      source: "test",
+      input_schema: {
+        type: "object",
+        required: ["command"],
+        properties: { command: { type: "string" } },
+      },
+      output_schema: {},
+      metadata: { read_only: "false", concurrency_safe: "false" },
+    }],
+  }), host);
+
+  assert.equal(host.shellRequests.length, 3);
+  assert.doesNotMatch(
+    JSON.stringify(host.checkpoints),
+    /active_background_shell_limit_reached/,
+  );
+});
+
+test("progressive execution does not treat read-only diagnostic artifacts as delivery", () => {
+  const progressive = new ProgressiveExecutionRuntime({
+    deliveryContract: { workspace_mutation_required: true },
+  });
+
+  progressive.observeToolResult({
+    toolCallId: "browser-state",
+    toolName: "browser",
+    arguments: { action: "open_url", url: "http://127.0.0.1/events" },
+    turnIndex: 0,
+    stepIndex: 0,
+    batchId: "browser-observation",
+    batchIndex: 0,
+    batchSize: 1,
+    executionMode: "concurrent_read_only",
+    metadata: {},
+  }, {
+    tool_call_id: "browser-state",
+    ok: true,
+    summary: "captured browser state",
+    output: {},
+    artifacts: [
+      { artifact_id: "html", kind: "file", uri: "artifact:state.html", title: "browser raw HTML" },
+      { artifact_id: "json", kind: "structured_data", uri: "artifact:state.json", title: "browser state snapshot" },
+    ],
+    metadata: {},
+  }, true);
+
+  const observed = progressive.snapshot();
+  assert.equal(observed.artifactCount, 2);
+  assert.equal(observed.workspaceMutationCount, 0);
+  assert.equal(observed.requiredDeliveryMissing, true);
+  assert.equal(observed.consecutiveNoDeliveryObservations, 1);
+  assert.doesNotMatch(observed.progressReasons.join("\n"), /artifact_receipt_committed/);
+});
+
+test("progressive execution nudges after sustained pre-delivery inspection", () => {
+  let clock = 1_000;
+  const progressive = new ProgressiveExecutionRuntime({
+    now: () => clock,
+    constraints: { pre_delivery_observation_nudge_after: 3 },
+    deliveryContract: { workspace_mutation_required: true },
+  });
+  const readResult = (index: number) => {
+    progressive.observeProviderRound(`Inspect source area ${index}.`, 1);
+    progressive.observeToolResult({
+      toolCallId: `read-${index}`,
+      toolName: "read",
+      arguments: { path: `source-${index}.ts` },
+      turnIndex: index,
+      stepIndex: 0,
+      batchId: `batch-${index}`,
+      batchIndex: 0,
+      batchSize: 1,
+      executionMode: "concurrent_read_only",
+      metadata: {},
+    }, {
+      tool_call_id: `read-${index}`,
+      ok: true,
+      summary: "source inspected",
+      output: {},
+      artifacts: [],
+      metadata: {},
+    }, true);
+    clock += 1_000;
+  };
+
+  readResult(1);
+  readResult(2);
+  assert.equal(progressive.decide(1_000, 10_000).action, "continue");
+  readResult(3);
+  const stalled = progressive.decide(1_000, 10_000);
+
+  assert.equal(stalled.action, "nudge_action");
+  assert.match(stalled.reason, /read-only inspection/);
+  assert.equal(stalled.snapshot.preDeliveryObservationCount, 3);
+  assert.equal(stalled.snapshot.consecutivePreDeliveryObservations, 3);
+  assert.equal(stalled.snapshot.verificationCount, 0);
+  assert.equal(stalled.snapshot.requiredDeliveryMissing, true);
+
+  const nudged = progressive.recordActionNudge();
+  assert.equal(nudged.actionNudgeCount, 1);
+  assert.equal(nudged.lastActionNudgeObservationCount, 3);
+  assert.equal(progressive.decide(1_000, 10_000).action, "continue");
+  readResult(4);
+  readResult(5);
+  assert.equal(progressive.decide(1_000, 10_000).action, "continue");
+  readResult(6);
+  assert.equal(progressive.decide(1_000, 10_000).action, "nudge_action");
+});
+
+test("progressive action nudge cadence survives checkpoint restore", () => {
+  const progressive = new ProgressiveExecutionRuntime({
+    constraints: { pre_delivery_observation_nudge_after: 3 },
+    deliveryContract: { workspace_mutation_required: true },
+    restored: {
+      version: "zyra.progressive-execution/v1",
+      providerRounds: 8,
+      preDeliveryObservationCount: 5,
+      consecutivePreDeliveryObservations: 5,
+      actionNudgeCount: 1,
+      lastActionNudgeObservationCount: 3,
+      lastActionNudgeProviderRound: 6,
+      workspaceMutationCount: 0,
+      artifactCount: 0,
+    },
+  });
+
+  assert.equal(progressive.decide(1_000, 10_000).action, "continue");
+  progressive.observeToolResult({
+    toolCallId: "read-restored",
+    toolName: "read",
+    arguments: { path: "restored.ts" },
+    turnIndex: 9,
+    stepIndex: 0,
+    batchId: "batch-restored",
+    batchIndex: 0,
+    batchSize: 1,
+    executionMode: "concurrent_read_only",
+    metadata: {},
+  }, {
+    tool_call_id: "read-restored",
+    ok: true,
+    summary: "source inspected",
+    output: {},
+    artifacts: [],
+    metadata: {},
+  }, true);
+  assert.equal(progressive.decide(1_000, 10_000).action, "nudge_action");
+});
+
+test("progressive execution nudges sustained inspection after a restored delivery", () => {
+  const progressive = new ProgressiveExecutionRuntime({
+    constraints: { pre_delivery_observation_nudge_after: 3 },
+    deliveryContract: { workspace_mutation_required: true },
+    continuityProgress: {
+      requiredDeliveryMissing: false,
+      providerRounds: 40,
+      realActionCount: 20,
+      workspaceMutationCount: 8,
+      verificationCount: 8,
+      artifactCount: 2,
+    },
+  });
+  const inspect = (index: number) => {
+    progressive.observeToolResult({
+      toolCallId: `post-delivery-read-${index}`,
+      toolName: "read",
+      arguments: { path: `source-${index}.ts` },
+      turnIndex: index,
+      stepIndex: 0,
+      batchId: `post-delivery-batch-${index}`,
+      batchIndex: 0,
+      batchSize: 1,
+      executionMode: "concurrent_read_only",
+      metadata: {},
+    }, {
+      tool_call_id: `post-delivery-read-${index}`,
+      ok: true,
+      summary: "source inspected",
+      output: {},
+      artifacts: [],
+      metadata: {},
+    }, true);
+  };
+
+  inspect(1);
+  inspect(2);
+  assert.equal(progressive.decide(1_000, 10_000).action, "continue");
+  inspect(3);
+  const stalled = progressive.decide(1_000, 10_000);
+
+  assert.equal(stalled.action, "nudge_action");
+  assert.match(stalled.reason, /last durable delivery/);
+  assert.equal(stalled.snapshot.requiredDeliveryMissing, false);
+  assert.equal(stalled.snapshot.workspaceMutationCount, 8);
+  assert.equal(stalled.snapshot.preDeliveryObservationCount, 0);
+  assert.equal(stalled.snapshot.noDeliveryObservationCount, 3);
+  assert.equal(stalled.snapshot.consecutiveNoDeliveryObservations, 3);
+
+  progressive.recordActionNudge();
+  assert.equal(progressive.decide(1_000, 10_000).action, "continue");
+  inspect(4);
+  inspect(5);
+  inspect(6);
+  assert.equal(progressive.decide(1_000, 10_000).action, "nudge_action");
+});
+
+test("no-contract child inspection never creates delivery action debt", () => {
+  const progressive = new ProgressiveExecutionRuntime({
+    constraints: { post_delivery_observation_nudge_after: 2 },
+    deliveryContract: {},
+  });
+  const inspect = (index: number) => {
+    progressive.observeToolResult({
+      toolCallId: `bounded-child-read-${index}`,
+      toolName: "read",
+      arguments: { path: `input-${index}.txt` },
+      turnIndex: index,
+      stepIndex: 0,
+      batchId: `bounded-child-read-batch-${index}`,
+      batchIndex: 0,
+      batchSize: 1,
+      executionMode: "concurrent_read_only",
+      metadata: {},
+    }, {
+      tool_call_id: `bounded-child-read-${index}`,
+      ok: true,
+      summary: "bounded input inspected",
+      output: {},
+      artifacts: [],
+      metadata: {},
+    }, true);
+  };
+
+  inspect(1);
+  inspect(2);
+  assert.equal(progressive.snapshot().requiredDeliveryMissing, false);
+  assert.equal(progressive.snapshot().consecutiveNoDeliveryObservations, 2);
+  assert.equal(progressive.decide(1_000, 10_000).action, "continue");
+
+  progressive.recordActionNudge();
+  progressive.recordActionNudge();
+  assert.equal(progressive.snapshot().postDeliveryActionNudgeCount, 2);
+  assert.equal(progressive.inspectionCircuitOpen(), false);
+});
+
+test("progressive execution resets post-delivery inspection streak on new progress", () => {
+  const progressive = new ProgressiveExecutionRuntime({
+    constraints: { pre_delivery_observation_nudge_after: 3 },
+    deliveryContract: { workspace_mutation_required: true },
+    continuityProgress: {
+      requiredDeliveryMissing: false,
+      workspaceMutationCount: 1,
+      verificationCount: 1,
+    },
+  });
+  const request = (toolCallId: string, metadata: JsonObject = {}): ToolExecutionRequest => ({
+    toolCallId,
+    toolName: "shell",
+    arguments: { command: "command" },
+    turnIndex: 0,
+    stepIndex: 0,
+    batchId: "post-delivery-progress",
+    batchIndex: 0,
+    batchSize: 1,
+    executionMode: "serial_non_read_only",
+    metadata,
+  });
+  const response = (toolCallId: string, mutated = false): ToolExecutionResponse => ({
+    tool_call_id: toolCallId,
+    ok: true,
+    summary: "command completed",
+    output: {},
+    artifacts: [],
+    metadata: { workspace_mutation_committed: String(mutated) },
+  });
+
+  progressive.observeToolResult(request("inspect-1"), response("inspect-1"), true);
+  progressive.observeToolResult(request("inspect-2"), response("inspect-2"), true);
+  progressive.observeToolResult(request("edit"), response("edit", true), false);
+  assert.equal(progressive.snapshot().consecutiveNoDeliveryObservations, 0);
+
+  progressive.observeToolResult(request("inspect-3"), response("inspect-3"), true);
+  progressive.observeToolResult(
+    request("tests", { progressive_verification_driving: true }),
+    response("tests"),
+    false,
+  );
+  assert.equal(progressive.snapshot().consecutiveNoDeliveryObservations, 0);
+  assert.equal(progressive.decide(1_000, 10_000).action, "continue");
+});
+
+test("progressive execution does not accept a zero-exit failed verification report", () => {
+  const progressive = new ProgressiveExecutionRuntime({
+    constraints: { pre_delivery_observation_nudge_after: 1 },
+    deliveryContract: { workspace_mutation_required: true },
+    continuityProgress: {
+      requiredDeliveryMissing: false,
+      workspaceMutationCount: 1,
+      verificationCount: 1,
+      verificationNudgeCount: 3,
+    },
+  });
+  const request: ToolExecutionRequest = {
+    toolCallId: "opaque-validation",
+    toolName: "shell",
+    arguments: { command: "./run-integration.sh" },
+    turnIndex: 0,
+    stepIndex: 0,
+    batchId: "opaque-validation",
+    batchIndex: 0,
+    batchSize: 1,
+    executionMode: "serial_non_read_only",
+    metadata: { progressive_verification_driving: true },
+  };
+  progressive.recordActionNudge();
+  progressive.observeToolResult(request, {
+    tool_call_id: request.toolCallId,
+    ok: true,
+    summary: "command completed",
+    output: {
+      stdout: JSON.stringify({
+        status: "failed",
+        counts: { passed: 8, failed: 2 },
+        failed_shards: ["security", "cross-language"],
+      }),
+      return_code: 0,
+    },
+    artifacts: [],
+    metadata: { workspace_mutation_committed: "false" },
+  }, false);
+
+  const failed = progressive.snapshot();
+  assert.equal(failed.verificationCount, 0);
+  assert.equal(failed.verificationNudgeCount, 0);
+  assert.equal(failed.recoveryInspectionAllowance, 8);
+  assert.equal(failed.postDeliveryActionNudgeCount, 1);
+  assert.ok(failed.progressReasons.includes("post_delivery_verification_failed"));
+  assert.equal(progressive.decide(1_000, 10_000).action, "nudge_verification");
+
+  progressive.observeToolResult({ ...request, toolCallId: "passing-tests" }, {
+    tool_call_id: "passing-tests",
+    ok: true,
+    summary: "command completed",
+    output: { stdout: "138 passed in 4.56s", return_code: 0 },
+    artifacts: [],
+    metadata: { workspace_mutation_committed: "false" },
+  }, false);
+  assert.equal(progressive.snapshot().verificationCount, 1);
+  assert.equal(progressive.snapshot().postDeliveryActionNudgeCount, 0);
+});
+
+test("a passing verification cannot erase debt from a different failed scope", () => {
+  const progressive = new ProgressiveExecutionRuntime({
+    deliveryContract: { workspace_mutation_required: true },
+    continuityProgress: {
+      requiredDeliveryMissing: false,
+      workspaceMutationCount: 1,
+    },
+  });
+  const scopedRequest = (toolCallId: string, scope: string): ToolExecutionRequest => ({
+    toolCallId,
+    toolName: "shell",
+    arguments: { command: scope },
+    turnIndex: 0,
+    stepIndex: 0,
+    batchId: toolCallId,
+    batchIndex: 0,
+    batchSize: 1,
+    executionMode: "serial_non_read_only",
+    metadata: {
+      progressive_verification_driving: true,
+      progressive_verification_scope: scope,
+    },
+  });
+  const observe = (request: ToolExecutionRequest, stdout: string, ok = true) => {
+    progressive.observeToolResult(request, {
+      tool_call_id: request.toolCallId,
+      ok,
+      summary: "command completed",
+      output: { stdout, return_code: 0 },
+      artifacts: [],
+      metadata: { workspace_mutation_committed: "false" },
+    }, false);
+  };
+
+  observe(
+    scopedRequest("integration-failed", "integration-suite"),
+    '{"status":"failed","failed_shards":["opaque-a"]}',
+  );
+  assert.deepEqual(progressive.snapshot().unresolvedVerificationScopes, ["integration-suite"]);
+  assert.deepEqual(progressive.snapshot().unresolvedVerificationFailures, [{
+    scope: "integration-suite",
+    failedChecks: ["opaque-a"],
+    failedCount: null,
+    failureKind: "reported_checks",
+    attemptCount: 1,
+    lastObservedWorkspaceMutationCount: 1,
+  }]);
+
+  observe(scopedRequest("public-passed", "public-suite"), "140 passed in 12.0s");
+  const stillFailed = progressive.snapshot();
+  assert.equal(stillFailed.verificationCount, 0);
+  assert.deepEqual(stillFailed.unresolvedVerificationScopes, ["integration-suite"]);
+  assert.equal(progressive.decide(1_000, 10_000).action, "nudge_action");
+
+  observe(scopedRequest("integration-passed", "integration-suite"), "10 passed in 20.0s");
+  const settled = progressive.snapshot();
+  assert.equal(settled.verificationCount, 1);
+  assert.deepEqual(settled.unresolvedVerificationScopes, []);
+  assert.deepEqual(settled.unresolvedVerificationFailures, []);
+
+  observe(
+    scopedRequest("integration-physical-failure", "integration-suite"),
+    "2 failed in 3.0s",
+    false,
+  );
+  assert.equal(progressive.snapshot().verificationCount, 0);
+  assert.deepEqual(progressive.snapshot().unresolvedVerificationScopes, ["integration-suite"]);
+});
+
+test("a newly observed regression takes priority over older verification debt", () => {
+  const progressive = new ProgressiveExecutionRuntime({
+    deliveryContract: { workspace_mutation_required: true },
+    continuityProgress: {
+      requiredDeliveryMissing: false,
+      workspaceMutationCount: 8,
+      repairMutationCount: 8,
+      unresolvedVerificationScopes: ["integration-suite"],
+      unresolvedVerificationFailures: [{
+        scope: "integration-suite",
+        failedChecks: ["opaque-contract"],
+        failedCount: 1,
+        failureKind: "reported_checks",
+        attemptCount: 4,
+        lastObservedWorkspaceMutationCount: 7,
+      }],
+    },
+  });
+  const edit: ToolExecutionRequest = {
+    toolCallId: "repair-edit",
+    toolName: "file_edit",
+    arguments: { path: "service.py" },
+    turnIndex: 0,
+    stepIndex: 0,
+    batchId: "repair-edit",
+    batchIndex: 0,
+    batchSize: 1,
+    executionMode: "serial_non_read_only",
+    metadata: { progressive_repair_driving: true },
+  };
+  progressive.observeToolResult(edit, {
+    tool_call_id: edit.toolCallId,
+    ok: true,
+    summary: "updated service",
+    output: {},
+    artifacts: [],
+    metadata: { workspace_mutation_committed: "true" },
+  }, false);
+  assert.equal(progressive.snapshot().targetedRepairInspectionAllowance, 4);
+  assert.equal(progressive.consumeRecoveryInspectionAllowance(true), true);
+  assert.equal(progressive.snapshot().targetedRepairInspectionAllowance, 3);
+  const publicFailure: ToolExecutionRequest = {
+    toolCallId: "public-failed",
+    toolName: "shell",
+    arguments: { command: "python tools/afctl.py test public" },
+    turnIndex: 0,
+    stepIndex: 0,
+    batchId: "public-failed",
+    batchIndex: 0,
+    batchSize: 1,
+    executionMode: "serial_non_read_only",
+    metadata: {
+      progressive_verification_driving: true,
+      progressive_verification_scope: "public-suite",
+    },
+  };
+  progressive.observeToolResult(publicFailure, {
+    tool_call_id: publicFailure.toolCallId,
+    ok: false,
+    summary: "1 failed in 2.0s",
+    output: { stderr: "TypeError: changed public signature", return_code: 1 },
+    artifacts: [],
+    metadata: { workspace_mutation_committed: "false" },
+  }, false);
+
+  const snapshot = progressive.snapshot();
+  assert.deepEqual(snapshot.unresolvedVerificationScopes, [
+    "public-suite",
+    "integration-suite",
+  ]);
+  assert.deepEqual(
+    snapshot.unresolvedVerificationFailures.map((failure) => failure.scope),
+    ["public-suite", "integration-suite"],
+  );
+  const decision = progressive.decide(1_000, 10_000);
+  assert.equal(decision.action, "nudge_action");
+  assert.match(decision.reason, /Priority failure: public-suite/);
+  assert.match(decision.reason, /before returning to older/);
+});
+
+test("a fresh failure outranks repeated debt when restored mutation counts tie", () => {
+  const prioritizedFailures = [
+    {
+      scope: "integration-suite",
+      failedChecks: ["opaque-contract"],
+      failedCount: 1,
+      failureKind: "reported_checks" as const,
+      attemptCount: 12,
+      lastObservedWorkspaceMutationCount: 9,
+    },
+    {
+      scope: "simulation-suite",
+      failedChecks: [],
+      failedCount: null,
+      failureKind: "reported_failure" as const,
+      attemptCount: 1,
+      lastObservedWorkspaceMutationCount: 9,
+    },
+  ];
+  const restoredRuntime = new ProgressiveExecutionRuntime({
+    deliveryContract: { workspace_mutation_required: true },
+    restored: {
+      version: PROGRESSIVE_EXECUTION_SNAPSHOT_VERSION,
+      workspaceMutationCount: 9,
+      repairMutationCount: 9,
+      requiredDeliveryMissing: false,
+      unresolvedVerificationScopes: prioritizedFailures.map((failure) => failure.scope),
+      unresolvedVerificationFailures: prioritizedFailures,
+    },
+  });
+  const restored = restoredRuntime.snapshot();
+
+  assert.deepEqual(
+    restored.unresolvedVerificationFailures.map((failure) => failure.scope),
+    ["simulation-suite", "integration-suite"],
+  );
+  assert.deepEqual(restored.unresolvedVerificationScopes, [
+    "simulation-suite",
+    "integration-suite",
+  ]);
+  assert.match(
+    restoredRuntime.verificationDebtSummary(),
+    /first-seen regression.*reproduce or inspect this priority failure/,
+  );
+});
+
+test("runtime diagnostics enrich and preserve the priority verification failure", () => {
+  const progressive = new ProgressiveExecutionRuntime({
+    deliveryContract: { workspace_mutation_required: true },
+    continuityProgress: {
+      requiredDeliveryMissing: false,
+      workspaceMutationCount: 4,
+      repairMutationCount: 4,
+      unresolvedVerificationScopes: ["simulation-suite"],
+      unresolvedVerificationFailures: [{
+        scope: "simulation-suite",
+        failedChecks: [],
+        failedCount: null,
+        failureKind: "reported_failure",
+        attemptCount: 1,
+        lastObservedWorkspaceMutationCount: 4,
+      }],
+    },
+  });
+  const logs: ToolExecutionRequest = {
+    toolCallId: "runtime-logs",
+    toolName: "shell",
+    arguments: { command: "docker compose logs --tail=80 control-api" },
+    turnIndex: 0,
+    stepIndex: 0,
+    batchId: "runtime-logs",
+    batchIndex: 0,
+    batchSize: 1,
+    executionMode: "serial_non_read_only",
+    metadata: {},
+  };
+  progressive.observeToolResult(logs, {
+    tool_call_id: logs.toolCallId,
+    ok: true,
+    summary: "command completed",
+    output: {
+      stdout: "Traceback (most recent call last):\npsycopg.errors.UndefinedColumn: column tenant_id of relation outbox_events does not exist",
+      return_code: 0,
+    },
+    artifacts: [],
+    metadata: { workspace_mutation_committed: "false" },
+  }, false);
+
+  const observed = progressive.snapshot();
+  assert.match(
+    observed.unresolvedVerificationFailures[0].diagnosticSummary ?? "",
+    /UndefinedColumn.*tenant_id.*outbox_events/,
+  );
+  assert.equal(observed.recoveryInspectionAllowance, 0);
+  assert.equal(observed.targetedRepairInspectionAllowance, 2);
+  assert.match(
+    observed.progressReasons.join(" "),
+    /actionable_verification_diagnostic_bounded/,
+  );
+  const restored = new ProgressiveExecutionRuntime({
+    deliveryContract: { workspace_mutation_required: true },
+    restored: observed,
+  });
+  assert.match(
+    restored.verificationDebtSummary(),
+    /diagnostic=.*UndefinedColumn.*tenant_id.*outbox_events/,
+  );
+  assert.equal(restored.snapshot().recoveryInspectionAllowance, 0);
+  assert.equal(restored.snapshot().targetedRepairInspectionAllowance, 2);
+});
+
+test("task-authored inline smoke failures remain diagnostic until a repository suite passes", () => {
+  const progressive = new ProgressiveExecutionRuntime({
+    deliveryContract: { workspace_mutation_required: true },
+    continuityProgress: {
+      requiredDeliveryMissing: false,
+      workspaceMutationCount: 1,
+      repairMutationCount: 1,
+    },
+  });
+  const inlineCommand = "cd /testbed && /opt/testbed/bin/python - <<'PY'\nassert pipe[0][0] == 'anova'\nPY";
+  assert.equal(isTaskAuthoredInlineVerificationProbeTool({
+    tool_name: "shell",
+    arguments: { command: inlineCommand },
+  }), true);
+  assert.equal(isTaskAuthoredInlineVerificationProbeTool({
+    tool_name: "shell",
+    arguments: { command: `${inlineCommand}\npython -m pytest tests/test_pipeline.py` },
+  }), false);
+
+  const inlineRequest: ToolExecutionRequest = {
+    toolCallId: "bad-inline-smoke",
+    toolName: "shell",
+    arguments: { command: inlineCommand },
+    turnIndex: 0,
+    stepIndex: 0,
+    batchId: "bad-inline-smoke",
+    batchIndex: 0,
+    batchSize: 1,
+    executionMode: "serial_non_read_only",
+    metadata: {
+      progressive_verification_driving: true,
+      progressive_verification_scope: "shell:inline-smoke",
+      progressive_task_authored_inline_probe: true,
+    },
+  };
+  progressive.observeToolResult(inlineRequest, {
+    tool_call_id: inlineRequest.toolCallId,
+    ok: false,
+    summary: "command failed",
+    output: {
+      stderr: "TypeError: object does not support indexing",
+      return_code: 1,
+    },
+    artifacts: [],
+    error: "shell_exit_1",
+    metadata: { workspace_mutation_committed: "false" },
+  }, false);
+
+  const diagnostic = progressive.snapshot();
+  assert.equal(diagnostic.verificationCount, 0);
+  assert.deepEqual(diagnostic.unresolvedVerificationScopes, []);
+  assert.equal(diagnostic.recoveryInspectionAllowance, 8);
+  assert.ok(diagnostic.progressReasons.includes(
+    "task_authored_inline_verification_probe_failed",
+  ));
+  assert.equal(progressive.decide(1_000, 10_000).action, "nudge_verification");
+
+  const suiteRequest: ToolExecutionRequest = {
+    ...inlineRequest,
+    toolCallId: "repository-suite",
+    arguments: { command: "python -m pytest tests/test_pipeline.py" },
+    metadata: {
+      progressive_verification_driving: true,
+      progressive_verification_scope: "shell:pytest:tests/test_pipeline.py",
+      progressive_task_authored_inline_probe: false,
+    },
+  };
+  progressive.observeToolResult(suiteRequest, {
+    tool_call_id: suiteRequest.toolCallId,
+    ok: true,
+    summary: "command completed",
+    output: { stdout: "41 passed", return_code: 0 },
+    artifacts: [],
+    metadata: { workspace_mutation_committed: "false" },
+  }, false);
+  assert.equal(progressive.snapshot().verificationCount, 1);
+});
+
+test("failed semantic scope requests a repair before another verification rerun", () => {
+  const scope = "shell:pytest:sympy/geometry/tests/test_point.py";
+  const progressive = new ProgressiveExecutionRuntime({
+    deliveryContract: { workspace_mutation_required: true },
+    continuityProgress: {
+      requiredDeliveryMissing: false,
+      workspaceMutationCount: 2,
+      repairMutationCount: 2,
+      unresolvedVerificationScopes: [scope],
+      unresolvedVerificationFailures: [{
+        scope,
+        failedChecks: [],
+        failedCount: 1,
+        failureKind: "nonzero_exit",
+        attemptCount: 1,
+        lastObservedWorkspaceMutationCount: 2,
+        diagnosticSummary: "AttributeError: Point2D has no attribute as_coeff_Mul",
+      }],
+    },
+  });
+
+  assert.equal(progressive.verificationRepairRequired(), true);
+  const repairDecision = progressive.decide(1_000, 10_000);
+  assert.equal(repairDecision.action, "nudge_action");
+  assert.match(repairDecision.reason, /targeted repair is required before it can be rerun/);
+
+  const edit: ToolExecutionRequest = {
+    toolCallId: "point-priority-edit",
+    toolName: "file_edit",
+    arguments: { path: "sympy/geometry/point.py" },
+    turnIndex: 0,
+    stepIndex: 0,
+    batchId: "point-priority-edit",
+    batchIndex: 0,
+    batchSize: 1,
+    executionMode: "serial_non_read_only",
+    metadata: { progressive_repair_driving: true },
+  };
+  progressive.observeToolResult(edit, {
+    tool_call_id: edit.toolCallId,
+    ok: true,
+    summary: "updated Point operator priority",
+    output: { path: "sympy/geometry/point.py" },
+    artifacts: [],
+    metadata: { workspace_mutation_committed: "true" },
+  }, false);
+
+  assert.equal(progressive.verificationRepairRequired(), false);
+  assert.equal(progressive.decide(1_000, 10_000).action, "nudge_verification");
+});
+
+test("explicit delivery-consistency verification debt targets generated evidence", () => {
+  const deliveryFailure = new ProgressiveExecutionRuntime({
+    deliveryContract: { workspace_mutation_required: true },
+    continuityProgress: {
+      requiredDeliveryMissing: false,
+      workspaceMutationCount: 7,
+      repairMutationCount: 7,
+      unresolvedVerificationScopes: ["shell:starweavectl:verify"],
+      unresolvedVerificationFailures: [{
+        scope: "shell:starweavectl:verify",
+        failedChecks: ["G8-DELIVERY-CONSISTENCY", "G9-AUTONOMOUS-CONTROL"],
+        failedCount: 2,
+        failureKind: "reported_checks",
+        attemptCount: 1,
+        lastObservedWorkspaceMutationCount: 7,
+        diagnosticSummary: "manifest omits dashboard.html; decision action digest mismatch for EVENT-1",
+      }],
+    },
+  });
+  assert.equal(deliveryFailure.verificationFailureTargetsGeneratedDelivery(), true);
+  assert.match(deliveryFailure.verificationDebtSummary(), /regenerate them.*immediately rerun/iu);
+  assert.match(deliveryFailure.verificationDebtSummary(), /Do not search for private evaluator/iu);
+
+  const generatedEntrypointFailure = new ProgressiveExecutionRuntime({
+    deliveryContract: { workspace_mutation_required: true },
+    continuityProgress: {
+      requiredDeliveryMissing: false,
+      workspaceMutationCount: 2,
+      repairMutationCount: 2,
+      unresolvedVerificationScopes: ["shell:powershell:deliverables/reproduce.ps1"],
+      unresolvedVerificationFailures: [{
+        scope: "shell:powershell:deliverables/reproduce.ps1",
+        failedChecks: [],
+        failedCount: 1,
+        failureKind: "nonzero_exit",
+        attemptCount: 1,
+        lastObservedWorkspaceMutationCount: 2,
+        diagnosticSummary: "ParserError: deliverables\\reproduce.ps1:300 unterminated array",
+      }],
+    },
+  });
+  assert.equal(
+    generatedEntrypointFailure.verificationFailureTargetsGeneratedDelivery(),
+    true,
+  );
+
+  const behavioralFailure = new ProgressiveExecutionRuntime({
+    deliveryContract: { workspace_mutation_required: true },
+    continuityProgress: {
+      requiredDeliveryMissing: false,
+      workspaceMutationCount: 7,
+      repairMutationCount: 7,
+      unresolvedVerificationScopes: ["integration-suite"],
+      unresolvedVerificationFailures: [{
+        scope: "integration-suite",
+        failedChecks: ["G5-BUSINESS-BEHAVIOR"],
+        failedCount: 1,
+        failureKind: "reported_checks",
+        attemptCount: 1,
+        lastObservedWorkspaceMutationCount: 7,
+        diagnosticSummary: "service response mismatch",
+      }],
+    },
+  });
+  assert.equal(behavioralFailure.verificationFailureTargetsGeneratedDelivery(), false);
+  assert.doesNotMatch(behavioralFailure.verificationDebtSummary(), /generated-delivery consistency/iu);
+});
+
+test("PowerShell absolute-path verifier failure retains an actionable generated entrypoint", () => {
+  const progressive = new ProgressiveExecutionRuntime({
+    deliveryContract: {
+      workspace_mutation_required: true,
+      verification_required: true,
+    },
+    continuityProgress: {
+      requiredDeliveryMissing: false,
+      workspaceMutationCount: 1,
+      repairMutationCount: 1,
+    },
+  });
+  const request: ToolExecutionRequest = {
+    toolCallId: "powershell-generated-entrypoint",
+    toolName: "shell",
+    arguments: {
+      command: "pwsh.exe -NoProfile -NonInteractive -File deliverables/reproduce.ps1",
+    },
+    turnIndex: 0,
+    stepIndex: 0,
+    batchId: "powershell-generated-entrypoint",
+    batchIndex: 0,
+    batchSize: 1,
+    executionMode: "serial_non_read_only",
+    metadata: {
+      progressive_verification_driving: true,
+      progressive_verification_scope: "shell:powershell:deliverables/reproduce.ps1",
+    },
+  };
+  progressive.observeToolResult(request, {
+    tool_call_id: request.toolCallId,
+    ok: false,
+    summary: "command failed",
+    output: {
+      stderr: [
+        "G:\\agent-zoo\\zyra-capability-evaluation\\runs\\T01\\run-attempt\\workspace\\deliverables\\reproduce.ps1:61",
+        "The term '>' is not recognized as a name of a cmdlet, function, script file, or executable program.",
+      ].join("\n"),
+      return_code: 1,
+    },
+    artifacts: [],
+    error: "shell_nonzero_exit",
+    metadata: { workspace_mutation_committed: "false" },
+  }, false);
+
+  const failure = progressive.snapshot().unresolvedVerificationFailures[0];
+  assert.match(failure.diagnosticSummary ?? "", /deliverables\\reproduce\.ps1:61/);
+  assert.match(failure.diagnosticSummary ?? "", /not recognized as a name/);
+  assert.equal(progressive.verificationFailureTargetsGeneratedDelivery(), true);
+  assert.equal(progressive.snapshot().targetedRepairInspectionAllowance, 2);
+});
+
+test("repeated opaque verification debt rejects invented diagnostics and redirects repair", () => {
+  const progressive = new ProgressiveExecutionRuntime({
+    deliveryContract: { workspace_mutation_required: true },
+    continuityProgress: {
+      requiredDeliveryMissing: false,
+      workspaceMutationCount: 6,
+      repairMutationCount: 6,
+      unresolvedVerificationScopes: ["integration-suite"],
+      unresolvedVerificationFailures: [{
+        scope: "integration-suite",
+        failedChecks: ["opaque-contract", "opaque-cross-language"],
+        failedCount: 2,
+        failureKind: "reported_checks",
+        attemptCount: 3,
+        lastObservedWorkspaceMutationCount: 6,
+      }],
+    },
+  });
+
+  const summary = progressive.verificationDebtSummary();
+  assert.match(summary, /repeated verifier result is intentionally opaque/);
+  assert.match(summary, /Do not invent or search for hidden error detail/);
+  assert.match(summary, /treat that hypothesis as insufficient and pivot/);
+  assert.doesNotMatch(summary, /first-seen regression/);
+});
+
+test("stale actionable fragments do not collapse a later opaque repair context", () => {
+  const progressive = new ProgressiveExecutionRuntime({
+    deliveryContract: { workspace_mutation_required: true },
+    continuityProgress: {
+      requiredDeliveryMissing: false,
+      workspaceMutationCount: 4,
+      repairMutationCount: 4,
+      unresolvedVerificationScopes: ["integration-suite"],
+      unresolvedVerificationFailures: [{
+        scope: "integration-suite",
+        failedChecks: ["contract-security", "cross-language"],
+        failedCount: 2,
+        failureKind: "reported_checks",
+        attemptCount: 4,
+        lastObservedWorkspaceMutationCount: 4,
+        diagnosticSummary: "grep: old_guess.py: No such file or directory | throw new Error(`metadata request failed`)",
+      }],
+    },
+  });
+
+  assert.equal(progressive.snapshot().targetedRepairInspectionAllowance, 12);
+  assert.doesNotMatch(
+    progressive.snapshot().progressReasons.join(" "),
+    /actionable_verification_diagnostic_bounded/,
+  );
+});
+
+test("a verification on repaired bytes drops stale source diagnostics", () => {
+  const progressive = new ProgressiveExecutionRuntime({
+    deliveryContract: { workspace_mutation_required: true },
+    continuityProgress: {
+      requiredDeliveryMissing: false,
+      workspaceMutationCount: 6,
+      repairMutationCount: 6,
+      unresolvedVerificationScopes: ["integration-suite"],
+      unresolvedVerificationFailures: [{
+        scope: "integration-suite",
+        failedChecks: ["contract-security", "cross-language"],
+        failedCount: 2,
+        failureKind: "reported_checks",
+        attemptCount: 4,
+        lastObservedWorkspaceMutationCount: 5,
+        diagnosticSummary: "existing.error = redact_log_line(str(error))",
+      }],
+    },
+  });
+  const rerun: ToolExecutionRequest = {
+    toolCallId: "integration-after-repair",
+    toolName: "shell",
+    arguments: { command: "python tools/afctl.py test integration" },
+    turnIndex: 0,
+    stepIndex: 0,
+    batchId: "integration-after-repair",
+    batchIndex: 0,
+    batchSize: 1,
+    executionMode: "serial_non_read_only",
+    metadata: {
+      progressive_verification_driving: true,
+      progressive_verification_scope: "integration-suite",
+    },
+  };
+  progressive.observeToolResult(rerun, {
+    tool_call_id: rerun.toolCallId,
+    ok: true,
+    summary: "command completed",
+    output: {
+      stdout: '{"status":"failed","failed":2,"failed_shards":["contract-security","cross-language"]}',
+      return_code: 0,
+    },
+    artifacts: [],
+    metadata: { workspace_mutation_committed: "false" },
+  }, false);
+
+  const failure = progressive.snapshot().unresolvedVerificationFailures[0];
+  assert.deepEqual(failure.failedChecks, ["contract-security", "cross-language"]);
+  assert.equal(failure.lastObservedWorkspaceMutationCount, 6);
+  assert.equal(failure.diagnosticSummary, undefined);
+});
+
+test("reported checks replace opaque stale diagnostics on the same bytes", () => {
+  const progressive = new ProgressiveExecutionRuntime({
+    deliveryContract: { workspace_mutation_required: true },
+    continuityProgress: {
+      requiredDeliveryMissing: false,
+      workspaceMutationCount: 6,
+      repairMutationCount: 6,
+      unresolvedVerificationScopes: ["integration-suite"],
+      unresolvedVerificationFailures: [{
+        scope: "integration-suite",
+        failedChecks: ["contract-security", "cross-language"],
+        failedCount: 2,
+        failureKind: "reported_checks",
+        attemptCount: 5,
+        lastObservedWorkspaceMutationCount: 6,
+        diagnosticSummary: "existing.error = redact_log_line(str(error))",
+      }],
+    },
+  });
+  const rerun: ToolExecutionRequest = {
+    toolCallId: "integration-same-bytes",
+    toolName: "shell",
+    arguments: { command: "python tools/afctl.py test integration" },
+    turnIndex: 0,
+    stepIndex: 0,
+    batchId: "integration-same-bytes",
+    batchIndex: 0,
+    batchSize: 1,
+    executionMode: "serial_non_read_only",
+    metadata: {
+      progressive_verification_driving: true,
+      progressive_verification_scope: "integration-suite",
+    },
+  };
+  progressive.observeToolResult(rerun, {
+    tool_call_id: rerun.toolCallId,
+    ok: true,
+    summary: "command completed",
+    output: {
+      stdout: '{"status":"failed","failed":2,"failed_shards":["contract-security","cross-language"]}',
+      return_code: 0,
+    },
+    artifacts: [],
+    metadata: { workspace_mutation_committed: "false" },
+  }, false);
+
+  const failure = progressive.snapshot().unresolvedVerificationFailures[0];
+  assert.deepEqual(failure.failedChecks, ["contract-security", "cross-language"]);
+  assert.equal(failure.lastObservedWorkspaceMutationCount, 6);
+  assert.equal(failure.diagnosticSummary, undefined);
+});
+
+test("legacy checkpoints migrate failed checks without polluted diagnostics", () => {
+  const source = new ProgressiveExecutionRuntime({
+    deliveryContract: { workspace_mutation_required: true },
+    continuityProgress: {
+      requiredDeliveryMissing: false,
+      workspaceMutationCount: 6,
+      repairMutationCount: 6,
+      unresolvedVerificationScopes: ["integration-suite"],
+      unresolvedVerificationFailures: [{
+        scope: "integration-suite",
+        failedChecks: ["contract-security", "cross-language"],
+        failedCount: 2,
+        failureKind: "reported_checks",
+        attemptCount: 5,
+        lastObservedWorkspaceMutationCount: 6,
+        diagnosticSummary: "old implementation | new implementation",
+      }],
+    },
+  });
+  const legacy = structuredClone(source.snapshot());
+  delete (legacy as { verificationDiagnosticVersion?: number }).verificationDiagnosticVersion;
+
+  const migrated = new ProgressiveExecutionRuntime({
+    deliveryContract: { workspace_mutation_required: true },
+    restored: legacy,
+    continuityProgress: {
+      unresolvedVerificationScopes: ["integration-suite"],
+      unresolvedVerificationFailures: [{
+        scope: "integration-suite",
+        failedChecks: ["contract-security", "cross-language"],
+        failedCount: 2,
+        failureKind: "reported_checks",
+        attemptCount: 5,
+        lastObservedWorkspaceMutationCount: 6,
+        diagnosticSummary: "old implementation | new implementation",
+      }],
+    },
+  }).snapshot();
+
+  assert.equal(migrated.verificationDiagnosticVersion, 3);
+  assert.deepEqual(
+    migrated.unresolvedVerificationFailures[0].failedChecks,
+    ["contract-security", "cross-language"],
+  );
+  assert.equal(migrated.unresolvedVerificationFailures[0].diagnosticSummary, undefined);
+
+  const handoffMigrated = new ProgressiveExecutionRuntime({
+    deliveryContract: { workspace_mutation_required: true },
+    continuityProgress: {
+      requiredDeliveryMissing: false,
+      workspaceMutationCount: 6,
+      repairMutationCount: 6,
+      targetedRepairReserveVersion: 4,
+      verificationDiagnosticVersion: 2,
+      unresolvedVerificationScopes: ["integration-suite"],
+      unresolvedVerificationFailures: [{
+        scope: "integration-suite",
+        failedChecks: ["contract-security", "cross-language"],
+        failedCount: 2,
+        failureKind: "reported_checks",
+        attemptCount: 5,
+        lastObservedWorkspaceMutationCount: 6,
+        diagnosticSummary: "old implementation | new implementation",
+      }],
+    },
+  }).snapshot();
+  assert.deepEqual(
+    handoffMigrated.unresolvedVerificationFailures[0].failedChecks,
+    ["contract-security", "cross-language"],
+  );
+  assert.equal(
+    handoffMigrated.unresolvedVerificationFailures[0].diagnosticSummary,
+    undefined,
+  );
+});
+
+test("a new verification result supersedes stale environment diagnostics", () => {
+  const progressive = new ProgressiveExecutionRuntime({
+    deliveryContract: { workspace_mutation_required: true },
+    continuityProgress: {
+      requiredDeliveryMissing: false,
+      workspaceMutationCount: 5,
+      repairMutationCount: 5,
+      unresolvedVerificationScopes: ["simulation-suite"],
+      unresolvedVerificationFailures: [{
+        scope: "simulation-suite",
+        failedChecks: [],
+        failedCount: null,
+        failureKind: "transport_failure",
+        attemptCount: 2,
+        lastObservedWorkspaceMutationCount: 4,
+        diagnosticSummary: "Network unreachable",
+      }],
+    },
+  });
+  const verification: ToolExecutionRequest = {
+    toolCallId: "simulation-http-500",
+    toolName: "shell",
+    arguments: { command: "python tools/afctl.py simulate" },
+    turnIndex: 0,
+    stepIndex: 0,
+    batchId: "simulation-http-500",
+    batchIndex: 0,
+    batchSize: 1,
+    executionMode: "serial_non_read_only",
+    metadata: {
+      progressive_verification_driving: true,
+      progressive_verification_scope: "simulation-suite",
+    },
+  };
+  progressive.observeToolResult(verification, {
+    tool_call_id: verification.toolCallId,
+    ok: false,
+    summary: "request failed: HTTP Error 500: Internal Server Error",
+    output: {
+      stderr: "request failed: HTTP Error 500: Internal Server Error",
+      return_code: 1,
+    },
+    artifacts: [],
+    metadata: { workspace_mutation_committed: "false" },
+  }, false);
+
+  const failure = progressive.snapshot().unresolvedVerificationFailures[0];
+  assert.doesNotMatch(failure.diagnosticSummary ?? "", /Network unreachable/);
+  assert.match(failure.diagnosticSummary ?? "", /HTTP Error 500/);
+  assert.equal(progressive.verificationEnvironmentRecoveryRequired(), false);
+});
+
+test("an aggregate rerun retains prior failed-check context without claiming current check names", () => {
+  const progressive = new ProgressiveExecutionRuntime({
+    deliveryContract: { workspace_mutation_required: true },
+    continuityProgress: {
+      requiredDeliveryMissing: false,
+      workspaceMutationCount: 6,
+      repairMutationCount: 6,
+      unresolvedVerificationScopes: ["integration-suite"],
+      unresolvedVerificationFailures: [{
+        scope: "integration-suite",
+        failedChecks: ["contract-security", "cross-language"],
+        failedCount: 2,
+        failureKind: "reported_checks",
+        attemptCount: 3,
+        lastObservedWorkspaceMutationCount: 5,
+      }],
+    },
+  });
+  const rerun: ToolExecutionRequest = {
+    toolCallId: "aggregate-integration-rerun",
+    toolName: "shell",
+    arguments: { command: "python tools/afctl.py test integration" },
+    turnIndex: 0,
+    stepIndex: 0,
+    batchId: "aggregate-integration-rerun",
+    batchIndex: 0,
+    batchSize: 1,
+    executionMode: "serial_non_read_only",
+    metadata: {
+      progressive_verification_driving: true,
+      progressive_verification_scope: "integration-suite",
+    },
+  };
+  progressive.observeToolResult(rerun, {
+    tool_call_id: rerun.toolCallId,
+    ok: true,
+    summary: "command completed",
+    output: { stdout: '{"status":"failed","failed":1}', return_code: 0 },
+    artifacts: [],
+    metadata: { workspace_mutation_committed: "false" },
+  }, false);
+
+  const failure = progressive.snapshot().unresolvedVerificationFailures[0];
+  assert.deepEqual(failure.failedChecks, []);
+  assert.equal(failure.failedCount, 1);
+  assert.match(
+    failure.diagnosticSummary ?? "",
+    /Previous verification attempt reported failed checks=contract-security,cross-language/,
+  );
+});
+
+test("contract prose does not pollute retained verification diagnostics", () => {
+  const progressive = new ProgressiveExecutionRuntime({
+    deliveryContract: { workspace_mutation_required: true },
+    continuityProgress: {
+      requiredDeliveryMissing: false,
+      workspaceMutationCount: 4,
+      repairMutationCount: 4,
+      unresolvedVerificationScopes: ["integration-suite"],
+      unresolvedVerificationFailures: [{
+        scope: "integration-suite",
+        failedChecks: [],
+        failedCount: 1,
+        failureKind: "reported_failure",
+        attemptCount: 2,
+        lastObservedWorkspaceMutationCount: 4,
+        diagnosticSummary: "ValueError: tenant predicate mismatch",
+      }],
+    },
+  });
+  const contractRead: ToolExecutionRequest = {
+    toolCallId: "contract-read",
+    toolName: "shell",
+    arguments: { command: "cat task-contract.json" },
+    turnIndex: 0,
+    stepIndex: 0,
+    batchId: "contract-read",
+    batchIndex: 0,
+    batchSize: 1,
+    executionMode: "serial_non_read_only",
+    metadata: {},
+  };
+  progressive.observeToolResult(contractRead, {
+    tool_call_id: contractRead.toolCallId,
+    ok: true,
+    summary: "command completed",
+    output: {
+      stdout: '"health_rate_formula": "missing or stale observations count as unhealthy"',
+      return_code: 0,
+    },
+    artifacts: [],
+    metadata: { workspace_mutation_committed: "false" },
+  }, false);
+
+  assert.equal(
+    progressive.snapshot().unresolvedVerificationFailures[0].diagnosticSummary,
+    "ValueError: tenant predicate mismatch",
+  );
+
+  const inspectThroughInterpreter: ToolExecutionRequest = {
+    ...contractRead,
+    toolCallId: "inspect-through-interpreter",
+    arguments: { command: "python -c \"import inspect, auth; print(inspect.getsource(auth.authorize))\"" },
+  };
+  progressive.observeToolResult(inspectThroughInterpreter, {
+    tool_call_id: inspectThroughInterpreter.toolCallId,
+    ok: true,
+    summary: "command completed",
+    output: {
+      stdout: 'def authorize():\n    raise CrossTenantAccessError("denied")',
+      return_code: 0,
+    },
+    artifacts: [],
+    metadata: { workspace_mutation_committed: "false" },
+  }, false);
+  assert.equal(
+    progressive.snapshot().unresolvedVerificationFailures[0].diagnosticSummary,
+    "ValueError: tenant predicate mismatch",
+  );
+
+  const backgroundSourceResult: ToolExecutionRequest = {
+    ...contractRead,
+    toolCallId: "background-source-result",
+    toolName: "shell_wait",
+    arguments: { job_id: "source-read" },
+  };
+  progressive.observeToolResult(backgroundSourceResult, {
+    tool_call_id: backgroundSourceResult.toolCallId,
+    ok: true,
+    summary: "background command completed",
+    output: {
+      stdout: 'def redact_error(error):\n    raise CrossTenantAccessError("denied")',
+      return_code: 0,
+    },
+    artifacts: [],
+    metadata: { workspace_mutation_committed: "false" },
+  }, false);
+  assert.equal(
+    progressive.snapshot().unresolvedVerificationFailures[0].diagnosticSummary,
+    "ValueError: tenant predicate mismatch",
+  );
+
+  const sourceRead: ToolExecutionRequest = {
+    ...contractRead,
+    toolCallId: "source-read",
+    arguments: { command: "sed -n '1,220p' services/control-api/auth.py" },
+  };
+  progressive.observeToolResult(sourceRead, {
+    tool_call_id: sourceRead.toolCallId,
+    ok: true,
+    summary: "command completed",
+    output: {
+      stdout: 'raise CrossTenantAccessError("cross-tenant access denied")',
+      return_code: 0,
+    },
+    artifacts: [],
+    metadata: { workspace_mutation_committed: "false" },
+  }, false);
+  assert.equal(
+    progressive.snapshot().unresolvedVerificationFailures[0].diagnosticSummary,
+    "ValueError: tenant predicate mismatch",
+  );
+
+  const restored = new ProgressiveExecutionRuntime({
+    deliveryContract: { workspace_mutation_required: true },
+    continuityProgress: {
+      requiredDeliveryMissing: false,
+      workspaceMutationCount: 4,
+      repairMutationCount: 4,
+      unresolvedVerificationScopes: ["integration-suite"],
+      unresolvedVerificationFailures: [{
+        scope: "integration-suite",
+        failedChecks: [],
+        failedCount: 1,
+        failureKind: "reported_failure",
+        attemptCount: 2,
+        lastObservedWorkspaceMutationCount: 4,
+        diagnosticSummary: '"health_rate_formula": "missing or stale observations count as unhealthy"',
+      }],
+    },
+  });
+  assert.equal(
+    restored.snapshot().unresolvedVerificationFailures[0].diagnosticSummary,
+    undefined,
+  );
+});
+
+test("structured failed checks outrank transport wrappers and use the final failure count", () => {
+  const progressive = new ProgressiveExecutionRuntime({
+    deliveryContract: { workspace_mutation_required: true },
+    continuityProgress: {
+      requiredDeliveryMissing: false,
+      workspaceMutationCount: 2,
+      repairMutationCount: 2,
+    },
+  });
+  const verification: ToolExecutionRequest = {
+    toolCallId: "structured-failed-checks",
+    toolName: "shell",
+    arguments: { command: "python tools/afctl.py test integration" },
+    turnIndex: 0,
+    stepIndex: 0,
+    batchId: "structured-failed-checks",
+    batchIndex: 0,
+    batchSize: 1,
+    executionMode: "serial_non_read_only",
+    metadata: {
+      progressive_verification_driving: true,
+      progressive_verification_scope: "integration-suite",
+    },
+  };
+  progressive.observeToolResult(verification, {
+    tool_call_id: verification.toolCallId,
+    ok: false,
+    summary: "sandbox_command_failed",
+    output: {
+      stdout: [
+        '{"counts":{"failed":1},"failed_shards":["contract-security"]}',
+        '{"counts":{"failed":2},"failed_shards":["contract-security","cross-language"]}',
+      ].join("\n"),
+      return_code: 1,
+    },
+    artifacts: [],
+    error: "sandbox_command_failed",
+    metadata: { workspace_mutation_committed: "false" },
+  }, false);
+
+  const failure = progressive.snapshot().unresolvedVerificationFailures[0];
+  assert.equal(failure.failureKind, "reported_checks");
+  assert.equal(failure.failedCount, 2);
+  assert.deepEqual(failure.failedChecks, ["contract-security", "cross-language"]);
+});
+
+test("a successful environment recovery permits the failed scope to rerun", () => {
+  const progressive = new ProgressiveExecutionRuntime({
+    deliveryContract: { workspace_mutation_required: true },
+    continuityProgress: {
+      requiredDeliveryMissing: false,
+      workspaceMutationCount: 3,
+      repairMutationCount: 3,
+      unresolvedVerificationScopes: ["simulation-suite"],
+      unresolvedVerificationFailures: [{
+        scope: "simulation-suite",
+        failedChecks: [],
+        failedCount: null,
+        failureKind: "transport_failure",
+        attemptCount: 2,
+        lastObservedWorkspaceMutationCount: 3,
+        diagnosticSummary: "Network unreachable",
+      }],
+    },
+  });
+  assert.equal(progressive.failedVerificationScopeAwaitingRepair("simulation-suite"), true);
+  assert.equal(progressive.verificationEnvironmentRecoveryRequired(), true);
+  const recovered: ToolExecutionRequest = {
+    toolCallId: "services-up",
+    toolName: "shell_wait",
+    arguments: { job_id: "services-up-job" },
+    turnIndex: 0,
+    stepIndex: 0,
+    batchId: "services-up",
+    batchIndex: 0,
+    batchSize: 1,
+    executionMode: "serial_non_read_only",
+    metadata: { progressive_environment_recovery_driving: true },
+  };
+  progressive.observeToolResult(recovered, {
+    tool_call_id: recovered.toolCallId,
+    ok: true,
+    summary: "services healthy",
+    output: { return_code: 0, termination: "exited" },
+    artifacts: [],
+    metadata: { workspace_mutation_committed: "false" },
+  }, false);
+
+  assert.equal(progressive.snapshot().repairMutationCount, 4);
+  assert.equal(progressive.failedVerificationScopeAwaitingRepair("simulation-suite"), false);
+  assert.equal(progressive.verificationEnvironmentRecoveryAwaitingVerification(), true);
+  const {
+    environmentRecoveryAwaitingVerification: _legacyFieldOmitted,
+    ...legacyRecoverySnapshot
+  } = progressive.snapshot();
+  const restoredLegacyRecovery = new ProgressiveExecutionRuntime({
+    deliveryContract: { workspace_mutation_required: true },
+    restored: {
+      ...legacyRecoverySnapshot,
+      progressReasons: [],
+    } as unknown as JsonObject,
+  });
+  assert.equal(
+    restoredLegacyRecovery.verificationEnvironmentRecoveryAwaitingVerification(),
+    true,
+  );
+  assert.match(
+    progressive.snapshot().progressReasons.join(" "),
+    /verification_environment_recovery_committed/,
+  );
+
+  const rerun: ToolExecutionRequest = {
+    toolCallId: "simulation-rerun",
+    toolName: "shell",
+    arguments: { command: "python tools/afctl.py simulate" },
+    turnIndex: 0,
+    stepIndex: 0,
+    batchId: "simulation-rerun",
+    batchIndex: 0,
+    batchSize: 1,
+    executionMode: "serial_non_read_only",
+    metadata: {
+      progressive_verification_driving: true,
+      progressive_verification_scope: "simulation-suite",
+    },
+  };
+  progressive.observeToolResult(rerun, {
+    tool_call_id: rerun.toolCallId,
+    ok: false,
+    summary: "request failed: HTTP Error 500: Internal Server Error",
+    output: { stderr: "HTTP Error 500: Internal Server Error", return_code: 1 },
+    artifacts: [],
+    metadata: { workspace_mutation_committed: "false" },
+  }, false);
+  assert.equal(progressive.verificationEnvironmentRecoveryAwaitingVerification(), false);
+});
+
+test("a failed build cannot impersonate successful environment recovery", () => {
+  const integrationScope = "shell:afctl:test:integration";
+  const progressive = new ProgressiveExecutionRuntime({
+    deliveryContract: { workspace_mutation_required: true },
+    continuityProgress: {
+      requiredDeliveryMissing: false,
+      workspaceMutationCount: 3,
+      repairMutationCount: 3,
+      unresolvedVerificationScopes: [integrationScope],
+      unresolvedVerificationFailures: [{
+        scope: integrationScope,
+        failedChecks: ["contract-security", "cross-language"],
+        failedCount: 2,
+        failureKind: "reported_checks",
+        attemptCount: 2,
+        lastObservedWorkspaceMutationCount: 3,
+      }],
+    },
+  });
+  const build: ToolExecutionRequest = {
+    toolCallId: "failed-build-recovery",
+    toolName: "shell_wait",
+    arguments: { job_id: "build-job" },
+    turnIndex: 0,
+    stepIndex: 0,
+    batchId: "failed-build-recovery",
+    batchIndex: 0,
+    batchSize: 1,
+    executionMode: "serial_non_read_only",
+    metadata: {
+      progressive_verification_driving: true,
+      progressive_verification_scope: "shell:afctl:build",
+      progressive_environment_recovery_driving: true,
+    },
+  };
+  progressive.observeToolResult(build, {
+    tool_call_id: build.toolCallId,
+    ok: true,
+    summary: "command completed",
+    output: { stderr: "ERROR: build failed", return_code: 1 },
+    artifacts: [],
+    metadata: { workspace_mutation_committed: "false" },
+  }, false);
+
+  assert.equal(progressive.snapshot().repairMutationCount, 3);
+  assert.equal(progressive.verificationEnvironmentRecoveryAwaitingVerification(), false);
+  assert.equal(progressive.failedVerificationScopeAwaitingRepair(integrationScope), true);
+
+  progressive.observeToolResult({ ...build, toolCallId: "successful-build-recovery" }, {
+    tool_call_id: "successful-build-recovery",
+    ok: true,
+    summary: "command completed",
+    output: { stdout: "build complete", return_code: 0 },
+    artifacts: [],
+    metadata: { workspace_mutation_committed: "false" },
+  }, false);
+
+  assert.equal(progressive.snapshot().repairMutationCount, 4);
+  assert.equal(progressive.verificationEnvironmentRecoveryAwaitingVerification(), true);
+  assert.equal(progressive.failedVerificationScopeAwaitingRepair(integrationScope), false);
+});
+
+test("repeating the same failed verification without an edit does not refill diagnostics", () => {
+  const progressive = new ProgressiveExecutionRuntime({
+    deliveryContract: { workspace_mutation_required: true },
+    continuityProgress: {
+      requiredDeliveryMissing: false,
+      workspaceMutationCount: 1,
+    },
+  });
+  const verification: ToolExecutionRequest = {
+    toolCallId: "integration-failed",
+    toolName: "shell",
+    arguments: { command: "python tools/afctl.py test integration" },
+    turnIndex: 0,
+    stepIndex: 0,
+    batchId: "integration-failed",
+    batchIndex: 0,
+    batchSize: 1,
+    executionMode: "serial_non_read_only",
+    metadata: {
+      progressive_verification_driving: true,
+      progressive_verification_scope: "shell:afctl:test:integration",
+    },
+  };
+  const failedResponse: ToolExecutionResponse = {
+    tool_call_id: verification.toolCallId,
+    ok: true,
+    summary: "command completed",
+    output: {
+      stdout: '{"status":"failed","counts":{"passed":7,"failed":3},"failed_shards":["security","state","cross-language"]}',
+      return_code: 0,
+    },
+    artifacts: [],
+    metadata: { workspace_mutation_committed: "false" },
+  };
+
+  progressive.recordActionNudge();
+  progressive.recordActionNudge();
+  progressive.observeToolResult(verification, failedResponse, false);
+  assert.equal(
+    progressive.failedVerificationScopeAwaitingRepair("shell:afctl:test:integration"),
+    true,
+  );
+  assert.equal(progressive.snapshot().recoveryInspectionAllowance, 8);
+  for (let index = 0; index < 8; index += 1) {
+    assert.equal(progressive.consumeRecoveryInspectionAllowance(), true);
+  }
+  progressive.observeToolResult(
+    { ...verification, toolCallId: "integration-same-bytes" },
+    { ...failedResponse, tool_call_id: "integration-same-bytes" },
+    false,
+  );
+  assert.equal(progressive.snapshot().recoveryInspectionAllowance, 0);
+  assert.equal(progressive.snapshot().unresolvedVerificationFailures[0].attemptCount, 2);
+
+  progressive.observeToolResult({
+    ...verification,
+    toolCallId: "targeted-edit",
+    toolName: "write",
+    arguments: { path: "src/fix.ts", content: "fixed" },
+    metadata: {},
+  }, {
+    tool_call_id: "targeted-edit",
+    ok: true,
+    summary: "updated",
+    output: {},
+    artifacts: [],
+    metadata: { workspace_mutation_committed: "true" },
+  }, false);
+  assert.equal(
+    progressive.failedVerificationScopeAwaitingRepair("shell:afctl:test:integration"),
+    false,
+  );
+  progressive.observeToolResult(
+    { ...verification, toolCallId: "integration-after-edit" },
+    { ...failedResponse, tool_call_id: "integration-after-edit" },
+    false,
+  );
+  const afterEdit = progressive.snapshot();
+  assert.equal(afterEdit.recoveryInspectionAllowance, 8);
+  assert.equal(afterEdit.unresolvedVerificationFailures[0].attemptCount, 3);
+  assert.equal(afterEdit.unresolvedVerificationFailures[0].lastObservedWorkspaceMutationCount, 2);
+  assert.equal(
+    progressive.failedVerificationScopeAwaitingRepair("shell:afctl:test:integration"),
+    true,
+  );
+});
+
+test("failed verification meters diagnostic inspection immediately", () => {
+  const progressive = new ProgressiveExecutionRuntime({
+    deliveryContract: { workspace_mutation_required: true },
+    continuityProgress: {
+      requiredDeliveryMissing: false,
+      workspaceMutationCount: 1,
+    },
+  });
+  const verification: ToolExecutionRequest = {
+    toolCallId: "integration-failed-before-nudge",
+    toolName: "shell",
+    arguments: { command: "python tools/afctl.py test integration" },
+    turnIndex: 0,
+    stepIndex: 0,
+    batchId: "integration-failed-before-nudge",
+    batchIndex: 0,
+    batchSize: 1,
+    executionMode: "serial_non_read_only",
+    metadata: {
+      progressive_verification_driving: true,
+      progressive_verification_scope: "shell:afctl:test:integration",
+    },
+  };
+
+  progressive.observeToolResult(verification, {
+    tool_call_id: verification.toolCallId,
+    ok: true,
+    summary: "command completed",
+    output: {
+      stdout: '{"status":"failed","failed_shards":["opaque-state"]}',
+      return_code: 0,
+    },
+    artifacts: [],
+    metadata: { workspace_mutation_committed: "false" },
+  }, false);
+
+  assert.equal(progressive.snapshot().actionNudgeCount, 0);
+  assert.equal(progressive.inspectionCircuitOpen(), true);
+  assert.equal(progressive.snapshot().recoveryInspectionAllowance, 8);
+  for (let index = 0; index < 8; index += 1) {
+    assert.equal(progressive.consumeRecoveryInspectionAllowance(), true);
+  }
+  assert.equal(progressive.consumeRecoveryInspectionAllowance(), false);
+});
+
+test("nonzero verification preserves its diagnostic window", () => {
+  const progressive = new ProgressiveExecutionRuntime({
+    deliveryContract: { workspace_mutation_required: true },
+    continuityProgress: {
+      requiredDeliveryMissing: false,
+      workspaceMutationCount: 1,
+    },
+  });
+  const verification: ToolExecutionRequest = {
+    toolCallId: "integration-nonzero",
+    toolName: "shell",
+    arguments: { command: "python tools/afctl.py test integration" },
+    turnIndex: 0,
+    stepIndex: 0,
+    batchId: "integration-nonzero",
+    batchIndex: 0,
+    batchSize: 1,
+    executionMode: "serial_non_read_only",
+    metadata: {
+      progressive_verification_driving: true,
+      progressive_verification_scope: "shell:afctl:test:integration",
+    },
+  };
+
+  progressive.observeToolResult(verification, {
+    tool_call_id: verification.toolCallId,
+    ok: false,
+    summary: "command failed",
+    output: {
+      stderr: "2 failed, 8 passed",
+      return_code: 1,
+    },
+    artifacts: [],
+    error: "shell_exit_1",
+    metadata: { workspace_mutation_committed: "false" },
+  }, false);
+
+  assert.equal(progressive.snapshot().recoveryInspectionAllowance, 8);
+  assert.equal(progressive.snapshot().unresolvedVerificationFailures[0]?.attemptCount, 1);
+});
+
+test("failed verification preserves twelve named source reads after broad diagnostics", () => {
+  const progressive = new ProgressiveExecutionRuntime({
+    deliveryContract: { workspace_mutation_required: true },
+    continuityProgress: {
+      requiredDeliveryMissing: false,
+      workspaceMutationCount: 1,
+    },
+  });
+  const verification: ToolExecutionRequest = {
+    toolCallId: "integration-failed-targeted-reserve",
+    toolName: "shell",
+    arguments: { command: "python tools/afctl.py test integration" },
+    turnIndex: 0,
+    stepIndex: 0,
+    batchId: "integration-failed-targeted-reserve",
+    batchIndex: 0,
+    batchSize: 1,
+    executionMode: "serial_non_read_only",
+    metadata: {
+      progressive_verification_driving: true,
+      progressive_verification_scope: "shell:afctl:test:integration",
+    },
+  };
+  progressive.observeToolResult(verification, {
+    tool_call_id: verification.toolCallId,
+    ok: true,
+    summary: "command completed",
+    output: {
+      stdout: '{"status":"failed","failed_shards":["opaque-state"]}',
+      return_code: 0,
+    },
+    artifacts: [],
+    metadata: { workspace_mutation_committed: "false" },
+  }, false);
+
+  for (let index = 0; index < 8; index += 1) {
+    assert.equal(progressive.consumeRecoveryInspectionAllowance(), true);
+  }
+  assert.equal(progressive.consumeRecoveryInspectionAllowance(), false);
+  for (let index = 0; index < 12; index += 1) {
+    assert.equal(progressive.consumeRecoveryInspectionAllowance(true), true);
+  }
+  assert.equal(progressive.consumeRecoveryInspectionAllowance(true), false);
+});
+
+test("verification-generated files do not impersonate a repair mutation", () => {
+  const progressive = new ProgressiveExecutionRuntime({
+    deliveryContract: { workspace_mutation_required: true },
+    continuityProgress: {
+      requiredDeliveryMissing: false,
+      workspaceMutationCount: 1,
+    },
+  });
+  const verification = (toolCallId: string): ToolExecutionRequest => ({
+    toolCallId,
+    toolName: "shell",
+    arguments: { command: "python tools/afctl.py simulate" },
+    turnIndex: 0,
+    stepIndex: 0,
+    batchId: toolCallId,
+    batchIndex: 0,
+    batchSize: 1,
+    executionMode: "serial_non_read_only",
+    metadata: {
+      progressive_verification_driving: true,
+      progressive_verification_scope: "shell:afctl:simulate",
+    },
+  });
+  const failedResponse = (toolCallId: string, mutated = false): ToolExecutionResponse => ({
+    tool_call_id: toolCallId,
+    ok: true,
+    summary: "simulation failed",
+    output: { stdout: '{"status":"failed","failed_shards":["state"]}', return_code: 0 },
+    artifacts: [],
+    metadata: { workspace_mutation_committed: String(mutated) },
+  });
+
+  progressive.observeToolResult(verification("first-failure"), failedResponse("first-failure"), false);
+  for (let index = 0; index < 8; index += 1) {
+    assert.equal(progressive.consumeRecoveryInspectionAllowance(), true);
+  }
+  for (let index = 0; index < 12; index += 1) {
+    assert.equal(progressive.consumeRecoveryInspectionAllowance(true), true);
+  }
+
+  progressive.observeToolResult(
+    verification("same-code-generated-report"),
+    failedResponse("same-code-generated-report", true),
+    false,
+  );
+  const snapshot = progressive.snapshot();
+  assert.equal(snapshot.workspaceMutationCount, 2);
+  assert.equal(snapshot.repairMutationCount, 1);
+  assert.equal(snapshot.recoveryInspectionAllowance, 0);
+  assert.equal(snapshot.targetedRepairInspectionAllowance, 0);
+  assert.equal(snapshot.unresolvedVerificationFailures[0].lastObservedWorkspaceMutationCount, 1);
+});
+
+test("submission report updates do not impersonate a repair mutation", () => {
+  const progressive = new ProgressiveExecutionRuntime({
+    deliveryContract: { workspace_mutation_required: true },
+    continuityProgress: {
+      requiredDeliveryMissing: false,
+      workspaceMutationCount: 9,
+      repairMutationCount: 4,
+    },
+  });
+  progressive.observeToolResult({
+    toolCallId: "update-report",
+    toolName: "shell",
+    arguments: { command: "python update_report.py submission/test-report.json" },
+    turnIndex: 0,
+    stepIndex: 0,
+    batchId: "update-report",
+    batchIndex: 0,
+    batchSize: 1,
+    executionMode: "serial_non_read_only",
+    metadata: { progressive_repair_driving: false },
+  }, {
+    tool_call_id: "update-report",
+    ok: true,
+    summary: "report updated",
+    output: {},
+    artifacts: [],
+    metadata: { workspace_mutation_committed: "true" },
+  }, false);
+
+  const snapshot = progressive.snapshot();
+  assert.equal(snapshot.workspaceMutationCount, 10);
+  assert.equal(snapshot.repairMutationCount, 4);
+});
+
+test("generated reports preserve the remaining named-source repair reserve", () => {
+  const progressive = new ProgressiveExecutionRuntime({
+    deliveryContract: { workspace_mutation_required: true },
+    continuityProgress: {
+      requiredDeliveryMissing: false,
+      workspaceMutationCount: 9,
+      repairMutationCount: 4,
+      unresolvedVerificationScopes: ["shell:afctl:test:integration"],
+      unresolvedVerificationFailures: [{
+        scope: "shell:afctl:test:integration",
+        failedChecks: ["opaque-state"],
+        failedCount: 1,
+        failureKind: "reported_checks",
+        attemptCount: 2,
+        lastObservedWorkspaceMutationCount: 4,
+      }],
+      targetedRepairInspectionAllowance: 2,
+      targetedRepairReserveVersion: 4,
+    },
+  });
+  progressive.observeToolResult({
+    toolCallId: "update-recovery-report",
+    toolName: "shell",
+    arguments: { command: "python update_report.py submission/recovery-report.json" },
+    turnIndex: 0,
+    stepIndex: 0,
+    batchId: "update-recovery-report",
+    batchIndex: 0,
+    batchSize: 1,
+    executionMode: "serial_non_read_only",
+    metadata: { progressive_repair_driving: false },
+  }, {
+    tool_call_id: "update-recovery-report",
+    ok: true,
+    summary: "report updated",
+    output: {},
+    artifacts: [],
+    metadata: { workspace_mutation_committed: "true" },
+  }, false);
+
+  const snapshot = progressive.snapshot();
+  assert.equal(snapshot.workspaceMutationCount, 10);
+  assert.equal(snapshot.repairMutationCount, 4);
+  assert.equal(snapshot.recoveryInspectionAllowance, 0);
+  assert.equal(snapshot.targetedRepairInspectionAllowance, 2);
+  assert.equal(progressive.consumeRecoveryInspectionAllowance(true), true);
+});
+
+test("legacy verification debt receives the named-source reserve only once", () => {
+  const legacyContinuity: JsonObject = {
+    requiredDeliveryMissing: false,
+    workspaceMutationCount: 7,
+    unresolvedVerificationScopes: ["shell:afctl:test:integration"],
+    unresolvedVerificationFailures: [{
+      scope: "shell:afctl:test:integration",
+      failedChecks: ["opaque-state"],
+      failedCount: 1,
+      failureKind: "reported_checks",
+      attemptCount: 1,
+      lastObservedWorkspaceMutationCount: 7,
+    }],
+  };
+  const migrated = new ProgressiveExecutionRuntime({
+    deliveryContract: { workspace_mutation_required: true },
+    continuityProgress: legacyContinuity,
+  }).snapshot();
+  assert.equal(migrated.targetedRepairInspectionAllowance, 12);
+  assert.equal(migrated.targetedRepairReserveVersion, 4);
+
+  const exhausted = new ProgressiveExecutionRuntime({
+    deliveryContract: { workspace_mutation_required: true },
+    continuityProgress: {
+      ...legacyContinuity,
+      targetedRepairInspectionAllowance: 0,
+      targetedRepairReserveVersion: 4,
+    },
+  }).snapshot();
+  assert.equal(exhausted.targetedRepairInspectionAllowance, 0);
+});
+
+test("a new resumed model context rehydrates named source reads exactly once", () => {
+  const debt: JsonObject = {
+    requiredDeliveryMissing: false,
+    workspaceMutationCount: 7,
+    repairMutationCount: 7,
+    unresolvedVerificationScopes: ["shell:afctl:test:integration"],
+    unresolvedVerificationFailures: [{
+      scope: "shell:afctl:test:integration",
+      failedChecks: ["hidden-state"],
+      failedCount: 1,
+      failureKind: "reported_checks",
+      attemptCount: 2,
+      lastObservedWorkspaceMutationCount: 7,
+    }],
+    targetedRepairInspectionAllowance: 0,
+    targetedRepairReserveVersion: 4,
+    repairContextId: "context-a",
+  };
+
+  const sameContext = new ProgressiveExecutionRuntime({
+    deliveryContract: { workspace_mutation_required: true },
+    continuityProgress: debt,
+    repairContextId: "context-a",
+  }).snapshot();
+  assert.equal(sameContext.targetedRepairInspectionAllowance, 0);
+
+  const resumed = new ProgressiveExecutionRuntime({
+    deliveryContract: { workspace_mutation_required: true },
+    continuityProgress: debt,
+    repairContextId: "context-b",
+  }).snapshot();
+  assert.equal(resumed.targetedRepairInspectionAllowance, 12);
+  assert.equal(resumed.repairContextId, "context-b");
+
+  const restoredSameContext = new ProgressiveExecutionRuntime({
+    deliveryContract: { workspace_mutation_required: true },
+    continuityProgress: {
+      ...debt,
+      repairContextId: resumed.repairContextId,
+      targetedRepairInspectionAllowance: 0,
+    },
+    repairContextId: "context-b",
+  }).snapshot();
+  assert.equal(restoredSameContext.targetedRepairInspectionAllowance, 0);
+});
+
+test("unscoped failed continuation cannot refill existing verification diagnostics", () => {
+  const progressive = new ProgressiveExecutionRuntime({
+    deliveryContract: { workspace_mutation_required: true },
+    continuityProgress: {
+      requiredDeliveryMissing: false,
+      workspaceMutationCount: 5,
+    },
+  });
+  const failed = (toolCallId: string, scope = ""): ToolExecutionRequest => ({
+    toolCallId,
+    toolName: scope ? "shell" : "shell_wait",
+    arguments: scope
+      ? { command: "python tools/afctl.py test integration" }
+      : { job_id: "restored-job" },
+    turnIndex: 0,
+    stepIndex: 0,
+    batchId: toolCallId,
+    batchIndex: 0,
+    batchSize: 1,
+    executionMode: "serial_non_read_only",
+    metadata: {
+      progressive_verification_driving: true,
+      progressive_verification_scope: scope,
+    },
+  });
+  const response = (toolCallId: string): ToolExecutionResponse => ({
+    tool_call_id: toolCallId,
+    ok: true,
+    summary: "command completed",
+    output: {
+      stdout: '{"status":"failed","failed_shards":["opaque-state"]}',
+      return_code: 0,
+    },
+    artifacts: [],
+    metadata: { workspace_mutation_committed: "false" },
+  });
+
+  const scoped = failed("scoped-failure", "shell:afctl:test:integration");
+  progressive.observeToolResult(scoped, response(scoped.toolCallId), false);
+  for (let index = 0; index < 8; index += 1) {
+    assert.equal(progressive.consumeRecoveryInspectionAllowance(), true);
+  }
+
+  const unscoped = failed("unscoped-restored-failure");
+  progressive.observeToolResult(unscoped, response(unscoped.toolCallId), false);
+  const snapshot = progressive.snapshot();
+  assert.equal(snapshot.recoveryInspectionAllowance, 0);
+  assert.deepEqual(snapshot.unresolvedVerificationScopes, ["shell:afctl:test:integration"]);
+  assert.equal(snapshot.unresolvedVerificationFailures[0].attemptCount, 2);
+  assert.equal(snapshot.unresolvedVerificationFailures[0].lastObservedWorkspaceMutationCount, 5);
+});
+
+test("structured verification debt survives a fenced execution continuation", () => {
+  const progressive = new ProgressiveExecutionRuntime({
+    deliveryContract: { workspace_mutation_required: true },
+    continuityProgress: {
+      requiredDeliveryMissing: false,
+      workspaceMutationCount: 7,
+      verificationCount: 4,
+      unresolvedVerificationScopes: ["shell:afctl:test:integration"],
+      unresolvedVerificationFailures: [{
+        scope: "shell:afctl:test:integration",
+        failedChecks: ["security", "cross-language"],
+        failedCount: 2,
+        failureKind: "reported_checks",
+        attemptCount: 3,
+        lastObservedWorkspaceMutationCount: 7,
+      }],
+    },
+  });
+
+  const restored = progressive.snapshot();
+  assert.equal(restored.verificationCount, 0);
+  assert.deepEqual(restored.unresolvedVerificationScopes, ["shell:afctl:test:integration"]);
+  assert.deepEqual(restored.unresolvedVerificationFailures[0].failedChecks, [
+    "security",
+    "cross-language",
+  ]);
+  const decision = progressive.decide(1_000, 10_000);
+  assert.equal(decision.action, "nudge_action");
+  assert.match(decision.reason, /security,cross-language/);
+});
+
+test("progressive execution rejects a zero-exit verification traceback", () => {
+  const progressive = new ProgressiveExecutionRuntime({
+    deliveryContract: { workspace_mutation_required: true },
+    continuityProgress: {
+      requiredDeliveryMissing: false,
+      workspaceMutationCount: 2,
+      verificationCount: 1,
+    },
+  });
+  const request: ToolExecutionRequest = {
+    toolCallId: "wrapped-worker-check",
+    toolName: "shell",
+    arguments: { command: "python verify_worker.py || true" },
+    turnIndex: 0,
+    stepIndex: 0,
+    batchId: "wrapped-worker-check",
+    batchIndex: 0,
+    batchSize: 1,
+    executionMode: "serial_non_read_only",
+    metadata: { progressive_verification_driving: true },
+  };
+
+  progressive.observeToolResult(request, {
+    tool_call_id: request.toolCallId,
+    ok: true,
+    summary: "command completed",
+    output: {
+      stdout: [
+        "Traceback (most recent call last):",
+        "  File 'verify_worker.py', line 10, in <module>",
+        "urllib.error.URLError: <urlopen error [Errno 111] Connection refused>",
+        "RC=0",
+      ].join("\n"),
+      return_code: 0,
+    },
+    artifacts: [],
+    metadata: { workspace_mutation_committed: "false" },
+  }, false);
+
+  const failed = progressive.snapshot();
+  assert.equal(failed.verificationCount, 0);
+  assert.ok(failed.progressReasons.includes("post_delivery_verification_failed"));
+});
+
+test("progressive execution rejects an explicit command error hidden by zero exit", () => {
+  const progressive = new ProgressiveExecutionRuntime({
+    deliveryContract: { workspace_mutation_required: true },
+    continuityProgress: {
+      requiredDeliveryMissing: false,
+      workspaceMutationCount: 2,
+      verificationCount: 1,
+    },
+  });
+  const request: ToolExecutionRequest = {
+    toolCallId: "wrapped-database-check",
+    toolName: "shell",
+    arguments: { command: "database-client --query verify; echo RC=$?" },
+    turnIndex: 0,
+    stepIndex: 0,
+    batchId: "wrapped-database-check",
+    batchIndex: 0,
+    batchSize: 1,
+    executionMode: "serial_non_read_only",
+    metadata: { progressive_verification_driving: true },
+  };
+
+  progressive.observeToolResult(request, {
+    tool_call_id: request.toolCallId,
+    ok: true,
+    summary: "command completed",
+    output: {
+      stdout: [
+        "ERROR:  column released_at does not exist",
+        "LINE 1: SELECT count(*) FROM worker_leases WHERE released_at IS NULL",
+        "RC=0",
+      ].join("\n"),
+      return_code: 0,
+    },
+    artifacts: [],
+    metadata: { workspace_mutation_committed: "false" },
+  }, false);
+
+  const failed = progressive.snapshot();
+  assert.equal(failed.verificationCount, 0);
+  assert.ok(failed.progressReasons.includes("post_delivery_verification_failed"));
+});
+
+test("progressive execution rejects a zero-exit transport failure", () => {
+  const progressive = new ProgressiveExecutionRuntime({
+    deliveryContract: { workspace_mutation_required: true },
+    continuityProgress: {
+      requiredDeliveryMissing: false,
+      workspaceMutationCount: 2,
+      verificationCount: 1,
+    },
+  });
+  const request: ToolExecutionRequest = {
+    toolCallId: "device-simulation",
+    toolName: "shell",
+    arguments: { command: "python scripts/run_device_simulation.py" },
+    turnIndex: 0,
+    stepIndex: 0,
+    batchId: "device-simulation",
+    batchIndex: 0,
+    batchSize: 1,
+    executionMode: "serial_non_read_only",
+    metadata: { progressive_verification_driving: true },
+  };
+
+  progressive.observeToolResult(request, {
+    tool_call_id: request.toolCallId,
+    ok: true,
+    summary: "command completed",
+    output: {
+      stdout: "request failed: <urlopen error [Errno 101] Network unreachable>",
+      return_code: 0,
+    },
+    artifacts: [],
+    metadata: { workspace_mutation_committed: "false" },
+  }, false);
+
+  const failed = progressive.snapshot();
+  assert.equal(failed.verificationCount, 0);
+  assert.ok(failed.progressReasons.includes("post_delivery_verification_failed"));
+});
+
+test("progressive execution rejects a compound verification that crashes after tests pass", () => {
+  const progressive = new ProgressiveExecutionRuntime({
+    deliveryContract: { workspace_mutation_required: true },
+    continuityProgress: {
+      requiredDeliveryMissing: false,
+      workspaceMutationCount: 2,
+      verificationCount: 1,
+    },
+  });
+  const request: ToolExecutionRequest = {
+    toolCallId: "compound-check",
+    toolName: "shell",
+    arguments: { command: "pytest && python verify_wiring.py" },
+    turnIndex: 0,
+    stepIndex: 0,
+    batchId: "compound-check",
+    batchIndex: 0,
+    batchSize: 1,
+    executionMode: "serial_non_read_only",
+    metadata: { progressive_verification_driving: true },
+  };
+
+  progressive.observeToolResult(request, {
+    tool_call_id: request.toolCallId,
+    ok: true,
+    summary: "command completed",
+    output: {
+      stdout: [
+        "138 passed in 12.45s",
+        "Traceback (most recent call last):",
+        "  File '<stdin>', line 3, in <module>",
+        "ModuleNotFoundError: No module named 'psycopg'",
+      ].join("\n"),
+      return_code: 0,
+    },
+    artifacts: [],
+    metadata: { workspace_mutation_committed: "false" },
+  }, false);
+
+  assert.equal(progressive.snapshot().verificationCount, 0);
+
+  progressive.observeToolResult({ ...request, toolCallId: "expected-error-tests" }, {
+    tool_call_id: "expected-error-tests",
+    ok: true,
+    summary: "command completed",
+    output: {
+      stdout: [
+        "Traceback (most recent call last):",
+        "ValueError: expected fixture error",
+        "5 passed in 0.10s",
+      ].join("\n"),
+      return_code: 0,
+    },
+    artifacts: [],
+    metadata: { workspace_mutation_committed: "false" },
+  }, false);
+  assert.equal(progressive.snapshot().verificationCount, 1);
+});
+
+test("explicitly accepted nonzero verification probes preserve semantic verification state", () => {
+  const cases: Array<{
+    name: string;
+    returnCode: number;
+    output: JsonObject;
+    metadata: Record<string, string>;
+  }> = [
+    {
+      name: "output-contract",
+      returnCode: 23,
+      output: {
+        accepted_return_codes: [0, 23],
+        return_code_accepted: true,
+      },
+      metadata: {},
+    },
+    {
+      name: "metadata-contract",
+      returnCode: 29,
+      output: {},
+      metadata: {
+        accepted_return_codes: "0,29",
+        return_code_accepted: "true",
+      },
+    },
+  ];
+
+  for (const scenario of cases) {
+    const request: ToolExecutionRequest = {
+      toolCallId: `negative-probe-${scenario.name}`,
+      toolName: "shell",
+      arguments: {
+        command: "python -m unittest discover",
+        accepted_return_codes: [0, scenario.returnCode],
+      },
+      turnIndex: 0,
+      stepIndex: 0,
+      batchId: `negative-probe-${scenario.name}`,
+      batchIndex: 0,
+      batchSize: 1,
+      executionMode: "serial_non_read_only",
+      metadata: {
+        progressive_verification_driving: true,
+        progressive_verification_scope: `shell:negative:${scenario.name}`,
+      },
+    };
+    const response: ToolExecutionResponse = {
+      tool_call_id: request.toolCallId,
+      ok: true,
+      summary: "expected failing baseline completed",
+      output: {
+        stdout: "Ran 5 tests\nFAILED (failures=3)\n3 failed",
+        return_code: scenario.returnCode,
+        ...scenario.output,
+      },
+      artifacts: [],
+      metadata: {
+        workspace_mutation_committed: "false",
+        ...scenario.metadata,
+      },
+    };
+
+    const alreadyVerified = new ProgressiveExecutionRuntime({
+      deliveryContract: { workspace_mutation_required: true },
+      continuityProgress: {
+        requiredDeliveryMissing: false,
+        workspaceMutationCount: 2,
+        verificationCount: 1,
+      },
+    });
+    alreadyVerified.observeToolResult(request, response, false);
+    const preserved = alreadyVerified.snapshot();
+    assert.equal(preserved.verificationCount, 1, scenario.name);
+    assert.deepEqual(preserved.unresolvedVerificationScopes, [], scenario.name);
+    assert.ok(
+      preserved.progressReasons.includes("expected_nonzero_verification_probe_observed"),
+      scenario.name,
+    );
+
+    const awaitingGreenVerification = new ProgressiveExecutionRuntime({
+      deliveryContract: { workspace_mutation_required: true },
+      continuityProgress: {
+        requiredDeliveryMissing: false,
+        workspaceMutationCount: 1,
+      },
+    });
+    awaitingGreenVerification.observeToolResult(request, response, false);
+    const neutral = awaitingGreenVerification.snapshot();
+    assert.equal(neutral.verificationCount, 0, scenario.name);
+    assert.deepEqual(neutral.unresolvedVerificationScopes, [], scenario.name);
+  }
+});
+
+test("nonzero verification results fail closed when the acceptance contract mismatches", () => {
+  const scope = "shell:negative:mismatched-contract";
+  const progressive = new ProgressiveExecutionRuntime({
+    deliveryContract: { workspace_mutation_required: true },
+    continuityProgress: {
+      requiredDeliveryMissing: false,
+      workspaceMutationCount: 2,
+      verificationCount: 1,
+    },
+  });
+  const request: ToolExecutionRequest = {
+    toolCallId: "negative-probe-mismatch",
+    toolName: "shell",
+    arguments: {
+      command: "python -m unittest discover",
+      accepted_return_codes: [0, 23],
+    },
+    turnIndex: 0,
+    stepIndex: 0,
+    batchId: "negative-probe-mismatch",
+    batchIndex: 0,
+    batchSize: 1,
+    executionMode: "serial_non_read_only",
+    metadata: {
+      progressive_verification_driving: true,
+      progressive_verification_scope: scope,
+    },
+  };
+
+  progressive.observeToolResult(request, {
+    tool_call_id: request.toolCallId,
+    ok: true,
+    summary: "command completed",
+    output: {
+      stdout: "2 failed",
+      return_code: 17,
+      accepted_return_codes: [0, 23],
+      return_code_accepted: true,
+    },
+    artifacts: [],
+    metadata: { workspace_mutation_committed: "false" },
+  }, false);
+
+  const failed = progressive.snapshot();
+  assert.equal(failed.verificationCount, 0);
+  assert.deepEqual(failed.unresolvedVerificationScopes, [scope]);
+  assert.ok(failed.progressReasons.includes("post_delivery_verification_failed"));
+});
+
+test("native test-harness baseline mismatches do not create semantic repair debt", () => {
+  const scope = "shell:pytest:lib/matplotlib/tests/test_axes.py";
+  const progressive = new ProgressiveExecutionRuntime({
+    deliveryContract: { workspace_mutation_required: true },
+    continuityProgress: {
+      requiredDeliveryMissing: false,
+      workspaceMutationCount: 2,
+      verificationCount: 1,
+    },
+  });
+  const request: ToolExecutionRequest = {
+    toolCallId: "matplotlib-freetype-baseline",
+    toolName: "shell",
+    arguments: { command: "python -m pytest lib/matplotlib/tests/test_axes.py -q" },
+    turnIndex: 0,
+    stepIndex: 0,
+    batchId: "matplotlib-freetype-baseline",
+    batchIndex: 0,
+    batchSize: 1,
+    executionMode: "serial_non_read_only",
+    metadata: {
+      progressive_verification_driving: true,
+      progressive_verification_scope: scope,
+    },
+  };
+
+  progressive.observeToolResult(request, {
+    tool_call_id: request.toolCallId,
+    ok: false,
+    summary: "repository test harness rejected the benchmark environment",
+    output: {
+      stderr: [
+        "Matplotlib is not built with the correct FreeType version to run tests.",
+        "Set local_freetype=True in setup.cfg and rebuild.",
+        "Expected freetype version 2.6.1. Found freetype version 2.11.1.",
+      ].join(" "),
+      return_code: 1,
+    },
+    artifacts: [],
+    metadata: { workspace_mutation_committed: "false" },
+  }, false);
+
+  const observed = progressive.snapshot();
+  assert.equal(observed.verificationCount, 0);
+  assert.deepEqual(observed.unresolvedVerificationScopes, []);
+  assert.deepEqual(observed.unresolvedVerificationFailures, []);
+  assert.ok(observed.progressReasons.includes(
+    "verification_invocation_failed_before_behavioral_result",
+  ));
+});
+
+test("shell wrapper failures do not replace semantic verification debt", () => {
+  const integrationScope = "shell:afctl:test:integration";
+  const progressive = new ProgressiveExecutionRuntime({
+    deliveryContract: { workspace_mutation_required: true },
+    continuityProgress: {
+      requiredDeliveryMissing: false,
+      workspaceMutationCount: 4,
+      repairMutationCount: 4,
+      unresolvedVerificationScopes: [integrationScope],
+      unresolvedVerificationFailures: [{
+        scope: integrationScope,
+        failedChecks: ["hidden-contract-security"],
+        failedCount: 1,
+        failureKind: "reported_checks",
+        attemptCount: 2,
+        lastObservedWorkspaceMutationCount: 4,
+      }],
+    },
+  });
+  progressive.observeToolResult({
+    toolCallId: "bad-build-wrapper",
+    toolName: "shell_wait",
+    arguments: { job_id: "job-build" },
+    turnIndex: 0,
+    stepIndex: 0,
+    batchId: "bad-build-wrapper",
+    batchIndex: 0,
+    batchSize: 1,
+    executionMode: "serial_non_read_only",
+    metadata: {
+      progressive_verification_driving: true,
+      progressive_verification_scope: "shell:afctl:build",
+    },
+  }, {
+    tool_call_id: "bad-build-wrapper",
+    ok: false,
+    summary: "Sandbox command failed",
+    output: {
+      stdout: "release-worker build completed\n",
+      stderr: "sh: syntax error: bad substitution\n",
+      return_code: 2,
+    },
+    artifacts: [],
+    error: "sandbox_command_failed",
+    metadata: { workspace_mutation_committed: "false" },
+  }, false);
+
+  const observed = progressive.snapshot();
+  assert.deepEqual(observed.unresolvedVerificationScopes, [integrationScope]);
+  assert.deepEqual(
+    observed.unresolvedVerificationFailures.map((failure) => failure.scope),
+    [integrationScope],
+  );
+  assert.equal(progressive.failedVerificationScopeAwaitingRepair("shell:afctl:build"), false);
+  assert.match(observed.progressReasons.join(" "), /verification_invocation_failed_before_behavioral_result/);
+
+  progressive.observeToolResult({
+    toolCallId: "blocked-typecheck-working-directory",
+    toolName: "shell",
+    arguments: { command: "npm run typecheck", cwd: "/workspace/services/release-worker" },
+    turnIndex: 1,
+    stepIndex: 0,
+    batchId: "blocked-typecheck-working-directory",
+    batchIndex: 0,
+    batchSize: 1,
+    executionMode: "serial_non_read_only",
+    metadata: {
+      progressive_verification_driving: true,
+      progressive_verification_scope: "shell:npm:typecheck",
+    },
+  }, {
+    tool_call_id: "blocked-typecheck-working-directory",
+    ok: false,
+    summary: "shell was blocked by SandboxGateway",
+    output: {
+      code: "ValueError",
+      reason: "absolute, drive and UNC paths are denied",
+    },
+    artifacts: [],
+    error: "ValueError",
+    metadata: { workspace_mutation_committed: "false" },
+  }, false);
+
+  const afterGatewayRejection = progressive.snapshot();
+  assert.deepEqual(afterGatewayRejection.unresolvedVerificationScopes, [integrationScope]);
+  assert.deepEqual(
+    afterGatewayRejection.unresolvedVerificationFailures.map((failure) => failure.scope),
+    [integrationScope],
+  );
+  assert.equal(
+    progressive.failedVerificationScopeAwaitingRepair("shell:npm:typecheck"),
+    false,
+  );
+
+  progressive.observeToolResult({
+    toolCallId: "dependency-download-timeout",
+    toolName: "shell_wait",
+    arguments: { job_id: "job-build-timeout" },
+    turnIndex: 2,
+    stepIndex: 0,
+    batchId: "dependency-download-timeout",
+    batchIndex: 0,
+    batchSize: 1,
+    executionMode: "serial_non_read_only",
+    metadata: {
+      progressive_verification_driving: true,
+      progressive_verification_scope: "shell:afctl:build",
+    },
+  }, {
+    tool_call_id: "dependency-download-timeout",
+    ok: false,
+    summary: "Sandbox command failed",
+    output: {
+      stderr: [
+        "pip._vendor.urllib3.exceptions.ReadTimeoutError:",
+        "HTTPSConnectionPool(host='files.pythonhosted.org', port=443): Read timed out.",
+      ].join(" "),
+      return_code: 17,
+    },
+    artifacts: [],
+    error: "sandbox_command_failed",
+    metadata: { workspace_mutation_committed: "false" },
+  }, false);
+
+  const afterDependencyTimeout = progressive.snapshot();
+  assert.deepEqual(afterDependencyTimeout.unresolvedVerificationScopes, [integrationScope]);
+  assert.deepEqual(
+    afterDependencyTimeout.unresolvedVerificationFailures.map((failure) => failure.scope),
+    [integrationScope],
+  );
+  assert.equal(
+    progressive.failedVerificationScopeAwaitingRepair("shell:afctl:build"),
+    false,
+  );
+
+  progressive.observeToolResult({
+    toolCallId: "empty-package-index",
+    toolName: "shell_wait",
+    arguments: { job_id: "job-empty-package-index" },
+    turnIndex: 3,
+    stepIndex: 0,
+    batchId: "empty-package-index",
+    batchIndex: 0,
+    batchSize: 1,
+    executionMode: "serial_non_read_only",
+    metadata: {
+      progressive_verification_driving: true,
+      progressive_verification_scope: "shell:afctl:build",
+    },
+  }, {
+    tool_call_id: "empty-package-index",
+    ok: false,
+    summary: "Sandbox command failed",
+    output: {
+      stderr: "Could not find a version that satisfies the requirement fastapi==0.116.1 (from versions: none)",
+      return_code: 1,
+    },
+    artifacts: [],
+    error: "sandbox_command_failed",
+    metadata: { workspace_mutation_committed: "false" },
+  }, false);
+  assert.deepEqual(progressive.snapshot().unresolvedVerificationScopes, [integrationScope]);
+});
+
+test("pre-execution permission denials do not create semantic verification debt", () => {
+  const scenarios: Array<{
+    name: string;
+    output: Record<string, string | boolean>;
+    error: string;
+  }> = [{
+    name: "error contract",
+    output: { replan_required: true },
+    error: "permission_denied",
+  }, {
+    name: "permission-effect contract",
+    output: { permission_effect: "deny", side_effect_executed: false },
+    error: "capability_blocked",
+  }];
+  for (const scenario of scenarios) {
+    const progressive = new ProgressiveExecutionRuntime({
+      deliveryContract: { workspace_mutation_required: true },
+      continuityProgress: {
+        requiredDeliveryMissing: false,
+        workspaceMutationCount: 4,
+        repairMutationCount: 4,
+      },
+    });
+    const scope = `shell:python:${scenario.name.replaceAll(" ", "-")}`;
+    progressive.observeToolResult({
+      toolCallId: `permission-denied-${scenario.name}`,
+      toolName: "shell",
+      arguments: {
+        executable: "python",
+        argv: ["../scripts/smoke_fixed_lib.py"],
+        cwd: "order-lib",
+      },
+      turnIndex: 0,
+      stepIndex: 0,
+      batchId: `permission-denied-${scenario.name}`,
+      batchIndex: 0,
+      batchSize: 1,
+      executionMode: "serial_non_read_only",
+      metadata: {
+        progressive_verification_driving: true,
+        progressive_verification_scope: scope,
+      },
+    }, {
+      tool_call_id: `permission-denied-${scenario.name}`,
+      ok: false,
+      summary: "autonomous mode denies unruled high-risk or unknown capability",
+      output: scenario.output,
+      artifacts: [],
+      error: scenario.error,
+      metadata: { workspace_mutation_committed: "false" },
+    }, false);
+
+    const observed = progressive.snapshot();
+    assert.equal(observed.verificationCount, 0, scenario.name);
+    assert.deepEqual(observed.unresolvedVerificationScopes, [], scenario.name);
+    assert.deepEqual(observed.unresolvedVerificationFailures, [], scenario.name);
+    assert.equal(progressive.failedVerificationScopeAwaitingRepair(scope), false, scenario.name);
+    assert.match(
+      observed.progressReasons.join(" "),
+      /verification_invocation_failed_before_behavioral_result/,
+      scenario.name,
+    );
+  }
+});
+
+test("missing generated verification prerequisites do not create semantic debt", () => {
+  const progressive = new ProgressiveExecutionRuntime({
+    deliveryContract: { workspace_mutation_required: true },
+    continuityProgress: {
+      requiredDeliveryMissing: false,
+      workspaceMutationCount: 4,
+      repairMutationCount: 4,
+    },
+  });
+  const scope = "shell:acceptance:verify";
+  progressive.observeToolResult({
+    toolCallId: "missing-manifest",
+    toolName: "shell",
+    arguments: { command: "python tools/control.py verify" },
+    turnIndex: 0,
+    stepIndex: 0,
+    batchId: "missing-manifest",
+    batchIndex: 0,
+    batchSize: 1,
+    executionMode: "serial_non_read_only",
+    metadata: {
+      progressive_verification_driving: true,
+      progressive_verification_scope: scope,
+    },
+  }, {
+    tool_call_id: "missing-manifest",
+    ok: false,
+    summary: "Sandbox command failed",
+    output: {
+      stdout: "RuntimeError: submission/manifest.json is missing; create all deliverables before verification",
+      return_code: 1,
+    },
+    artifacts: [],
+    error: "sandbox_command_failed",
+    metadata: { workspace_mutation_committed: "false" },
+  }, false);
+
+  const observed = progressive.snapshot();
+  assert.deepEqual(observed.unresolvedVerificationScopes, []);
+  assert.deepEqual(observed.unresolvedVerificationFailures, []);
+  assert.equal(progressive.failedVerificationScopeAwaitingRepair(scope), false);
+  assert.match(
+    observed.progressReasons.join(" "),
+    /verification_invocation_failed_before_behavioral_result/,
+  );
+});
+
+test("missing documentation permits acceptance retry but mixed business failures remain debt", () => {
+  const scenarios = [
+    { name: "missing report", stderr: "FileNotFoundError: [Errno 2] No such file or directory: 'C:\\task\\REPORT.md'\nRan 3 tests\nFAILED (errors=1)", debt: false },
+    { name: "missing report plus incorrect predictions", stderr: "AssertionError: predicted labels differ\nFileNotFoundError: [Errno 2] No such file or directory: 'REPORT.md'\nFAILED (failures=1, errors=1)", debt: true },
+    { name: "missing input data", stderr: "FileNotFoundError: [Errno 2] No such file or directory: 'inputs.json'\nFAILED (errors=1)", debt: true },
+    { name: "missing report plus another runtime error", stderr: "ValueError: invalid logits\nFileNotFoundError: [Errno 2] No such file or directory: 'REPORT.md'\nFAILED (errors=2)", debt: true },
+  ];
+  for (const scenario of scenarios) {
+    const progressive = new ProgressiveExecutionRuntime({
+      deliveryContract: { workspace_mutation_required: true },
+      continuityProgress: { requiredDeliveryMissing: false, workspaceMutationCount: 4, repairMutationCount: 4 },
+    });
+    const request: ToolExecutionRequest = {
+      toolCallId: "acceptance", toolName: "shell",
+      arguments: { executable: "python", argv: ["-m", "unittest", "-v", "inference_task_acceptance"] },
+      turnIndex: 0, stepIndex: 0, batchId: "acceptance", batchIndex: 0, batchSize: 1,
+      executionMode: "serial_non_read_only",
+      metadata: { progressive_verification_driving: true, progressive_verification_scope: "shell:acceptance" },
+    };
+    progressive.observeToolResult(request, {
+      tool_call_id: "acceptance", ok: false, summary: "Sandbox command failed",
+      output: { stderr: scenario.stderr, return_code: 1 }, artifacts: [], error: "sandbox_command_failed",
+      metadata: { workspace_mutation_committed: "false" },
+    }, false);
+    assert.equal(progressive.failedVerificationScopeAwaitingRepair("shell:acceptance"), scenario.debt, scenario.name);
+    assert.equal(progressive.snapshot().verificationCount, 0, scenario.name);
+    if (!scenario.debt) {
+      // Only the subsequent actual successful suite can satisfy the gate.
+      progressive.observeToolResult({ ...request, toolCallId: "acceptance-after-report" }, {
+        tool_call_id: "acceptance-after-report", ok: true, summary: "3 tests passed",
+        output: { stderr: "Ran 3 tests\nOK", return_code: 0 }, artifacts: [], metadata: {},
+      }, false);
+      assert.equal(progressive.snapshot().verificationCount, 1);
+    }
+  }
+});
+
+test("missing selected verification runners are invocation failures but product imports remain debt", () => {
+  const progressive = new ProgressiveExecutionRuntime({
+    deliveryContract: { workspace_mutation_required: true },
+    continuityProgress: {
+      requiredDeliveryMissing: false,
+      workspaceMutationCount: 5,
+      repairMutationCount: 5,
+    },
+  });
+  const observe = (
+    toolCallId: string,
+    output: JsonObject,
+    metadata: JsonObject = {},
+  ): void => {
+    progressive.observeToolResult({
+      toolCallId,
+      toolName: "shell",
+      arguments: { command: "python -B -m pytest checks/" },
+      turnIndex: 0,
+      stepIndex: 0,
+      batchId: toolCallId,
+      batchIndex: 0,
+      batchSize: 1,
+      executionMode: "serial_non_read_only",
+      metadata: {
+        progressive_verification_driving: true,
+        progressive_verification_scope: "shell:pytest:checks/",
+      },
+    }, {
+      tool_call_id: toolCallId,
+      ok: false,
+      summary: "verification command failed",
+      output,
+      artifacts: [],
+      error: "sandbox_command_failed",
+      metadata: { workspace_mutation_committed: "false", ...metadata },
+    }, false);
+  };
+
+  observe("missing-windows-entrypoint", {
+    stderr: "'python3' is not recognized as an internal or external command",
+    return_code: 9009,
+  });
+  assert.deepEqual(progressive.snapshot().unresolvedVerificationScopes, []);
+
+  observe("missing-selected-runner", {
+    stderr: "python: No module named 'pytest'",
+    return_code: 1,
+  });
+  assert.deepEqual(progressive.snapshot().unresolvedVerificationScopes, []);
+
+  observe("explicit-spawn-failure", {
+    reason: "process could not be created",
+    termination_kind: "failed_to_start",
+  });
+  assert.deepEqual(progressive.snapshot().unresolvedVerificationScopes, []);
+
+  observe("gateway-spawn-failure", {
+    stderr: "[WinError 2] The system cannot find the file specified.",
+    termination: "failed_to_start",
+  });
+  assert.deepEqual(progressive.snapshot().unresolvedVerificationScopes, []);
+
+  observe("missing-product-import", {
+    stderr: "ModuleNotFoundError: No module named 'release_domain'",
+    return_code: 1,
+  });
+  assert.deepEqual(
+    progressive.snapshot().unresolvedVerificationScopes,
+    ["shell:pytest:checks/"],
+  );
+  assert.equal(
+    progressive.snapshot().unresolvedVerificationFailures[0]?.failureKind,
+    "nonzero_exit",
+  );
+
+  observe("missing-compiled-build-sentinel", {
+    stderr: "ModuleNotFoundError: No module named 'sklearn.__check_build._check_build'",
+    return_code: 1,
+  });
+  assert.deepEqual(
+    progressive.snapshot().unresolvedVerificationScopes,
+    ["shell:pytest:checks/"],
+    "a compiled-extension build-check sentinel is an environment diagnostic, not semantic debt",
+  );
+
+  observe("pytest-node-not-found", {
+    stderr: "ERROR: not found: /testbed/xarray/tests/test_merge.py::TestMerge::test_merge_dataarray_unnamed (no name in any of [<Module test_merge.py>])",
+    return_code: 4,
+  });
+  assert.deepEqual(
+    progressive.snapshot().unresolvedVerificationScopes,
+    ["shell:pytest:checks/"],
+    "a pytest node-id usage error is an invocation failure, not semantic debt",
+  );
+
+  observe("pytest-collected-zero", {
+    stderr: "collected 0 items",
+    return_code: 5,
+  });
+  assert.deepEqual(
+    progressive.snapshot().unresolvedVerificationScopes,
+    ["shell:pytest:checks/"],
+    "collected 0 items is an invocation failure, not semantic debt",
+  );
+});
+
+test("structured shell executable duplication is pre-behavioral across path and case variants", () => {
+  const scenarios = [
+    { executable: "python.exe", repeated: "python.exe" },
+    { executable: "C:\\Python313\\PYTHON.EXE", repeated: "python.exe" },
+    { executable: "/usr/local/bin/node", repeated: "NODE" },
+  ];
+  for (const scenario of scenarios) {
+    const progressive = new ProgressiveExecutionRuntime({
+      deliveryContract: { workspace_mutation_required: true },
+      continuityProgress: {
+        requiredDeliveryMissing: false,
+        workspaceMutationCount: 2,
+        repairMutationCount: 1,
+      },
+    });
+    const scope = `shell:duplicate:${scenario.repeated.toLowerCase()}`;
+    progressive.observeToolResult({
+      toolCallId: `duplicate-${scenario.repeated}`,
+      toolName: "shell",
+      arguments: {
+        executable: scenario.executable,
+        argv: [scenario.repeated, "-m", "unittest", "discover"],
+        cwd: "project",
+      },
+      turnIndex: 0,
+      stepIndex: 0,
+      batchId: `duplicate-${scenario.repeated}`,
+      batchIndex: 0,
+      batchSize: 1,
+      executionMode: "serial_non_read_only",
+      metadata: {
+        progressive_verification_driving: true,
+        progressive_verification_scope: scope,
+      },
+    }, {
+      tool_call_id: `duplicate-${scenario.repeated}`,
+      ok: false,
+      summary: "argv contains arguments only and must not repeat executable",
+      output: { return_code: 2 },
+      artifacts: [],
+      error: "ValueError",
+      metadata: { workspace_mutation_committed: "false" },
+    }, false);
+
+    const observed = progressive.snapshot();
+    assert.deepEqual(observed.unresolvedVerificationScopes, [], scenario.executable);
+    assert.equal(observed.verificationCount, 0, scenario.executable);
+    assert.match(
+      observed.progressReasons.join(" "),
+      /verification_invocation_failed_before_behavioral_result/,
+      scenario.executable,
+    );
+  }
+});
+
+test("restore drops invocation-only verification debt", () => {
+  const restored = new ProgressiveExecutionRuntime({
+    deliveryContract: { workspace_mutation_required: true },
+    restored: {
+      version: PROGRESSIVE_EXECUTION_SNAPSHOT_VERSION,
+      requiredDeliveryMissing: false,
+      workspaceMutationCount: 4,
+      repairMutationCount: 4,
+      unresolvedVerificationScopes: [
+        "shell:afctl:build",
+        "shell:npm:typecheck",
+        "shell:afctl:test:integration",
+      ],
+      unresolvedVerificationFailures: [{
+        scope: "shell:afctl:build",
+        failedChecks: [],
+        failedCount: null,
+        failureKind: "transport_failure",
+        attemptCount: 1,
+        lastObservedWorkspaceMutationCount: 4,
+        diagnosticSummary: "sh: syntax error: bad substitution",
+      }, {
+        scope: "shell:npm:typecheck",
+        failedChecks: [],
+        failedCount: null,
+        failureKind: "transport_failure",
+        attemptCount: 1,
+        lastObservedWorkspaceMutationCount: 4,
+      }, {
+        scope: "shell:afctl:build-network",
+        failedChecks: [],
+        failedCount: null,
+        failureKind: "transport_failure",
+        attemptCount: 1,
+        lastObservedWorkspaceMutationCount: 4,
+        diagnosticSummary: "pip ReadTimeoutError from files.pythonhosted.org: Read timed out",
+      }, {
+        scope: "shell:afctl:test:integration",
+        failedChecks: ["hidden-cross-language"],
+        failedCount: 1,
+        failureKind: "reported_checks",
+        attemptCount: 2,
+        lastObservedWorkspaceMutationCount: 4,
+      }],
+    },
+  }).snapshot();
+
+  assert.deepEqual(restored.unresolvedVerificationScopes, ["shell:afctl:test:integration"]);
+  assert.deepEqual(
+    restored.unresolvedVerificationFailures.map((failure) => failure.scope),
+    ["shell:afctl:test:integration"],
+  );
+});
+
+test("repeated successful verification does not reopen stalled inspection", () => {
+  const progressive = new ProgressiveExecutionRuntime({
+    deliveryContract: { workspace_mutation_required: true },
+    continuityProgress: {
+      requiredDeliveryMissing: false,
+      workspaceMutationCount: 1,
+      verificationCount: 1,
+      consecutiveNoDeliveryObservations: 8,
+      postDeliveryActionNudgeCount: 2,
+    },
+  });
+  const request: ToolExecutionRequest = {
+    toolCallId: "repeated-typecheck",
+    toolName: "shell",
+    arguments: { command: "npm run typecheck" },
+    turnIndex: 0,
+    stepIndex: 0,
+    batchId: "repeated-typecheck",
+    batchIndex: 0,
+    batchSize: 1,
+    executionMode: "serial_non_read_only",
+    metadata: { progressive_verification_driving: true },
+  };
+  progressive.observeToolResult(request, {
+    tool_call_id: request.toolCallId,
+    ok: true,
+    summary: "command completed",
+    output: { stdout: "typecheck passed", return_code: 0 },
+    artifacts: [],
+    metadata: { workspace_mutation_committed: "false" },
+  }, false);
+
+  const repeated = progressive.snapshot();
+  assert.equal(repeated.verificationCount, 1);
+  assert.equal(repeated.postDeliveryActionNudgeCount, 2);
+  assert.equal(repeated.consecutiveNoDeliveryObservations, 9);
+  assert.ok(repeated.progressReasons.includes("post_delivery_verification_repeated_without_delivery"));
+  assert.equal(progressive.inspectionCircuitOpen(), true);
+});
+
+test("pre-delivery inspection circuit opens after repeated durable nudges", () => {
+  const progressive = new ProgressiveExecutionRuntime({
+    constraints: { pre_delivery_inspection_block_after_nudges: 3 },
+    deliveryContract: { workspace_mutation_required: true },
+  });
+  assert.equal(progressive.inspectionCircuitOpen(), false);
+  progressive.recordActionNudge();
+  progressive.recordActionNudge();
+  assert.equal(progressive.inspectionCircuitOpen(), false);
+  progressive.recordActionNudge();
+  assert.equal(progressive.inspectionCircuitOpen(), true);
+});
+
+test("post-delivery inspection circuit uses a tighter independent default", () => {
+  const progressive = new ProgressiveExecutionRuntime({
+    deliveryContract: { workspace_mutation_required: true },
+    continuityProgress: {
+      requiredDeliveryMissing: false,
+      workspaceMutationCount: 1,
+      verificationCount: 1,
+    },
+  });
+  progressive.recordActionNudge();
+  assert.equal(progressive.inspectionCircuitOpen(), false);
+  progressive.recordActionNudge();
+  assert.equal(progressive.inspectionCircuitOpen(), true);
+
+  const configured = new ProgressiveExecutionRuntime({
+    constraints: { post_delivery_inspection_block_after_nudges: 3 },
+    deliveryContract: { workspace_mutation_required: true },
+    continuityProgress: {
+      requiredDeliveryMissing: false,
+      workspaceMutationCount: 1,
+      verificationCount: 1,
+    },
+  });
+  configured.recordActionNudge();
+  configured.recordActionNudge();
+  assert.equal(configured.inspectionCircuitOpen(), false);
+  configured.recordActionNudge();
+  assert.equal(configured.inspectionCircuitOpen(), true);
+});
+
+test("pre-delivery inspection circuit carries bounded debt across fenced sessions", () => {
+  const carried = new ProgressiveExecutionRuntime({
+    constraints: { pre_delivery_inspection_block_after_nudges: 3 },
+    deliveryContract: { workspace_mutation_required: true },
+    continuityProgress: {
+      requiredDeliveryMissing: true,
+      providerRounds: 9,
+      preDeliveryObservationCount: 6,
+      consecutivePreDeliveryObservations: 6,
+      actionNudgeCount: 4,
+      lastActionNudgeObservationCount: 6,
+      lastActionNudgeProviderRound: 7,
+    },
+  });
+  assert.equal(carried.inspectionCircuitOpen(), true);
+  assert.equal(carried.snapshot().providerRounds, 9);
+  assert.equal(carried.snapshot().actionNudgeCount, 4);
+
+  const delivered = new ProgressiveExecutionRuntime({
+    constraints: { pre_delivery_inspection_block_after_nudges: 3 },
+    deliveryContract: { workspace_mutation_required: true },
+    continuityProgress: {
+      requiredDeliveryMissing: false,
+      providerRounds: 9,
+      actionNudgeCount: 4,
+    },
+  });
+  assert.equal(delivered.inspectionCircuitOpen(), false);
+  assert.equal(delivered.snapshot().actionNudgeCount, 0);
+});
+
+test("post-delivery inspection circuit carries stall debt and resets on progress", () => {
+  const progressive = new ProgressiveExecutionRuntime({
+    constraints: { pre_delivery_inspection_block_after_nudges: 3 },
+    deliveryContract: { workspace_mutation_required: true },
+    continuityProgress: {
+      requiredDeliveryMissing: false,
+      providerRounds: 14,
+      workspaceMutationCount: 3,
+      verificationCount: 1,
+      noDeliveryObservationCount: 24,
+      consecutiveNoDeliveryObservations: 24,
+      actionNudgeCount: 5,
+      postDeliveryActionNudgeCount: 3,
+      lastActionNudgeNoDeliveryObservationCount: 24,
+      lastActionNudgeProviderRound: 14,
+    },
+  });
+  assert.equal(progressive.inspectionCircuitOpen(), true);
+
+  progressive.observeToolResult(
+    {
+      toolCallId: "post-delivery-edit",
+      toolName: "write",
+      arguments: { path: "result.txt", content: "progress" },
+      turnIndex: 0,
+      stepIndex: 0,
+      batchId: "post-delivery",
+      batchIndex: 0,
+      batchSize: 1,
+      executionMode: "serial_non_read_only",
+      metadata: {},
+    },
+    {
+      tool_call_id: "post-delivery-edit",
+      ok: true,
+      summary: "updated",
+      output: {},
+      artifacts: [],
+      metadata: { workspace_mutation_committed: "true" },
+    },
+    false,
+  );
+  assert.equal(progressive.snapshot().postDeliveryActionNudgeCount, 0);
+  assert.equal(progressive.inspectionCircuitOpen(), false);
+});
+
+test("failed delivery grants exactly one bounded recovery inspection", () => {
+  const progressive = new ProgressiveExecutionRuntime({
+    constraints: { pre_delivery_inspection_block_after_nudges: 3 },
+    deliveryContract: { workspace_mutation_required: true },
+  });
+  progressive.recordActionNudge();
+  progressive.recordActionNudge();
+  progressive.recordActionNudge();
+  progressive.observeToolResult({
+    toolCallId: "stale-edit",
+    toolName: "file_edit",
+    arguments: { path: "result.txt" },
+    turnIndex: 0,
+    stepIndex: 0,
+    batchId: "stale-edit-batch",
+    batchIndex: 0,
+    batchSize: 1,
+    executionMode: "serial_non_read_only",
+    metadata: {},
+  }, {
+    tool_call_id: "stale-edit",
+    ok: false,
+    summary: "old text was not found",
+    output: {},
+    artifacts: [],
+    error: "edit_old_text_not_found",
+    metadata: {},
+  }, false);
+
+  assert.equal(progressive.snapshot().recoveryInspectionAllowance, 1);
+  assert.equal(progressive.consumeRecoveryInspectionAllowance(), true);
+  assert.equal(progressive.snapshot().recoveryInspectionAllowance, 0);
+  assert.equal(progressive.consumeRecoveryInspectionAllowance(), false);
+  assert.equal(progressive.inspectionCircuitOpen(), true);
+});
+
+test("blocked alternate verification cannot reopen its own diagnostic allowance", () => {
+  const progressive = new ProgressiveExecutionRuntime({
+    deliveryContract: { workspace_mutation_required: true },
+    continuityProgress: {
+      requiredDeliveryMissing: false,
+      workspaceMutationCount: 1,
+      unresolvedVerificationScopes: ["shell:afctl:test:integration"],
+      unresolvedVerificationFailures: [{
+        scope: "shell:afctl:test:integration",
+        attemptCount: 2,
+        lastObservedWorkspaceMutationCount: 1,
+        failedChecks: ["hidden-state"],
+        failedCount: 1,
+        failureKind: "reported_checks",
+      }],
+      recoveryInspectionAllowance: 0,
+    },
+  });
+  const request: ToolExecutionRequest = {
+    toolCallId: "blocked-smoke",
+    toolName: "shell",
+    arguments: { command: "python tools/smoke_closure.py" },
+    turnIndex: 0,
+    stepIndex: 0,
+    batchId: "blocked-smoke",
+    batchIndex: 0,
+    batchSize: 1,
+    executionMode: "serial_non_read_only",
+    metadata: {},
+  };
+  while (progressive.consumeRecoveryInspectionAllowance()) {
+    // Exhaust the restored failed-verification diagnostic window first.
+  }
+  progressive.observeToolResult(request, {
+    tool_call_id: request.toolCallId,
+    ok: false,
+    summary: "alternate verification blocked",
+    output: {},
+    artifacts: [],
+    error: "alternate_verification_budget_exhausted",
+    metadata: { alternate_verification_blocked: "true" },
+  }, false);
+
+  assert.equal(progressive.snapshot().recoveryInspectionAllowance, 0);
+  assert.deepEqual(
+    progressive.snapshot().unresolvedVerificationScopes,
+    ["shell:afctl:test:integration"],
+  );
+});
+
+test("blocked validation and verifier-runner edits do not reopen inspection", () => {
+  const progressive = new ProgressiveExecutionRuntime({
+    deliveryContract: { workspace_mutation_required: true },
+    continuityProgress: {
+      requiredDeliveryMissing: false,
+      workspaceMutationCount: 1,
+      unresolvedVerificationScopes: ["shell:afctl:test:integration"],
+      unresolvedVerificationFailures: [{
+        scope: "shell:afctl:test:integration",
+        attemptCount: 1,
+        lastObservedWorkspaceMutationCount: 1,
+        failedChecks: ["opaque-state"],
+        failedCount: 1,
+        failureKind: "reported_checks",
+      }],
+      recoveryInspectionAllowance: 0,
+    },
+  });
+  while (progressive.consumeRecoveryInspectionAllowance()) {
+    // Exhaust the restored failed-verification diagnostic window first.
+  }
+  const request: ToolExecutionRequest = {
+    toolCallId: "blocked-runner-edit",
+    toolName: "file_edit",
+    arguments: { path: "tools/afctl.py" },
+    turnIndex: 0,
+    stepIndex: 0,
+    batchId: "blocked-runner-edit",
+    batchIndex: 0,
+    batchSize: 1,
+    executionMode: "serial_non_read_only",
+    metadata: {},
+  };
+  progressive.observeToolResult(request, {
+    tool_call_id: request.toolCallId,
+    ok: false,
+    summary: "verification harness edit blocked",
+    output: {},
+    artifacts: [],
+    error: "unresolved_verification_harness_write_blocked",
+    metadata: { unresolved_verification_harness_write_blocked: "true" },
+  }, false);
+
+  assert.equal(progressive.snapshot().recoveryInspectionAllowance, 0);
+});
+
+test("validation material can be staged only after a real repair and cannot settle debt", () => {
+  const progressive = new ProgressiveExecutionRuntime({
+    deliveryContract: { workspace_mutation_required: true },
+    continuityProgress: {
+      requiredDeliveryMissing: false,
+      workspaceMutationCount: 1,
+      repairMutationCount: 0,
+    },
+  });
+  const verification: ToolExecutionRequest = {
+    toolCallId: "public-tests-failed",
+    toolName: "shell",
+    arguments: {
+      executable: "python",
+      argv: ["-m", "unittest", "discover", "-s", "tests", "-v"],
+    },
+    turnIndex: 0,
+    stepIndex: 0,
+    batchId: "public-tests-failed",
+    batchIndex: 0,
+    batchSize: 1,
+    executionMode: "serial_non_read_only",
+    metadata: {
+      progressive_verification_driving: true,
+      progressive_verification_scope: "shell:python:public-suite",
+    },
+  };
+  progressive.observeToolResult(verification, {
+    tool_call_id: verification.toolCallId,
+    ok: false,
+    summary: "public suite failed",
+    output: { stderr: "AssertionError: expected true", return_code: 1 },
+    artifacts: [],
+    error: "sandbox_command_failed",
+    metadata: { workspace_mutation_committed: "false" },
+  }, false);
+
+  const directValidationWrite = {
+    tool_name: "file_write",
+    arguments: { path: "tests/test_regression.py", content: "assert repaired()" },
+  };
+  const shellValidationWrite = {
+    tool_name: "shell",
+    arguments: { command: "sed -i 's/old/new/' tests/test_regression.py" },
+  };
+  assert.equal(
+    shouldBlockValidationOnlyMutation(directValidationWrite, progressive),
+    true,
+  );
+  assert.equal(
+    shouldBlockValidationOnlyMutation(shellValidationWrite, progressive),
+    true,
+  );
+
+  const implementationRepair: ToolExecutionRequest = {
+    toolCallId: "implementation-repair",
+    toolName: "file_write",
+    arguments: { path: "src/order.py", content: "def repaired(): return True" },
+    turnIndex: 0,
+    stepIndex: 0,
+    batchId: "implementation-repair",
+    batchIndex: 0,
+    batchSize: 1,
+    executionMode: "serial_non_read_only",
+    metadata: {
+      progressive_mutation_path: "src/order.py",
+      progressive_repair_driving: true,
+    },
+  };
+  progressive.observeToolResult(implementationRepair, {
+    tool_call_id: implementationRepair.toolCallId,
+    ok: true,
+    summary: "implementation replaced",
+    output: {
+      path: "src/order.py",
+      workspace_path_disposition: "replaced",
+      workspace_path_created: "false",
+    },
+    artifacts: [],
+    metadata: {
+      workspace_mutation_committed: "true",
+      workspace_logical_path: "src/order.py",
+      workspace_path_disposition: "replaced",
+      workspace_path_created: "false",
+    },
+  }, false);
+
+  assert.equal(progressive.snapshot().repairMutationCount, 1);
+  assert.equal(
+    shouldBlockValidationOnlyMutation(directValidationWrite, progressive),
+    false,
+  );
+  assert.equal(
+    shouldBlockValidationOnlyMutation(shellValidationWrite, progressive),
+    false,
+  );
+
+  const validationStage: ToolExecutionRequest = {
+    toolCallId: "validation-stage",
+    toolName: "file_write",
+    arguments: directValidationWrite.arguments,
+    turnIndex: 0,
+    stepIndex: 0,
+    batchId: "validation-stage",
+    batchIndex: 0,
+    batchSize: 1,
+    executionMode: "serial_non_read_only",
+    metadata: {
+      progressive_mutation_path: "tests/test_regression.py",
+      progressive_repair_driving: false,
+    },
+  };
+  progressive.observeToolResult(validationStage, {
+    tool_call_id: validationStage.toolCallId,
+    ok: true,
+    summary: "new regression test staged",
+    output: {
+      path: "tests/test_regression.py",
+      workspace_path_disposition: "created",
+      workspace_path_created: "true",
+    },
+    artifacts: [],
+    metadata: {
+      workspace_mutation_committed: "true",
+      workspace_logical_path: "tests/test_regression.py",
+      workspace_path_disposition: "created",
+      workspace_path_created: "true",
+    },
+  }, false);
+
+  const staged = progressive.snapshot();
+  assert.equal(staged.workspaceMutationCount, 3);
+  assert.equal(staged.repairMutationCount, 1);
+  assert.equal(staged.verificationCount, 0);
+  assert.deepEqual(
+    staged.unresolvedVerificationScopes,
+    ["shell:python:public-suite"],
+  );
+
+  progressive.observeToolResult({
+    ...verification,
+    toolCallId: "public-tests-passed",
+  }, {
+    tool_call_id: "public-tests-passed",
+    ok: true,
+    summary: "public suite passed",
+    output: { stdout: "12 passed", return_code: 0 },
+    artifacts: [],
+    metadata: { workspace_mutation_committed: "false" },
+  }, false);
+
+  assert.deepEqual(progressive.snapshot().unresolvedVerificationScopes, []);
+  assert.equal(progressive.snapshot().verificationCount, 1);
+});
+
+test("pre-delivery verification opens a bounded diagnostic inspection window", () => {
+  const progressive = new ProgressiveExecutionRuntime({
+    constraints: {
+      pre_delivery_inspection_block_after_nudges: 3,
+      post_verification_diagnostic_inspection_limit: 5,
+    },
+    deliveryContract: { workspace_mutation_required: true },
+  });
+  progressive.recordActionNudge();
+  progressive.recordActionNudge();
+  progressive.recordActionNudge();
+  progressive.observeToolResult({
+    toolCallId: "public-tests",
+    toolName: "shell",
+    arguments: { command: "python -m pytest -q" },
+    turnIndex: 0,
+    stepIndex: 0,
+    batchId: "public-test-batch",
+    batchIndex: 0,
+    batchSize: 1,
+    executionMode: "serial_non_read_only",
+    metadata: { progressive_verification_driving: true },
+  }, {
+    tool_call_id: "public-tests",
+    ok: true,
+    summary: "command completed with failure details in piped output",
+    output: { stdout: "4 failed, 134 passed" },
+    artifacts: [],
+    metadata: { return_code: "0" },
+  }, false);
+
+  assert.equal(progressive.inspectionCircuitOpen(), true);
+  assert.equal(progressive.snapshot().recoveryInspectionAllowance, 5);
+  for (let index = 0; index < 5; index += 1) {
+    assert.equal(progressive.consumeRecoveryInspectionAllowance(), true);
+  }
+  assert.equal(progressive.consumeRecoveryInspectionAllowance(), false);
+});
+
+test("pre-delivery inspection classifier blocks reads but permits delivery and verification", () => {
+  const shell = (command: string) => ({ tool_name: "shell", arguments: { command } });
+  const structuredShell = (executable: string, argv: string[]) => ({
+    tool_name: "shell",
+    arguments: { executable, argv },
+  });
+  assert.equal(isClearlyPreDeliveryInspection(shell("cat src/app.ts && git diff --stat"), false), true);
+  assert.equal(isClearlyPreDeliveryInspection(shell("find src -type f | xargs grep -n TODO 2>/dev/null | head"), false), true);
+  assert.equal(isClearlyPreDeliveryInspection(shell("docker compose ps && docker compose config --services"), false), true);
+  assert.equal(isClearlyPreDeliveryInspection(shell("docker compose logs --tail=120 worker 2>&1 | tail -120"), false), true);
+  assert.equal(isClearlyPreDeliveryInspection(shell("docker logs worker --tail 100 2>&1"), false), true);
+  assert.equal(isClearlyPreDeliveryInspection(shell("python -c \"from pathlib import Path; print(Path('src/app.ts').read_text())\""), false), true);
+  assert.equal(isClearlyPreDeliveryInspection(shell("python - <<'PY'\nfrom pathlib import Path\nprint(Path('src/app.ts').read_text())\nPY"), false), true);
+  assert.equal(isClearlyPreDeliveryInspection(shell("some-opaque-command --inspect src"), false), true);
+  assert.equal(isClearlyPreDeliveryInspection(shell("cat > src/app.ts <<'EOF'\nchanged\nEOF"), false), false);
+  assert.equal(isClearlyPreDeliveryInspection(shell("python -c \"from pathlib import Path; Path('src/app.ts').write_text('changed')\""), false), false);
+  assert.equal(isClearlyPreDeliveryInspection(shell("python tools/afctl.py simulate"), false), false);
+  assert.equal(isClearlyPreDeliveryInspection(shell("python -m pytest tests"), false), false);
+  assert.equal(isClearlyPreDeliveryInspection(shell("python reproduce/build.py"), false), false);
+  assert.equal(isClearlyPreDeliveryInspection(shell("cd /workspace && python reproduce/build.py 2>&1 | tail -80"), false), false);
+  assert.equal(isClearlyPreDeliveryInspection(shell("python work/build_deliverables.py"), false), false);
+  assert.equal(isClearlyPreDeliveryInspection(shell("cd /workspace && python3 work/build_deliverables.py"), false), false);
+  assert.equal(isClearlyPreDeliveryInspection(shell("python work/finalize.py"), false), false);
+  assert.equal(isClearlyPreDeliveryInspection(shell("docker compose up -d --build"), false), false);
+  assert.equal(isClearlyEnvironmentRecoveryTool(shell("docker compose up -d --build --wait")), true);
+  assert.equal(isClearlyEnvironmentRecoveryTool(shell("docker compose restart control-api")), true);
+  assert.equal(isClearlyEnvironmentRecoveryTool(shell("docker compose ps")), false);
+  assert.equal(isClearlyEnvironmentRecoveryTool(shell("python tools/afctl.py bootstrap")), true);
+  assert.equal(isClearlyEnvironmentRecoveryTool(shell("python tools/afctl.py build")), true);
+  assert.equal(isClearlyEnvironmentRecoveryTool(shell("python tools/afctl.py up 2>&1 | tail -60")), true);
+  assert.equal(isClearlyEnvironmentRecoveryTool(shell("npm run build")), true);
+  assert.equal(isClearlyEnvironmentRecoveryTool(shell("npm run typecheck")), false);
+  assert.equal(isClearlyPreDeliveryInspection(shell("curl https://service.invalid/status"), false), true);
+  assert.equal(isClearlyPreDeliveryInspection(shell("curl -X POST https://service.invalid/runs -d '{}'"), false), false);
+  assert.equal(isClearlyPreDeliveryInspection(structuredShell("python", ["-c", "from pathlib import Path; Path('src/app.ts').write_text('changed')"]), false), false);
+  assert.equal(isClearlyPreDeliveryInspection(structuredShell("python", ["-c", "from pathlib import Path; print(Path('src/app.ts').read_text())"]), false), true);
+  assert.equal(isClearlyPreDeliveryInspection(structuredShell("python", ["reproduce/build.py"]), false), false);
+  assert.equal(isClearlyPreDeliveryInspection(structuredShell("docker", ["exec", "worker", "sh", "-c", "cat /app/dist/worker.js"]), false), true);
+  assert.equal(isClearlyPreDeliveryInspection(structuredShell("docker", ["exec", "worker", "sh", "-c", "sed -i 's/a/b/' /app/config"]), false), false);
+  assert.equal(isClearlyPreDeliveryInspection(shell("docker compose exec -T postgres psql -c '\\d audit_events'"), false), true);
+  assert.equal(isClearlyPreDeliveryInspection(shell("docker exec postgres psql -Atc 'SELECT tenant_id FROM campaigns'"), false), true);
+  assert.equal(isClearlyPreDeliveryInspection(shell("docker compose exec -T postgres psql -c 'ALTER TABLE campaigns ADD COLUMN note text'"), false), false);
+  assert.equal(isClearlyPreDeliveryInspection(shell("psql --file migrations/003_security.sql"), false), false);
+  assert.equal(isClearlyPreDeliveryInspection(structuredShell("python", ["tools/afctl.py", "bootstrap"]), false), false);
+  assert.equal(isClearlyPreDeliveryInspection({ tool_name: "read", arguments: { path: "src/app.ts" } }, true), true);
+  assert.equal(isClearlyPreDeliveryInspection({ tool_name: "write", arguments: { path: "src/app.ts" } }, false), false);
+  const repairGuidance = preDeliveryInspectionGuidance(2).join(" ");
+  assert.match(repairGuidance, /empty\/zero\/null\/default/);
+  assert.match(repairGuidance, /normative operators/);
+  assert.match(repairGuidance, /Do not invent an exception/);
+  assert.doesNotMatch(repairGuidance, /equal-order input/);
+  assert.match(repairGuidance, /free-form reason, message, error, and payload/);
+  assert.match(repairGuidance, /sanitize prohibited material before durable storage/);
+  assert.match(repairGuidance, /trace every externally supplied field/);
+  assert.match(repairGuidance, /record that hypothesis and its repair files as rejected/);
+  assert.match(repairGuidance, /revert the just-falsified changes/);
+  assert.match(repairGuidance, /do not spend more reads revalidating a rejected hypothesis/);
+  assert.match(repairGuidance, /do not use unrelated dependency-download/);
+  assert.match(repairGuidance, /build-freshness hypothesis already disproved/);
+  assert.equal(
+    isFailedVerificationHarnessMutation(
+      { tool_name: "file_edit", arguments: { path: "tools/afctl.py" } },
+      ["shell:afctl:test:integration"],
+    ),
+    true,
+  );
+  assert.equal(
+    isFailedVerificationHarnessMutation(
+      shell("sed -i 's/a/b/' package.json"),
+      ["shell:bun:test"],
+    ),
+    true,
+  );
+  assert.equal(
+    isFailedVerificationHarnessMutation(
+      { tool_name: "file_edit", arguments: { path: "services/release-worker/src/worker.ts" } },
+      ["shell:afctl:test:integration"],
+    ),
+    false,
+  );
+  assert.equal(
+    isPrivateVerificationInfrastructureInspection(
+      shell('grep -rln "test_farm\\|hidden-contract" tools/ tests/ | head -40'),
+      false,
+    ),
+    true,
+  );
+  assert.equal(
+    isPrivateVerificationInfrastructureInspection(
+      shell('grep -n "hidden\\|shard\\|test-farm" tools/afctl.py | head -60'),
+      false,
+    ),
+    true,
+  );
+  assert.equal(
+    isPrivateVerificationInfrastructureInspection(
+      { tool_name: "file_read", arguments: { path: "evaluator/hidden-tests/security.py" } },
+      true,
+    ),
+    true,
+  );
+  assert.equal(
+    isPrivateVerificationInfrastructureInspection(
+      { tool_name: "file_read", arguments: { path: "tests/public/test_authorization.py" } },
+      true,
+    ),
+    false,
+  );
+  assert.equal(
+    isPrivateVerificationInfrastructureInspection(
+      shell('rg -n "tenant_id" services/control-api/auth.py | head -80'),
+      false,
+    ),
+    false,
+  );
+  assert.equal(isTargetedRepairInspection({ tool_name: "file_read", arguments: { path: "services/worker/state_machine.py" } }, true), true);
+  assert.equal(isTargetedRepairInspection({ tool_name: "file_read", arguments: { path: "services/worker/src" } }, true), false);
+  assert.equal(isTargetedRepairInspection({ tool_name: "file_read", arguments: { path: "submission/test-report.json" } }, true), false);
+  assert.equal(isTargetedRepairInspection({ tool_name: "file_read", arguments: { path: "evidence/test-farm/latest.json" } }, true), false);
+  assert.equal(isTargetedRepairInspection({ tool_name: "read", arguments: { path: ".runtime/venv/lib/source.py" } }, true), false);
+  assert.equal(isTargetedRepairInspection(shell("cat services/worker/state_machine.py"), false), false);
+  assert.equal(isTargetedRepairInspection(shell("docker compose exec -T postgres psql -U app -d aurorafleet -c '\\d outbox_events'"), false), true);
+  assert.equal(isTargetedRepairInspection(shell("docker exec postgres psql -Atc 'SELECT column_name FROM information_schema.columns WHERE table_name = ''outbox_events'''"), false), true);
+  assert.equal(isTargetedRepairInspection(shell("docker compose logs --tail=120 control-api"), false), true);
+  assert.equal(isTargetedRepairInspection(shell("docker compose logs --tail=120 control-api | grep ERROR"), false), false);
+  assert.equal(isTargetedRepairInspection(shell('grep -n "WindowMetrics\\|healthRate" services/release-worker/src/worker.ts | head -60'), false), true);
+  assert.equal(isTargetedRepairInspection(shell("rg -n 'tenant_id|campaign_id' services/control-api/aurorafleet_api/repositories/campaigns.py | head -n 120"), false), true);
+  assert.equal(isTargetedRepairInspection(shell("sed -n '120,260p' services/release-worker/src/worker.ts"), false), true);
+  assert.equal(isTargetedRepairInspection(shell("cd /workspace && sed -n '120,260p' services/release-worker/src/worker.ts"), false), true);
+  assert.equal(isTargetedRepairInspection(shell("cd '/workspace'; grep -n 'WindowMetrics' services/release-worker/src/worker.ts | head -60"), false), true);
+  assert.equal(isTargetedRepairInspection(shell("ls -la services/control-api/aurorafleet_api/services"), false), true);
+  assert.equal(isTargetedRepairInspection(shell("find services/control-api/aurorafleet_api/services -maxdepth 1 -type f"), false), true);
+  assert.equal(isTargetedRepairInspection(shell("find services -maxdepth 5 -type f"), false), false);
+  assert.equal(isTargetedRepairInspection(shell("ls -la ."), false), false);
+  assert.equal(isTargetedRepairInspection(shell("grep -rn tenant_id services | head -60"), false), false);
+  assert.equal(isTargetedRepairInspection(shell("cd /workspace && grep -rn tenant_id services | head -60"), false), false);
+  assert.equal(isTargetedRepairInspection(shell("grep -n tenant_id services/release-worker/src/*.ts | head -60"), false), false);
+  assert.equal(isTargetedRepairInspection(shell("sed -n '1,1000p' services/release-worker/src/worker.ts"), false), false);
+  assert.equal(isTargetedRepairInspection(shell("sed -n '1,100p' submission/security-report.md"), false), false);
+  assert.equal(isTargetedRepairInspection(shell("docker exec postgres psql -c 'ALTER TABLE outbox_events ADD COLUMN tenant_id text'"), false), false);
+  assert.equal(isTargetedRepairInspection(shell("docker exec postgres psql --file migrations/003.sql"), false), false);
+  assert.match(
+    preDeliveryInspectionGuidance(12).join(" "),
+    /12 targeted diagnostics remain: use read or file_read/,
+  );
+  assert.match(
+    preDeliveryInspectionGuidance(12).join(" "),
+    /compare actual predicates clause-by-clause; include persistence lookup\/update scope and state-transition semantics.*verify every qualifier/,
+  );
+  assert.match(
+    preDeliveryInspectionGuidance(12).join(" "),
+    /find with -maxdepth 1/,
+  );
+  assert.doesNotMatch(
+    preDeliveryInspectionGuidance(0).join(" "),
+    /targeted diagnostics remain/,
+  );
+  assert.match(
+    preDeliveryInspectionGuidance(0).join(" "),
+    /tests and documentation alone do not reopen it/,
+  );
+  assert.equal(isClearlyRepairDrivingTool({ tool_name: "file_write", arguments: { path: "services/worker/state.py" } }), true);
+  assert.equal(isClearlyRepairDrivingTool({ tool_name: "file_write", arguments: { path: "submission/test-report.json" } }), false);
+  assert.equal(isClearlyRepairDrivingTool({ tool_name: "file_write", arguments: { path: "deliverables/verification.json" } }), false);
+  assert.equal(isClearlyRepairDrivingTool({ tool_name: "file_write", arguments: { path: "tests/public/test_release_policy_parity.py" } }), false);
+  assert.equal(isClearlyRepairDrivingTool({ tool_name: "file_edit", arguments: { path: "services/worker/state.test.ts" } }), false);
+  assert.equal(isClearlyRepairDrivingTool({ tool_name: "file_write", arguments: { path: "docs/security.md" } }), false);
+  assert.equal(isClearlyRepairDrivingTool(shell("python tools/afctl.py test integration")), false);
+  assert.equal(isClearlyRepairDrivingTool(shell("python -c \"from pathlib import Path; Path('submission/test-report.json').write_text('x')\"")), false);
+  assert.equal(isClearlyRepairDrivingTool(shell("cat result.json > evidence/test-farm/latest.json")), false);
+  assert.equal(isClearlyRepairDrivingTool(shell("apply_patch <<'PATCH'\n*** Update File: services/worker/state.py\nPATCH")), true);
+  assert.equal(isClearlyRepairDrivingTool(shell("sed -i 's/a/b/' services/worker/state.py")), true);
+  assert.equal(isClearlyRepairDrivingTool(shell("docker compose up -d --build")), false);
+  assert.equal(isClearlyRepairDrivingTool(shell("npm run build")), false);
+  assert.equal(isGeneratedDeliveryMutation({ tool_name: "file_write", arguments: { path: "submission/test-report.json" } }), true);
+  assert.equal(isGeneratedDeliveryMutation({ tool_name: "file_write", arguments: { path: "deliverables/verification.json" } }), true);
+  assert.equal(isGeneratedDeliveryMutation({ tool_name: "file_edit", arguments: { path: "evidence/test-farm/latest.json" } }), true);
+  assert.equal(isGeneratedDeliveryMutation({ tool_name: "file_write", arguments: { path: "services/worker/state.py" } }), false);
+  assert.equal(isGeneratedDeliveryMutation(shell("cat result.json > evidence/test-farm/latest.json")), true);
+  assert.equal(isGeneratedDeliveryMutation(shell("cat result.json > submission/result.json && sed -i 's/a/b/' services/worker/state.py")), false);
+  assert.equal(isValidationOnlyMutation({ tool_name: "file_write", arguments: { path: "tests/public/test_release_policy_parity.py" } }), true);
+  assert.equal(isValidationOnlyMutation({ tool_name: "file_edit", arguments: { path: "services/worker/state.spec.ts" } }), true);
+  assert.equal(isValidationOnlyMutation({ tool_name: "file_write", arguments: { path: "docs/security.md" } }), true);
+  assert.equal(isValidationOnlyMutation({ tool_name: "file_write", arguments: { path: "services/worker/state.py" } }), false);
+  assert.equal(isValidationOnlyMutation(shell("sed -i 's/a/b/' tests/public/test_policy.py")), true);
+  assert.equal(isValidationOnlyMutation(shell("sed -i 's/a/b/' tests/public/test_policy.py && sed -i 's/a/b/' services/worker/state.py")), false);
+  assert.equal(isGeneratedDeliveryInspection({ tool_name: "file_read", arguments: { path: "submission/test-report.json" } }, true), true);
+  assert.equal(isGeneratedDeliveryInspection(shell("cat deliverables/verification.json"), false), true);
+  assert.equal(isGeneratedDeliveryInspection(shell("cat evidence/test-farm/latest.json"), false), true);
+  assert.equal(isGeneratedDeliveryInspection(shell("cat .runtime/simulation-result.json && docker ps"), false), true);
+  assert.equal(isGeneratedDeliveryInspection(shell("ls evidence/test-farm 2>/dev/null; ls .runtime/ 2>/dev/null"), false), true);
+  assert.equal(isGeneratedDeliveryInspection(shell("cat tools/regenerate_submission.py"), false), true);
+  assert.equal(isGeneratedDeliveryInspection(shell("python3 work/build_submission.py"), false), false);
+  assert.equal(isGeneratedDeliveryInspection(shell("python tools/generate_manifest.py"), false), false);
+  assert.equal(isGeneratedDeliveryInspection(shell("python work/gen_deliverables.py"), false), false);
+  assert.equal(isGeneratedDeliveryInspection(shell("python work/finalize.py"), false), false);
+  assert.equal(isGeneratedDeliveryInspection(shell("cat task-contract.json"), false), false);
+  assert.equal(isGeneratedDeliveryInspection({ tool_name: "file_read", arguments: { path: "services/worker/state.py" } }, true), false);
+  assert.equal(isClearlyRepairDrivingTool(shell("ls evidence/test-farm 2>/dev/null; ls .runtime/ 2>/dev/null")), false);
+  assert.equal(isClearlyVerificationDrivingTool(shell("python -m pytest tests -q")), true);
+  for (const command of [
+    "python -B -m unittest discover -s tests -v",
+    "python3.12 -I -B -m pytest tests/unit -q",
+    "C:\\Python312\\python.exe -X dev -W error -m compileall src",
+  ]) {
+    assert.equal(isClearlyVerificationDrivingTool(shell(command)), true, command);
+  }
+  assert.equal(isClearlyVerificationDrivingTool(shell("npm run typecheck && npm test")), true);
+  assert.equal(isClearlyVerificationDrivingTool(shell("python tools/afctl.py simulate")), true);
+  assert.equal(isClearlyVerificationDrivingTool(shell("python tools/smoke_closure.py")), true);
+  assert.equal(isClearlyVerificationDrivingTool(shell("python tools/e2e_full_lifecycle.py")), true);
+  assert.equal(isClearlyVerificationDrivingTool(shell("python3 work/build_submission.py")), false);
+  assert.equal(isClearlyVerificationDrivingTool(shell("python tools/generate_manifest.py")), false);
+  assert.equal(isClearlyVerificationDrivingTool(shell("python work/gen_deliverables.py")), false);
+  assert.equal(isClearlyVerificationDrivingTool(shell("python tools/afctl.py request-acceptance")), false);
+  assert.equal(isClearlyVerificationDrivingTool(structuredShell(".runtime/venv/bin/python", ["-m", "pytest", "-q"])), true);
+  assert.equal(isClearlyVerificationDrivingTool(structuredShell("python", ["-B", "-m", "unittest", "discover", "-s", "tests", "-v"])), true);
+  assert.equal(isClearlyVerificationDrivingTool(structuredShell("python3.11", ["-I", "-X", "dev", "-m", "pytest", "tests/api"])), true);
+  assert.equal(isClearlyVerificationDrivingTool(structuredShell("npm.cmd", ["test"])), true);
+  assert.equal(isClearlyVerificationDrivingTool(structuredShell("pnpm.cmd", ["run", "typecheck"])), true);
+  assert.equal(isClearlyVerificationDrivingTool(structuredShell("npx.cmd", ["vitest", "run"])), true);
+  assert.equal(isClearlyVerificationDrivingTool(shell("node --test")), true);
+  assert.equal(isClearlyVerificationDrivingTool(structuredShell("node.exe", ["--test", "test"])), true);
+  assert.equal(isClearlyVerificationDrivingTool(structuredShell("python", ["tools/afctl.py", "simulate"])), true);
+  assert.equal(isClearlyVerificationDrivingTool(structuredShell("python", ["-c", "import json; print(json.load(open('submission/manifest.json')))"])), false);
+  assert.equal(isClearlyVerificationDrivingTool(structuredShell("python", ["-c", "print('-m pytest')"])), false);
+  assert.equal(isClearlyVerificationDrivingTool(shell("cat submission/manifest.json")), false);
+  assert.equal(isClearlyVerificationDrivingTool(shell("git status --short && sha256sum submission/*")), false);
+  assert.equal(isClearlyVerificationDrivingTool(shell("python -c \"import json; json.load(open('submission/manifest.json'))\"")), false);
+  assert.equal(isClearlyVerificationDrivingTool(shell("cat tests/public/test_metrics.py")), false);
+  assert.equal(isClearlyVerificationDrivingTool(shell("sed -n '1,200p' /workspace/tests/integration/test_release.py")), false);
+  assert.equal(isClearlyVerificationDrivingTool(shell("grep -n 'pytest|failed_shards|test integration' tools/afctl.py")), false);
+  assert.equal(isClearlyVerificationDrivingTool(shell("./scripts/verify-release.sh --all")), true);
+  assert.equal(isClearlyVerificationDrivingTool(structuredShell("pwsh", ["-NoProfile", "-File", "deliverables/reproduce.ps1"])), true);
+  assert.equal(isClearlyVerificationDrivingTool(shell("/workspace/tools/integration-check.py --live")), true);
+  assert.equal(isClearlyVerificationDrivingTool({ tool_name: "read", arguments: { path: "test.log" } }), false);
+});
+
+test("verification scopes remain stable across diagnostic wrappers", () => {
+  const scope = (command: string) => verificationScopeForTool({
+    tool_name: "shell",
+    arguments: { command },
+  });
+  const integrationCommands = [
+    "python tools/afctl.py test integration",
+    "timeout 400 python tools/afctl.py test integration 2>&1 | tail -40",
+    "cd /workspace && .runtime/venv/bin/python tools/afctl.py test integration > /tmp/integration-9.log; grep failed /tmp/integration-9.log",
+    "timeout 240 python tools/afctl.py test integration; echo EXIT_CODE=0",
+  ];
+  assert.deepEqual(
+    integrationCommands.map(scope),
+    integrationCommands.map(() => "shell:afctl:test:integration"),
+  );
+  assert.equal(scope("python tools/afctl.py test public"), "shell:afctl:test:public");
+  assert.equal(
+    scope("cd /workspace && timeout 240 python tools/afctl.py test public; echo EXIT_CODE=0"),
+    "shell:afctl:test:public",
+  );
+  assert.equal(scope("timeout 300 python tools/afctl.py build 2>&1 | tail -5"), "shell:afctl:build");
+  assert.equal(scope("python tools/afctl.py simulate > /tmp/sim.log"), "shell:afctl:simulate");
+  assert.equal(scope("npm run test -- --runInBand"), "shell:npm:test");
+  assert.equal(scope("npm.cmd test"), "shell:npm:test");
+  assert.equal(scope("node --test"), "shell:node:test");
+  assert.equal(
+    verificationScopeForTool({
+      tool_name: "shell",
+      arguments: { executable: "npm.cmd", argv: ["test"] },
+    }),
+    "shell:npm:test",
+  );
+  assert.notEqual(scope("python tools/afctl.py test public"), scope(integrationCommands[0]));
+});
+
+test("alternate verification cannot substitute for an unresolved semantic scope", () => {
+  const shell = (command: string) => ({ tool_name: "shell", arguments: { command } });
+  const unresolved = ["shell:afctl:test:integration"];
+
+  assert.equal(
+    isAlternativeVerificationInspection(shell("python tools/afctl.py test integration"), unresolved),
+    false,
+  );
+  assert.equal(
+    isAlternativeVerificationInspection(shell("python tools/smoke_closure.py"), unresolved),
+    true,
+  );
+  assert.equal(
+    isAlternativeVerificationInspection(shell("python tools/e2e_full_lifecycle.py"), unresolved),
+    true,
+  );
+  assert.equal(
+    isAlternativeVerificationInspection(shell("python tools/afctl.py simulate"), unresolved),
+    true,
+  );
+  assert.equal(
+    isAlternativeVerificationInspection(shell("python tools/afctl.py test public"), unresolved),
+    true,
+  );
+  assert.equal(
+    isAlternativeVerificationInspection(shell("python tools/afctl.py build"), unresolved),
+    false,
+  );
+  assert.equal(
+    isAlternativeVerificationInspection(shell("npm run typecheck"), unresolved),
+    false,
+  );
+});
+
+test("environment probes never consume the alternate-verification budget", () => {
+  const shell = (command: string) => ({ tool_name: "shell", arguments: { command } });
+  const unresolved = ["shell:pytest:all", "shell:pytest:sklearn/ensemble/_hist_gradient_boosting/tests/test_gradient_boosting.py"];
+  // Locating the testbed interpreter / confirming the test runner is a
+  // prerequisite, not a substitute green score.
+  assert.equal(
+    isAlternativeVerificationInspection(shell("/opt/miniconda3/envs/testbed/bin/python --version"), unresolved),
+    false,
+  );
+  assert.equal(
+    isAlternativeVerificationInspection(shell("python -m pytest --version"), unresolved),
+    false,
+  );
+  assert.equal(
+    isAlternativeVerificationInspection(shell("conda env list"), unresolved),
+    false,
+  );
+  assert.equal(
+    isAlternativeVerificationInspection(shell("pip show pytest"), unresolved),
+    false,
+  );
+  assert.equal(
+    isAlternativeVerificationInspection(shell("which python"), unresolved),
+    false,
+  );
+  // A real alternate test run on a different scope is still blocked.
+  assert.equal(
+    isAlternativeVerificationInspection(shell("python -m pytest sklearn/ensemble/_hist_gradient_boosting/tests/other_test.py"), unresolved),
+    true,
+  );
+});
+
+test("query engine propagates background verification lineage to shell_wait", () => {
+  const origin = {
+    toolCallId: "call-integration",
+    name: "shell",
+    arguments: {
+      command: "python tools/afctl.py test integration",
+    },
+  };
+  const response: ToolExecutionResponse = {
+    tool_call_id: "call-wait",
+    ok: true,
+    summary: "Sandbox command completed",
+    output: {
+      stdout: JSON.stringify({
+        schema: "example.test-job-summary/v1",
+        status: "failed",
+        counts: { passed: 8, failed: 2 },
+      }),
+      return_code: 0,
+      gateway_receipt: {
+        invocation_ref: {
+          tool_call_id: origin.toolCallId,
+        },
+      },
+    },
+    artifacts: [],
+    metadata: {},
+  };
+
+  assert.equal(isVerificationDrivingToolResult({
+    tool_name: "shell_wait",
+    arguments: { job_id: "job-integration" },
+  }, response, [origin]), true);
+  assert.equal(
+    verificationScopeForToolResult({
+      tool_name: "shell_wait",
+      arguments: { job_id: "job-integration" },
+    }, response, [origin]),
+    verificationScopeForTool({ tool_name: origin.name, arguments: origin.arguments }),
+  );
+  assert.notEqual(
+    verificationScopeForTool({ tool_name: origin.name, arguments: origin.arguments }),
+    verificationScopeForTool({
+      tool_name: "shell",
+      arguments: { command: "python tools/afctl.py test public" },
+    }),
+  );
+  assert.equal(isVerificationDrivingToolResult({
+    tool_name: "shell_wait",
+    arguments: { job_id: "job-unrelated" },
+  }, response, [{ ...origin, name: "read" }]), false);
+
+  const physicalResponse: ToolExecutionResponse = {
+    ...response,
+    ok: false,
+    error: "sandbox_command_failed",
+    output: {
+      stdout: "138 passed\n",
+      stderr: "sh: syntax error: bad substitution\n",
+      return_code: 2,
+      gateway_receipt: {
+        invocation: {
+          tool_call_id: origin.toolCallId,
+          causation_id: origin.toolCallId,
+        },
+      },
+    },
+    metadata: {
+      originating_tool_call_id: origin.toolCallId,
+      return_code: "2",
+    },
+  };
+  assert.equal(isVerificationDrivingToolResult({
+    tool_name: "shell_wait",
+    arguments: { job_id: "gateway-command-job:integration" },
+  }, physicalResponse, [origin]), true);
+
+  const recoveryOrigin = {
+    toolCallId: "call-services-up",
+    name: "shell",
+    arguments: { command: "docker compose up -d --build --wait" },
+  };
+  const recoveryResponse: ToolExecutionResponse = {
+    ...response,
+    output: {
+      stdout: "all services healthy",
+      return_code: 0,
+      gateway_receipt: {
+        invocation_ref: { tool_call_id: recoveryOrigin.toolCallId },
+      },
+    },
+  };
+  assert.equal(isEnvironmentRecoveryToolResult({
+    tool_name: "shell_wait",
+    arguments: { job_id: "gateway-command-job:services-up" },
+  }, recoveryResponse, [recoveryOrigin]), true);
+});
+
+test("verification harness provenance follows structured commands and background lineage", () => {
+  const harnessPath = "checks/generated/alpha-482-smoke.py";
+  const structured = {
+    tool_name: "shell",
+    arguments: {
+      executable: "C:\\Python312\\python.exe",
+      argv: ["-B", harnessPath],
+    },
+  };
+  assert.equal(verificationHarnessPathForTool(structured), harnessPath);
+  assert.equal(verificationHarnessPathForTool({
+    tool_name: "shell",
+    arguments: { command: `python -B ${harnessPath}` },
+  }), harnessPath);
+  assert.equal(verificationHarnessPathForTool({
+    tool_name: "shell",
+    arguments: { executable: "python", argv: ["-m", "unittest", "discover"] },
+  }), "");
+
+  const origin = {
+    toolCallId: "call-harness-background",
+    name: structured.tool_name,
+    arguments: structured.arguments,
+  };
+  const terminal: ToolExecutionResponse = {
+    tool_call_id: "call-harness-wait",
+    ok: false,
+    summary: "assertion failed",
+    output: {
+      return_code: 1,
+      gateway_receipt: {
+        invocation_ref: { tool_call_id: origin.toolCallId },
+      },
+    },
+    artifacts: [],
+    metadata: {},
+  };
+  assert.equal(verificationHarnessPathForToolResult({
+    tool_name: "shell_wait",
+    arguments: { job_id: "job-harness" },
+  }, terminal, [origin]), harnessPath);
+});
+
+test("task-authored harness correction is revision-bound and requires independent verification", () => {
+  const progressive = new ProgressiveExecutionRuntime({
+    deliveryContract: { workspace_mutation_required: true },
+  });
+  const request = (
+    toolCallId: string,
+    toolName: string,
+    arguments_: JsonObject,
+    metadata: JsonObject,
+  ): ToolExecutionRequest => ({
+    toolCallId,
+    toolName,
+    arguments: arguments_,
+    turnIndex: 0,
+    stepIndex: 0,
+    batchId: toolCallId,
+    batchIndex: 0,
+    batchSize: 1,
+    executionMode: "serial_non_read_only",
+    metadata,
+  });
+  const mutationResult = (
+    toolCallId: string,
+    path: string,
+    disposition: "created" | "replaced",
+  ): ToolExecutionResponse => ({
+    tool_call_id: toolCallId,
+    ok: true,
+    summary: `workspace path ${disposition}`,
+    output: {
+      path,
+      workspace_path_disposition: disposition,
+      workspace_path_created: String(disposition === "created"),
+    },
+    artifacts: [],
+    metadata: {
+      workspace_mutation_committed: "true",
+      workspace_logical_path: path,
+      workspace_path_disposition: disposition,
+      workspace_path_created: String(disposition === "created"),
+    },
+  });
+
+  const sourceEdit = request("source-edit", "file_write", { path: "src/service.py" }, {
+    progressive_mutation_path: "src/service.py",
+    progressive_repair_driving: true,
+  });
+  progressive.observeToolResult(
+    sourceEdit,
+    mutationResult(sourceEdit.toolCallId, "src/service.py", "replaced"),
+    false,
+  );
+  const harnessWrite = request("harness-create", "file_write", {
+    path: "checks/generated/alpha-482-smoke.py",
+  }, {
+    progressive_mutation_path: "checks/generated/alpha-482-smoke.py",
+    progressive_repair_driving: false,
+  });
+  progressive.observeToolResult(
+    harnessWrite,
+    mutationResult(
+      harnessWrite.toolCallId,
+      "checks/generated/alpha-482-smoke.py",
+      "created",
+    ),
+    false,
+  );
+  const harnessVerification = request("harness-run", "shell", {
+    executable: "python",
+    argv: ["-B", "checks/generated/alpha-482-smoke.py"],
+  }, {
+    progressive_verification_driving: true,
+    progressive_verification_scope: "shell:python:alpha-482-smoke",
+    progressive_verification_harness_path: "checks/generated/alpha-482-smoke.py",
+  });
+  progressive.observeToolResult(harnessVerification, {
+    tool_call_id: harnessVerification.toolCallId,
+    ok: false,
+    summary: "assertion mismatch",
+    output: { stderr: "AssertionError: expected 9, observed 8", return_code: 1 },
+    artifacts: [],
+    metadata: { workspace_mutation_committed: "false" },
+  }, false);
+
+  const failed = progressive.snapshot();
+  assert.equal(failed.unresolvedVerificationFailures[0].failureKind, "nonzero_exit");
+  assert.equal(
+    failed.unresolvedVerificationFailures[0].validationHarnessPath,
+    "checks/generated/alpha-482-smoke.py",
+  );
+  assert.equal(progressive.canCorrectTaskAuthoredVerificationHarness(
+    "checks/generated/alpha-482-smoke.py",
+  ), true);
+  const restored = new ProgressiveExecutionRuntime({
+    deliveryContract: { workspace_mutation_required: true },
+    restored: failed,
+  });
+  assert.deepEqual(restored.snapshot().taskAuthoredPathRevisions, [{
+    path: "checks/generated/alpha-482-smoke.py",
+    revision: 1,
+  }]);
+  assert.equal(restored.failedVerificationScopeAwaitingRepair(
+    "shell:python:alpha-482-smoke",
+  ), true);
+
+  const renamedHelper = request("renamed-helper", "file_write", {
+    path: "scripts/cleanup_smoke.py",
+  }, {
+    progressive_mutation_path: "scripts/cleanup_smoke.py",
+    progressive_repair_driving: true,
+  });
+  const repairGeneration = progressive.snapshot().repairMutationCount;
+  progressive.observeToolResult(
+    renamedHelper,
+    mutationResult(renamedHelper.toolCallId, "scripts/cleanup_smoke.py", "created"),
+    false,
+  );
+  assert.equal(progressive.snapshot().repairMutationCount, repairGeneration);
+  assert.equal(progressive.failedVerificationScopeAwaitingRepair(
+    "shell:python:alpha-482-smoke",
+  ), true);
+
+  const harnessEdit = request("harness-correct", "file_write", {
+    path: "checks/generated/alpha-482-smoke.py",
+  }, {
+    progressive_mutation_path: "checks/generated/alpha-482-smoke.py",
+    progressive_repair_driving: false,
+  });
+  progressive.observeToolResult(
+    harnessEdit,
+    mutationResult(
+      harnessEdit.toolCallId,
+      "checks/generated/alpha-482-smoke.py",
+      "replaced",
+    ),
+    false,
+  );
+  assert.equal(progressive.failedVerificationScopeAwaitingRepair(
+    "shell:python:alpha-482-smoke",
+  ), false);
+  progressive.observeToolResult(harnessVerification, {
+    tool_call_id: harnessVerification.toolCallId,
+    ok: true,
+    summary: "smoke passed",
+    output: { stdout: "ok", return_code: 0 },
+    artifacts: [],
+    metadata: { workspace_mutation_committed: "false" },
+  }, false);
+  assert.deepEqual(progressive.snapshot().unresolvedVerificationScopes, []);
+  assert.equal(progressive.snapshot().verificationCount, 0);
+
+  const official = request("official-suite", "shell", {
+    executable: "python",
+    argv: ["-m", "unittest", "discover"],
+  }, {
+    progressive_verification_driving: true,
+    progressive_verification_scope: "shell:python:unittest",
+  });
+  progressive.observeToolResult(official, {
+    tool_call_id: official.toolCallId,
+    ok: true,
+    summary: "official suite passed",
+    output: { stdout: "42 passed", return_code: 0 },
+    artifacts: [],
+    metadata: { workspace_mutation_committed: "false" },
+  }, false);
+  assert.equal(progressive.snapshot().verificationCount, 1);
+});
+
+test("progressive execution reapplies the current delivery contract after restore", () => {
+  const progressive = new ProgressiveExecutionRuntime({
+    deliveryContract: { workspace_mutation_required: true },
+    restored: {
+      version: "zyra.progressive-execution/v1",
+      requiredDeliveryMissing: false,
+      workspaceMutationCount: 0,
+      artifactCount: 2,
+    },
+  });
+
+  assert.equal(progressive.snapshot().requiredDeliveryMissing, true);
+});
+
+test("progressive closeout accounts for artifacts, verification, background work, and context", () => {
+  const progressive = new ProgressiveExecutionRuntime({
+    now: () => 10_000,
+    constraints: {
+      external_deadline_epoch_ms: 20_000,
+      closeout_reserve_seconds: 2,
+    },
+  });
+  const normal = progressive.decide(1_000, 10_000);
+  const contextBoundary = progressive.decide(9_800, 10_000);
+
+  assert.equal(normal.action, "continue");
+  assert.equal(contextBoundary.action, "closeout");
+  assert.match(contextBoundary.reason, /resource boundary/);
+  assert.equal(contextBoundary.snapshot.phase, "closeout");
+});
+
+test("a newly created reproduction script does not clear the required delivery obligation", () => {
+  const progressive = new ProgressiveExecutionRuntime({
+    deliveryContract: { workspace_mutation_required: true },
+  });
+  const request: ToolExecutionRequest = {
+    toolCallId: "write-repro",
+    toolName: "write",
+    arguments: { path: "repro_case_q.py" },
+    turnIndex: 0,
+    stepIndex: 0,
+    batchId: "batch-repro",
+    batchIndex: 0,
+    batchSize: 1,
+    executionMode: "serial_non_read_only",
+    metadata: {},
+  };
+  progressive.observeToolResult(request, {
+    tool_call_id: "write-repro",
+    ok: true,
+    summary: "created a reproduction script",
+    output: {},
+    artifacts: [{ artifact_id: "artifact-repro", kind: "file", uri: "workspace:repro_case_q.py", title: "repro" }],
+    metadata: {
+      physical_effect_executed: "true",
+      workspace_mutation_committed: "true",
+      workspace_path_created: "true",
+      workspace_logical_path: "repro_case_q.py",
+    },
+  }, false);
+
+  const observed = progressive.snapshot();
+  assert.equal(observed.requiredDeliveryMissing, true);
+  assert.equal(observed.workspaceMutationCount, 0);
+  assert.equal(observed.diagnosticScriptCount, 1);
+  assert.ok(observed.progressReasons.includes("diagnostic_script_created_not_delivery"));
+});
+
+test("a diagnostic script without a production repair keeps nudging toward a real fix", () => {
+  let clock = 1_000;
+  const progressive = new ProgressiveExecutionRuntime({
+    now: () => clock,
+    constraints: {
+      external_deadline_epoch_ms: 100_000,
+      closeout_reserve_seconds: 5,
+    },
+    deliveryContract: { workspace_mutation_required: true },
+  });
+
+  const reproRequest = (index: number): ToolExecutionRequest => ({
+    toolCallId: `write-repro-${index}`,
+    toolName: "write",
+    arguments: { path: `repro_case_${index}.py` },
+    turnIndex: index,
+    stepIndex: 0,
+    batchId: `batch-${index}`,
+    batchIndex: 0,
+    batchSize: 1,
+    executionMode: "serial_non_read_only",
+    metadata: {},
+  });
+  const reproResponse = (toolCallId: string): ToolExecutionResponse => ({
+    tool_call_id: toolCallId,
+    ok: true,
+    summary: "created a reproduction script",
+    output: {},
+    artifacts: [],
+    metadata: {
+      physical_effect_executed: "true",
+      workspace_mutation_committed: "true",
+      workspace_path_created: "true",
+      workspace_logical_path: "repro_case_q.py",
+    },
+  });
+
+  // First reproduction script: does not clear the delivery obligation.
+  progressive.observeToolResult(reproRequest(0), reproResponse("write-repro-0"), false);
+  progressive.observeProviderRound("The reproduction script confirms the defect.", 1);
+  clock += 1_000;
+
+  // A second round of provider work should trigger the nudge fallback.
+  progressive.observeProviderRound("Let me rerun the reproduction script again.", 1);
+  clock += 1_000;
+  const decision = progressive.decide(2_000, 96_000);
+
+  assert.equal(decision.action, "nudge_action");
+  assert.match(decision.reason, /production implementation is still unmodified/);
+  assert.equal(decision.snapshot.requiredDeliveryMissing, true);
+  assert.equal(decision.snapshot.workspaceMutationCount, 0);
+});
+
+test("verification debt keeps nudging past the bounded nudge cap", () => {
+  let clock = 1_000;
+  const progressive = new ProgressiveExecutionRuntime({
+    now: () => clock,
+    constraints: {
+      external_deadline_epoch_ms: 10_000_000,
+      closeout_reserve_seconds: 5,
+    },
+    deliveryContract: {
+      workspace_mutation_required: true,
+      verification_required: true,
+    },
+    restored: {
+      version: "zyra.progressive-execution/v1",
+      workspaceMutationCount: 3,
+      verificationCount: 0,
+      verificationNudgeCount: 5,
+      lastVerificationNudgeProviderRound: 0,
+      providerRounds: 6,
+      startedAt: 1_000,
+      lastEffectiveProgressAt: 2_000,
+    },
+  });
+
+  // Verification debt exists (mutation committed, never verified), the nudge
+  // cap is exceeded, and the agent has stalled long past the progress window.
+  // The deadline is far away, so it must nudge again rather than close out.
+  clock = 200_000;
+  const decision = progressive.decide(2_000, 96_000);
+
+  assert.equal(decision.action, "nudge_verification");
+  assert.match(decision.reason, /behaviorally verified|verification debt/);
+});
+
+test("verification debt forces closeout near the deadline", () => {
+  let clock = 1_000;
+  const progressive = new ProgressiveExecutionRuntime({
+    now: () => clock,
+    constraints: {
+      external_deadline_epoch_ms: 6_000,
+      closeout_reserve_seconds: 5,
+    },
+    deliveryContract: {
+      workspace_mutation_required: true,
+      verification_required: true,
+    },
+    restored: {
+      version: "zyra.progressive-execution/v1",
+      workspaceMutationCount: 3,
+      verificationCount: 0,
+      verificationNudgeCount: 5,
+      lastVerificationNudgeProviderRound: 0,
+      providerRounds: 6,
+      startedAt: 1_000,
+      lastEffectiveProgressAt: 2_000,
+    },
+  });
+
+  // timePressure = reserve / remaining = 5000 / (6000 - 2000) = 1.25 >= 0.85,
+  // so the verification debt should hard-close instead of nudging.
+  clock = 2_000;
+  const decision = progressive.decide(2_000, 96_000);
+
+  assert.equal(decision.action, "closeout");
+  assert.equal(decision.snapshot.phase, "closeout");
+});
+
+test("budget-adjusted compaction threshold tightens as cumulative tokens are spent", () => {
+  // Below 40% the nominal threshold is untouched.
+  assert.equal(budgetAdjustedCompactionThreshold(96_000, 0, 600_000), 96_000);
+  assert.equal(budgetAdjustedCompactionThreshold(96_000, 120_000, 600_000), 96_000);
+
+  // 40%-70% keeps 60%.
+  assert.equal(budgetAdjustedCompactionThreshold(96_000, 240_000, 600_000), 57_600);
+
+  // 70%-90% keeps 35%.
+  assert.equal(budgetAdjustedCompactionThreshold(96_000, 420_000, 600_000), 33_600);
+
+  // 90%+ keeps 20% and never collapses to zero.
+  assert.equal(budgetAdjustedCompactionThreshold(96_000, 540_000, 600_000), 19_200);
+  assert.equal(budgetAdjustedCompactionThreshold(96_000, 599_999, 600_000), 19_200);
+});
+
+test("budget-adjusted compaction threshold is inert without a provider cap", () => {
+  assert.equal(budgetAdjustedCompactionThreshold(96_000, 500_000, 0), 96_000);
+  assert.equal(budgetAdjustedCompactionThreshold(96_000, 0, 600_000), 96_000);
+});
+
+test("budget forces compaction only past 90% of the provider cap", () => {
+  assert.equal(budgetForcesCompaction(0, 600_000), false);
+  assert.equal(budgetForcesCompaction(539_999, 600_000), false);
+  assert.equal(budgetForcesCompaction(540_000, 600_000), true);
+  assert.equal(budgetForcesCompaction(600_000, 600_000), true);
+  assert.equal(budgetForcesCompaction(540_000, 0), false);
+});
+
+test("budget-driven delegation steer fires at half the provider cap", () => {
+  // Below half, no steer.
+  assert.equal(budgetDrivenDelegationSteer(0, 600_000), null);
+  assert.equal(budgetDrivenDelegationSteer(299_999, 600_000), null);
+  assert.equal(budgetDrivenDelegationSteer(100_000, 0), null);
+
+  // At and past half, a steer names the Agent tool and isolated context mode.
+  const steer = budgetDrivenDelegationSteer(300_000, 600_000);
+  assert.ok(steer !== null);
+  assert.match(steer!, /Agent tool/);
+  assert.match(steer!, /"isolated"/);
+  assert.match(steer!, /50%/);
+  assert.ok(budgetDrivenDelegationSteer(540_000, 600_000) !== null);
+});
+
+test("budget delegation steer is disabled for sealed single-bug benchmarks", () => {
+  assert.equal(budgetDelegationSteerEnabled(undefined), true);
+  assert.equal(budgetDelegationSteerEnabled({}), true);
+  assert.equal(
+    budgetDelegationSteerEnabled({ disable_budget_delegation_steer: false }),
+    true,
+  );
+  assert.equal(
+    budgetDelegationSteerEnabled({ disable_budget_delegation_steer: true }),
+    false,
+  );
+});
+
+test("provider control plane injects a delegation steer once past half the cumulative budget", async () => {
+  const directory = mkdtempSync(join(tmpdir(), "zyra-delegation-steer-"));
+  const databasePath = join(directory, "provider.sqlite3");
+  const controlPlane = new ProviderControlPlane({ databasePath });
+  let route: ProviderRouteLease;
+  try {
+    installDeepSeekFlashProfile(controlPlane, {
+      ZYRA_DEEPSEEK_ENABLED: "true",
+      DEEPSEEK_API_KEY: "delegation-steer-test-secret",
+    });
+    route = controlPlane.acquireRoute({
+      runId: "run-delegation-steer",
+      taskId: "task-delegation-steer",
+      nodeId: "node-delegation-steer",
+      sessionId: "session-delegation-steer",
+      turnId: "turn-delegation-steer",
+      purpose: "reason",
+      preferredProviderId: DEEPSEEK_PROVIDER_ID,
+      preferredModelId: DEEPSEEK_FLASH_MODEL_ID,
+      routeHint: `${DEEPSEEK_PROVIDER_ID}/${DEEPSEEK_FLASH_MODEL_ID}`,
+      constraints: {
+        providerIds: [DEEPSEEK_PROVIDER_ID],
+        modelIds: [DEEPSEEK_FLASH_MODEL_ID],
+        requiredInput: ["text"],
+        requiredOutput: ["text"],
+        requireTools: true,
+        requireStreaming: true,
+        minimumContextWindow: 0,
+        maximumInputPricePerMillion: null,
+        maximumOutputPricePerMillion: null,
+        excludedCredentialIds: [],
+        requiredScopes: [],
+      },
+      metadata: {},
+    });
+  } finally {
+    controlPlane.close();
+  }
+
+  const originalFetch = globalThis.fetch;
+  const originalDeepSeekKey = process.env.DEEPSEEK_API_KEY;
+  process.env.DEEPSEEK_API_KEY = "delegation-steer-test-secret";
+  const requestBodies: JsonObject[] = [];
+  globalThis.fetch = (async (
+    _resource: Parameters<typeof fetch>[0],
+    init?: Parameters<typeof fetch>[1],
+  ) => {
+    requestBodies.push(JSON.parse(String(init?.body ?? "{}")) as JsonObject);
+    const requestCount = requestBodies.length;
+    // Three read-only tool rounds, then a stop.  Each dispatch bills a small
+    // prompt (so per-request context never approaches the compaction threshold)
+    // but a large total (so the cumulative provider ledger crosses half the
+    // 300k cap after round 3 without ever crossing the 90% hard boundary).
+    const choice = requestCount <= 3
+      ? {
+        index: 0,
+        delta: {
+          tool_calls: [{
+            index: 0,
+            id: `call-delegation-read-${requestCount}`,
+            type: "function",
+            function: {
+              name: "read",
+              arguments: JSON.stringify({ path: ["a", "b", "c"][requestCount - 1] }),
+            },
+          }],
+        },
+        finish_reason: "tool_calls",
+      }
+      : {
+        index: 0,
+        delta: { content: "Delegation accepted; delivery complete." },
+        finish_reason: "stop",
+      };
+    const payload = {
+      id: `delegation-steer-provider-${requestCount}`,
+      object: "chat.completion.chunk",
+      model: DEEPSEEK_FLASH_MODEL_ID,
+      choices: [choice],
+      usage: {
+        prompt_tokens: 1_000,
+        completion_tokens: 100,
+        total_tokens: 60_000,
+      },
+    };
+    return new Response(`data: ${JSON.stringify(payload)}\n\ndata: [DONE]\n\n`, {
+      status: 200,
+      headers: { "content-type": "text/event-stream" },
+    });
+  }) as unknown as typeof fetch;
+  try {
+    const host = new MemoryHost();
+    const result = await new ClaudeRuntimeCore().run(input({
+      runId: route.runId,
+      taskId: route.taskId,
+      sessionId: route.sessionId,
+      config: {
+        maxTurns: 8,
+        modelName: DEEPSEEK_FLASH_MODEL_ID,
+        runtimeConstraints: {
+          model_transport: "http_sse",
+          provider_control_plane_required: true,
+          provider_control_plane_database_path: databasePath,
+          provider_route_id: route.routeId,
+          provider_route_checksum: route.checksum,
+          provider_catalog_revision: String(route.catalogRevision),
+          provider_credential_version: String(route.credentialVersion),
+          provider_credential_fingerprint: route.credentialFingerprint,
+          provider_transport_id: route.transportId,
+          provider_route_session_id: route.sessionId,
+          provider_route_turn_id: route.turnId,
+          maximum_total_tokens: 300_000,
+        },
+      },
+    }), host);
+
+    const failure = host.events
+      .filter((event) => event.phase === "error" || event.phase === "model_stream_report")
+      .map((event) => JSON.stringify(event))
+      .join("\n");
+    assert.equal(
+      result.ok,
+      true,
+      `stoppedReason=${result.stoppedReason}\nfailures=\n${failure}`,
+    );
+    assert.ok(host.events.some((event) =>
+      event.phase === "provider_delegation_steered"
+    ));
+    // The steer must have been appended to a provider request body so the model
+    // actually sees it, not only recorded as an event.
+    assert.ok(requestBodies.some((body) =>
+      (body.messages as JsonObject[]).some((message) =>
+        String(message.content ?? "").includes("offload the next well-scoped subtask")
+      )
+    ));
+  } finally {
+    globalThis.fetch = originalFetch;
+    if (originalDeepSeekKey === undefined) delete process.env.DEEPSEEK_API_KEY;
+    else process.env.DEEPSEEK_API_KEY = originalDeepSeekKey;
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+
+test("a run's token ceiling ignores dispatches from earlier runs", async () => {
+  // The provider ledger is shared by every run that has used the database, so
+  // a run-scoped ceiling must not count another run's tokens.  Summing the
+  // whole table made every new run inherit all prior consumption and refuse
+  // its first request with `provider_total_token_budget_exhausted`, which is
+  // how a long-horizon benchmark failed at round 0 with an empty ledger.
+  const directory = mkdtempSync(join(tmpdir(), "zyra-run-scoped-budget-"));
+  const databasePath = join(directory, "provider.sqlite3");
+  const controlPlane = new ProviderControlPlane({ databasePath });
+  let previousRoute: ProviderRouteLease;
+  let route: ProviderRouteLease;
+  try {
+    installDeepSeekFlashProfile(controlPlane, {
+      ZYRA_DEEPSEEK_ENABLED: "true",
+      DEEPSEEK_API_KEY: "run-scoped-budget-test-secret",
+    });
+    previousRoute = controlPlane.acquireRoute({
+      runId: "run-previous",
+      taskId: "task-previous",
+      nodeId: "node-previous",
+      sessionId: "session-previous",
+      turnId: "turn-previous",
+      purpose: "reason",
+      preferredProviderId: DEEPSEEK_PROVIDER_ID,
+      preferredModelId: DEEPSEEK_FLASH_MODEL_ID,
+      routeHint: `${DEEPSEEK_PROVIDER_ID}/${DEEPSEEK_FLASH_MODEL_ID}`,
+      constraints: {
+        providerIds: [DEEPSEEK_PROVIDER_ID],
+        modelIds: [DEEPSEEK_FLASH_MODEL_ID],
+        requiredInput: ["text"],
+        requiredOutput: ["text"],
+        requireTools: true,
+        requireStreaming: true,
+        minimumContextWindow: 0,
+        maximumInputPricePerMillion: null,
+        maximumOutputPricePerMillion: null,
+        excludedCredentialIds: [],
+        requiredScopes: [],
+      },
+      metadata: {},
+    });
+    route = controlPlane.acquireRoute({
+      runId: "run-current",
+      taskId: "task-current",
+      nodeId: "node-current",
+      sessionId: "session-current",
+      turnId: "turn-current",
+      purpose: "reason",
+      preferredProviderId: DEEPSEEK_PROVIDER_ID,
+      preferredModelId: DEEPSEEK_FLASH_MODEL_ID,
+      routeHint: `${DEEPSEEK_PROVIDER_ID}/${DEEPSEEK_FLASH_MODEL_ID}`,
+      constraints: {
+        providerIds: [DEEPSEEK_PROVIDER_ID],
+        modelIds: [DEEPSEEK_FLASH_MODEL_ID],
+        requiredInput: ["text"],
+        requiredOutput: ["text"],
+        requireTools: true,
+        requireStreaming: true,
+        minimumContextWindow: 0,
+        maximumInputPricePerMillion: null,
+        maximumOutputPricePerMillion: null,
+        excludedCredentialIds: [],
+        requiredScopes: [],
+      },
+      metadata: {},
+    });
+
+    // Spend far more than the ceiling below, entirely under the earlier run.
+    const claim = controlPlane.dispatches.claim({
+      dispatchId: "provider_dispatch_previous_round1",
+      routeId: previousRoute.routeId,
+      runId: previousRoute.runId,
+      taskId: previousRoute.taskId,
+      nodeId: "node-previous",
+      sessionId: "session-previous",
+      turnId: "turn-previous",
+      idempotencyKey: "previous-run:provider:0:1",
+      messages: [{ role: "user", content: "previous run" }],
+      tools: [],
+      maximumOutputTokens: 1_024,
+      temperature: 0,
+      stream: true,
+      timeoutMilliseconds: 30_000,
+      chunkTimeoutMilliseconds: 30_000,
+      routeFallbackPolicy: "pin_initial_route",
+      extraBody: {},
+      metadata: {},
+    });
+    controlPlane.dispatches.succeed(
+      "provider_dispatch_previous_round1",
+      claim.snapshot.ownerToken,
+      {
+        dispatchId: "provider_dispatch_previous_round1",
+        routeId: previousRoute.routeId,
+        providerId: DEEPSEEK_PROVIDER_ID,
+        modelId: DEEPSEEK_FLASH_MODEL_ID,
+        protocol: "openai_chat",
+        frames: [],
+        text: "done",
+        stopReason: "stop",
+        usage: { prompt_tokens: 900_000, completion_tokens: 1_000, total_tokens: 901_000 },
+        attempts: [],
+        metadata: {},
+        completedAt: Date.now(),
+      } as never,
+    );
+  } finally {
+    controlPlane.close();
+  }
+
+  const originalFetch = globalThis.fetch;
+  const originalDeepSeekKey = process.env.DEEPSEEK_API_KEY;
+  process.env.DEEPSEEK_API_KEY = "run-scoped-budget-test-secret";
+  globalThis.fetch = (async () =>
+    new Response(
+      `data: ${JSON.stringify({
+        id: "run-scoped-budget-provider",
+        object: "chat.completion.chunk",
+        model: DEEPSEEK_FLASH_MODEL_ID,
+        choices: [
+          { index: 0, delta: { content: "Budget accepted." }, finish_reason: "stop" },
+        ],
+        usage: { prompt_tokens: 1_000, completion_tokens: 10, total_tokens: 1_010 },
+      })}\n\ndata: [DONE]\n\n`,
+      { status: 200, headers: { "content-type": "text/event-stream" } },
+    )) as unknown as typeof fetch;
+  try {
+    const host = new MemoryHost();
+    const result = await new ClaudeRuntimeCore().run(input({
+      runId: route.runId,
+      taskId: route.taskId,
+      sessionId: route.sessionId,
+      config: {
+        maxTurns: 2,
+        modelName: DEEPSEEK_FLASH_MODEL_ID,
+        runtimeConstraints: {
+          model_transport: "http_sse",
+          provider_control_plane_required: true,
+          provider_control_plane_database_path: databasePath,
+          provider_route_id: route.routeId,
+          provider_route_checksum: route.checksum,
+          provider_catalog_revision: String(route.catalogRevision),
+          provider_credential_version: String(route.credentialVersion),
+          provider_credential_fingerprint: route.credentialFingerprint,
+          provider_transport_id: route.transportId,
+          provider_route_session_id: route.sessionId,
+          provider_route_turn_id: route.turnId,
+          maximum_total_tokens: 600_000,
+        },
+      },
+    }), host);
+
+    const failure = host.events
+      .filter((event) => event.phase === "error" || event.phase === "model_stream_report")
+      .map((event) => JSON.stringify(event))
+      .join("\n");
+    assert.ok(
+      !failure.includes("provider_total_token_budget_exhausted"),
+      `the new run inherited the previous run's spend:\n${failure}`,
+    );
+    assert.equal(
+      result.ok,
+      true,
+      `stoppedReason=${result.stoppedReason}\nfailures=\n${failure}`,
+    );
+  } finally {
+    globalThis.fetch = originalFetch;
+    if (originalDeepSeekKey === undefined) delete process.env.DEEPSEEK_API_KEY;
+    else process.env.DEEPSEEK_API_KEY = originalDeepSeekKey;
+    rmSync(directory, { recursive: true, force: true });
+  }
+});

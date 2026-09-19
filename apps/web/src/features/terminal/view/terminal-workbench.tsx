@@ -1,0 +1,648 @@
+import {
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+  type CSSProperties,
+  type KeyboardEvent,
+  type RefObject,
+} from "react"
+import type { TaskProjection } from "../../../../../../packages/core/typed-api-client/src/index.ts"
+import type { WorkbenchRuntime } from "../../../app/runtime.ts"
+import { parseTerminalSession, type TerminalSessionProjection } from "../contracts.ts"
+import { renderTerminalViewport, type TerminalRenderRun } from "../render.ts"
+import { TerminalRuntime, type TerminalRuntimeSnapshot } from "../runtime.ts"
+import {
+  extractTerminalSelection,
+  searchTerminalSelections,
+  type TerminalSelectionRange,
+} from "../selection.ts"
+import {
+  TerminalTabStore,
+  browserTerminalTabStorage,
+  type TerminalTabState,
+} from "../tabs.ts"
+import { PermissionSurfaceStatus } from "../../permissions/index.ts"
+
+interface TerminalDraft {
+  command: string
+  title: string
+  cwd: string
+  shell: string
+  permitId: string
+  sessionId: string
+  workerId: string
+  commandId: string
+  toolCallId: string
+  spanId: string
+}
+
+function token(prefix: string): string {
+  const suffix = (
+    typeof crypto !== "undefined" && typeof crypto.randomUUID === "function"
+      ? crypto.randomUUID().replaceAll("-", "").slice(0, 20)
+      : `${Date.now().toString(36)}${Math.random().toString(36).slice(2, 12)}`
+  )
+  return `${prefix}_${suffix}`
+}
+
+function taskSession(task: TaskProjection): string {
+  const candidates = [
+    task.sessionId,
+    task.metadata.query_session_id,
+    task.metadata.session_id,
+  ]
+  for (const value of candidates) {
+    if (typeof value === "string" && value.trim()) return value.trim()
+  }
+  return `session_${task.taskId.replace(/[^A-Za-z0-9]/gu, "").slice(-32)}`
+}
+
+function defaultDraft(task: TaskProjection): TerminalDraft {
+  const root = task.planNodes.find((node) => node.nodeId === task.rootNodeId)
+  return {
+    command: "python -i",
+    title: "Task terminal",
+    cwd: ".",
+    shell: "",
+    permitId: "",
+    sessionId: taskSession(task),
+    workerId: root?.assignedWorkerId || "terminal-viewer",
+    commandId: token("terminal_command"),
+    toolCallId: token("terminal_tool"),
+    spanId: token("span"),
+  }
+}
+
+function terminalValues(value: unknown): readonly unknown[] {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return []
+  const source = value as Record<string, unknown>
+  return Array.isArray(source.terminals) ? source.terminals : []
+}
+
+function initialTabState(tabs: TerminalTabStore): TerminalTabState {
+  return tabs.snapshot()
+}
+
+function useTerminalSnapshot(
+  runtime: TerminalRuntime,
+  terminalId: string | undefined,
+): TerminalRuntimeSnapshot | undefined {
+  const [snapshot, setSnapshot] = useState<TerminalRuntimeSnapshot>()
+  useEffect(() => {
+    if (!terminalId) {
+      setSnapshot(undefined)
+      return
+    }
+    try {
+      setSnapshot(runtime.snapshot(terminalId))
+      return runtime.listen(terminalId, setSnapshot)
+    } catch {
+      setSnapshot(undefined)
+      return
+    }
+  }, [runtime, terminalId])
+  return snapshot
+}
+
+function statusTone(phase: string | undefined): string {
+  if (phase === "running") return "is-running"
+  if (phase === "opening" || phase === "permission_pending") return "is-pending"
+  if (phase === "exited") return "is-exited"
+  return "is-failed"
+}
+
+function Run({ run }: { run: TerminalRenderRun }) {
+  if (run.hyperlink) {
+    return (
+      <a
+        className={run.className}
+        href={run.hyperlink}
+        rel="noreferrer"
+        target="_blank"
+        style={run.style as CSSProperties}
+      >
+        {run.text}
+      </a>
+    )
+  }
+  return (
+    <span className={run.className} style={run.style as CSSProperties}>
+      {run.text}
+    </span>
+  )
+}
+
+function Screen({
+  snapshot,
+  container,
+}: {
+  snapshot: TerminalRuntimeSnapshot
+  container: RefObject<HTMLDivElement | null>
+}) {
+  const viewport = useMemo(
+    () => renderTerminalViewport(snapshot.screen, {
+      includeScrollback: true,
+      followOutput: true,
+      visibleRows: snapshot.screen.rows,
+      overscan: 12,
+    }),
+    [snapshot.screen],
+  )
+  useEffect(() => {
+    const element = container.current
+    if (element) element.scrollTop = element.scrollHeight
+  }, [container, viewport.revision, viewport.totalRows])
+  return (
+    <div
+      className="terminal-screen-lines"
+      style={{
+        paddingTop: `${viewport.beforeRows * 18}px`,
+        paddingBottom: `${viewport.afterRows * 18}px`,
+      }}
+    >
+      {viewport.rows.map((line) => (
+        <div
+          className={`terminal-screen-line${line.wrapped ? " is-wrapped" : ""}`}
+          data-terminal-row={line.row}
+          key={line.key}
+        >
+          {line.runs.map((run) => <Run key={run.key} run={run} />)}
+          {line.cursorColumn === undefined ? null : (
+            <span
+              aria-hidden="true"
+              className={[
+                "terminal-cursor",
+                `is-${line.cursorShape ?? "block"}`,
+                line.cursorBlinking ? "is-blinking" : "",
+              ].join(" ")}
+              style={{ left: `${line.cursorColumn}ch` }}
+            />
+          )}
+        </div>
+      ))}
+    </div>
+  )
+}
+
+export function TerminalWorkbench({
+  runtime,
+  task,
+}: {
+  runtime: WorkbenchRuntime
+  task: TaskProjection
+}) {
+  const tabs = useMemo(() => {
+    const storage = (
+      typeof window !== "undefined" && window.localStorage
+        ? browserTerminalTabStorage(window.localStorage)
+        : undefined
+    )
+    return new TerminalTabStore(`${task.runId}:${task.taskId}`, { storage })
+  }, [task.runId, task.taskId])
+  const terminal = useMemo(
+    () => new TerminalRuntime({ taskApi: runtime.api.tasks, tabs }),
+    [runtime.api.tasks, tabs],
+  )
+  const [tabState, setTabState] = useState(() => initialTabState(tabs))
+  const [draft, setDraft] = useState(() => defaultDraft(task))
+  const [input, setInput] = useState("")
+  const pendingInput = useRef<{ terminalId: string; value: string; sequence: number } | undefined>(undefined)
+  const [search, setSearch] = useState("")
+  const [loading, setLoading] = useState(true)
+  const [busy, setBusy] = useState(false)
+  const [error, setError] = useState<string>()
+  const screenRef = useRef<HTMLDivElement>(null)
+  const activeId = tabState.active
+  const active = useTerminalSnapshot(terminal, activeId)
+  const searchResult = useMemo(
+    () => active
+      ? searchTerminalSelections(active.screen, search, {
+          includeScrollback: true,
+          maximumMatches: 10_000,
+        })
+      : { query: "", matches: [], truncated: false },
+    [active, search],
+  )
+
+  useEffect(() => tabs.listen(setTabState), [tabs])
+  useEffect(() => () => terminal.dispose(), [terminal])
+  useEffect(() => {
+    let cancelled = false
+    setLoading(true)
+    const preferred = tabs.snapshot().active
+    void runtime.api.tasks.terminalList(task.taskId, { includeClosed: true })
+      .then(async (response) => {
+        const adopted = new Set<string>()
+        for (const value of terminalValues(response)) {
+          if (cancelled) return
+          const projection = parseTerminalSession(value)
+          adopted.add(projection.binding.terminalId)
+          await terminal.adopt(projection, { connect: false })
+        }
+        for (const tab of tabs.snapshot().tabs) {
+          if (!adopted.has(tab.terminalId)) tabs.close(tab.terminalId)
+        }
+        if (preferred && adopted.has(preferred)) {
+          tabs.select(preferred)
+        }
+        const selected = tabs.snapshot().active
+        if (selected) {
+          const snapshot = terminal.snapshot(selected)
+          if (snapshot.status?.phase === "running") {
+            await terminal.connect(selected)
+          }
+        }
+      })
+      .catch((failure) => {
+        if (!cancelled) {
+          setError(failure instanceof Error ? failure.message : String(failure))
+        }
+      })
+      .finally(() => {
+        if (!cancelled) setLoading(false)
+      })
+    return () => { cancelled = true }
+  }, [runtime.api.tasks, tabs, task.taskId, terminal])
+
+  useEffect(() => {
+    const element = screenRef.current
+    if (!element || !activeId || !active?.connected) return
+    let previous = ""
+    const observer = new ResizeObserver((entries) => {
+      const box = entries[0]?.contentRect
+      if (!box) return
+      const rows = Math.max(2, Math.min(500, Math.floor(box.height / 18)))
+      const cols = Math.max(2, Math.min(1_000, Math.floor(box.width / 8.4)))
+      const key = `${rows}:${cols}`
+      if (key === previous) return
+      previous = key
+      terminal.resize(activeId, rows, cols)
+    })
+    observer.observe(element)
+    return () => observer.disconnect()
+  }, [active?.connected, activeId, terminal])
+
+  const create = async () => {
+    if (busy) return
+    setBusy(true)
+    setError(undefined)
+    try {
+      const sessionId = runtime.permissionConsole.consoleSessionId(task.taskId)
+      const permission = runtime.permissionConsole.getSnapshot()
+      const request = permission.requests.find((item) => item.toolCallId === draft.toolCallId
+        && item.sessionId === sessionId && item.taskId === task.taskId)
+      const permit = permission.receipts.find((item) => item.requestId === request?.requestId
+        && item.accepted && item.effect === "allow")?.permitId
+      const sealed = task.metadata.sealed === true || task.metadata.sealed_autonomous === true
+        || task.metadata.competition_mode === "sealed_autonomous"
+      await runtime.permissionConsole.bindTask({ taskId: task.taskId, runId: task.runId,
+        sessionId, productMode: sealed ? "sealed" : "interactive" })
+      const snapshot = await terminal.create({
+        taskId: task.taskId,
+        runId: task.runId,
+        sessionId,
+        workerId: draft.workerId,
+        commandId: draft.commandId,
+        toolCallId: draft.toolCallId,
+        spanId: draft.spanId,
+        command: draft.command,
+        title: draft.title,
+        cwd: draft.cwd,
+        shell: draft.shell || undefined,
+        actorId: "zyra-web-terminal",
+        permissionPermitId: draft.permitId || permit || undefined,
+        // A deliberate retry after approval is a new operation. Transport retries
+        // still share this key, while the permission remains bound to the exact call.
+        idempotencyKey: token("terminal_create"),
+        sealed,
+      })
+      if (snapshot.terminal?.permission.effect === "ask") {
+        setError(
+          "等待本次终端操作的权限审批。点击上方权限请求，批准后再点 启动终端；批准凭据会自动带入。",
+        )
+      } else if (snapshot.terminal?.permission.effect === "deny") {
+        setError(snapshot.terminal.permission.reason)
+      } else {
+        setDraft(defaultDraft(task))
+      }
+    } catch (failure) {
+      setError(failure instanceof Error ? failure.message : String(failure))
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  const select = async (terminalId: string) => {
+    tabs.select(terminalId)
+    setError(undefined)
+    try {
+      const snapshot = terminal.snapshot(terminalId)
+      if (snapshot.status?.phase === "running" && !snapshot.connected) {
+        await terminal.connect(terminalId)
+      }
+    } catch (failure) {
+      setError(failure instanceof Error ? failure.message : String(failure))
+    }
+  }
+
+  const refresh = async () => {
+    if (!activeId || busy) return
+    setBusy(true)
+    setError(undefined)
+    try {
+      const snapshot = await terminal.refresh(task.taskId, activeId)
+      if (snapshot.status?.phase === "running" && !snapshot.connected) {
+        await terminal.connect(activeId)
+      }
+    } catch (failure) {
+      setError(failure instanceof Error ? failure.message : String(failure))
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  useEffect(() => {
+    const pending = pendingInput.current
+    if (!pending || pending.terminalId !== activeId) return
+    if (active?.error) {
+      setInput((current) => current || pending.value)
+      pendingInput.current = undefined
+    } else if ((active?.status?.inputSequence ?? 0) >= pending.sequence) {
+      pendingInput.current = undefined
+    }
+  }, [active?.error, active?.status?.inputSequence, activeId])
+
+  const approvedPermit = (operation: "input" | "kill") => {
+    const permission = runtime.permissionConsole.getSnapshot()
+    const requestIds = new Set(permission.requests.filter((request) =>
+      request.operation === operation && request.taskId === task.taskId
+      && request.sessionId === active?.binding?.sessionId
+      && request.toolCallId === active?.binding?.toolCallId).map((request) => request.requestId))
+    return [...permission.receipts].reverse().find((receipt) =>
+      requestIds.has(receipt.requestId) && receipt.accepted && receipt.effect === "allow")?.permitId
+  }
+
+  const send = () => {
+    if (!activeId || !input || !active?.connected) return
+    try {
+      const sequences = terminal.input(activeId, `${input}\r`, {
+        permissionPermitId: draft.permitId || approvedPermit("input"),
+      })
+      pendingInput.current = { terminalId: activeId, value: input, sequence: sequences.at(-1)! }
+      setInput("")
+      setError(undefined)
+    } catch (failure) {
+      setError(failure instanceof Error ? failure.message : String(failure))
+    }
+  }
+
+  const rawKey = (event: KeyboardEvent<HTMLDivElement>) => {
+    if (!activeId || !active?.connected) return
+    if (!(event.ctrlKey || event.altKey || event.metaKey) && ![
+      "ArrowUp", "ArrowDown", "ArrowLeft", "ArrowRight",
+      "Home", "End", "PageUp", "PageDown", "Escape", "Tab",
+    ].includes(event.key)) return
+    try {
+      const sequence = terminal.key(
+        activeId,
+        {
+          key: event.key,
+          code: event.code,
+          ctrlKey: event.ctrlKey,
+          altKey: event.altKey,
+          metaKey: event.metaKey,
+          shiftKey: event.shiftKey,
+        },
+        { permissionPermitId: draft.permitId || undefined },
+      )
+      if (sequence !== undefined) event.preventDefault()
+    } catch (failure) {
+      setError(failure instanceof Error ? failure.message : String(failure))
+    }
+  }
+
+  const kill = async () => {
+    const projection = active?.terminal
+    if (!projection || busy) return
+    setBusy(true)
+    setError(undefined)
+    try {
+      await terminal.kill({
+        taskId: projection.binding.taskId,
+        runId: projection.binding.runId,
+        terminalId: projection.binding.terminalId,
+        sessionId: projection.binding.sessionId,
+        workerId: projection.binding.workerId,
+        toolCallId: projection.binding.toolCallId,
+        spanId: projection.binding.spanId,
+        actorId: "zyra-web-terminal",
+        reason: "Killed from the task terminal workbench.",
+        permissionPermitId: draft.permitId || approvedPermit("kill"),
+        idempotencyKey: token("terminal_kill"),
+      })
+    } catch (failure) {
+      setError(failure instanceof Error ? failure.message : String(failure))
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  const close = (terminalId: string) => {
+    terminal.closeTab(terminalId)
+    setError(undefined)
+  }
+
+  const copyTranscript = async () => {
+    if (!active) return
+    const lines = [...active.screen.scrollback, ...active.screen.lines]
+    const last = lines.at(-1)
+    const range: TerminalSelectionRange = {
+      anchor: { row: 0, column: 0 },
+      focus: {
+        row: Math.max(0, lines.length - 1),
+        column: last?.cells.filter((cell) => cell.width !== 0).length ?? 0,
+      },
+      rectangular: false,
+    }
+    const value = extractTerminalSelection(active.screen, range, {
+      includeScrollback: true,
+      maximumBytes: 8 * 1_024 * 1_024,
+    })
+    try {
+      await navigator.clipboard.writeText(value)
+      runtime.notifications.push({
+        id: token("terminal_copy"),
+        title: "Terminal transcript copied",
+        message: `${new TextEncoder().encode(value).byteLength} bytes copied from the viewer.`,
+        tone: "success",
+        taskId: task.taskId,
+      })
+    } catch (failure) {
+      setError(failure instanceof Error ? failure.message : String(failure))
+    }
+  }
+
+  return (
+    <section
+      className="terminal-workbench"
+      aria-labelledby="terminal-workbench-heading"
+      data-terminal-state-owner="zyra_workers.terminal.TerminalSessionRegistry"
+      data-terminal-session-id={active?.terminal?.binding.sessionId ?? active?.binding?.sessionId}
+      data-terminal-frame-id={active?.binding?.terminalId}
+    >
+      <header className="terminal-workbench-header">
+        <div>
+          <h3 id="terminal-workbench-heading">工作区终端</h3>
+          <p>
+            查看工作区终端输出。关闭标签只收起查看器；终止进程才会停止命令。
+          </p>
+        </div>
+        <div className="terminal-workbench-actions">
+          <button className="button button-secondary" disabled={!activeId || busy} onClick={() => void refresh()} type="button">
+            刷新
+          </button>
+          <button className="button button-danger" disabled={!active || active.status?.phase !== "running" || busy} onClick={() => void kill()} type="button">
+            终止进程
+          </button>
+        </div>
+      </header>
+
+      <PermissionSurfaceStatus
+        runtime={runtime.permissionConsole}
+        surface="terminal"
+        label="terminal"
+      />
+
+      <div className="terminal-create-grid">
+        <label>
+          <span>命令</span>
+          <input value={draft.command} onChange={(event) => setDraft({ ...draft, command: event.target.value })} />
+        </label>
+        <label>
+          <span>工作目录</span>
+          <input value={draft.cwd} onChange={(event) => setDraft({ ...draft, cwd: event.target.value })} />
+        </label>
+        <label>
+          <span>指定 Shell</span>
+          <input placeholder="使用系统默认值" value={draft.shell} onChange={(event) => setDraft({ ...draft, shell: event.target.value })} />
+        </label>
+        <label>
+          <span>审批凭据</span>
+          <input placeholder="审批凭据（可选）" value={draft.permitId} onChange={(event) => setDraft({ ...draft, permitId: event.target.value })} />
+        </label>
+        <button className="button button-primary" disabled={busy || !draft.command.trim()} onClick={() => void create()} type="button">
+          {busy ? "正在处理…" : "启动终端"}
+        </button>
+      </div>
+
+      <div className="terminal-tabs" role="tablist" aria-label="Task terminals">
+        {tabState.tabs.map((tab) => (
+          <div className={`terminal-tab ${tab.terminalId === activeId ? "is-active" : ""}`} key={tab.terminalId}>
+            <button
+              aria-selected={tab.terminalId === activeId}
+              className="terminal-tab-select"
+              onClick={() => void select(tab.terminalId)}
+              role="tab"
+              type="button"
+            >
+              <span className={`terminal-status-dot ${statusTone(tab.phase)}`} />
+              <span>{tab.title}</span>
+              <small>{tab.phase}</small>
+            </button>
+            <button
+              aria-label={`Close ${tab.title} viewer`}
+              className="terminal-tab-close"
+              onClick={() => close(tab.terminalId)}
+              title="Close viewer only"
+              type="button"
+            >
+              ×
+            </button>
+          </div>
+        ))}
+        {!tabState.tabs.length && !loading ? (
+          <span className="terminal-tabs-empty">此任务暂无终端会话。</span>
+        ) : null}
+      </div>
+
+      {error || active?.error ? <div className="terminal-error" role="alert">{error || active?.error?.message}</div> : null}
+
+      {active ? (
+        <div className="terminal-stage">
+          <div className="terminal-statusbar">
+            <span className={`terminal-status-dot ${statusTone(active.status?.phase)}`} />
+            <strong>{active.status?.phase ?? "opening"}</strong>
+            <span>{active.status?.cwd ?? "."}</span>
+            <span>{active.status?.rows ?? active.screen.rows}×{active.status?.cols ?? active.screen.cols}</span>
+            <span>cursor {active.replay.acknowledgedCursor}/{active.replay.cursor}</span>
+            <span>{active.connected ? "socket connected" : active.reconnect.phase}</span>
+            {active.status?.pid ? <span>pid {active.status.pid}</span> : null}
+            {active.status?.exitCode !== undefined ? <span>exit {active.status.exitCode}</span> : null}
+          </div>
+          <div className="terminal-view-toolbar">
+            <label>
+              <span className="sr-only">Search terminal output</span>
+              <input
+                onChange={(event) => setSearch(event.target.value)}
+                placeholder="Search terminal output"
+                value={search}
+              />
+            </label>
+            <span>
+              {search
+                ? `${searchResult.matches.length}${searchResult.truncated ? "+" : ""} matches`
+                : `${active.transcript.entries.length} transcript entries`}
+            </span>
+            <button className="button button-secondary" onClick={() => void copyTranscript()} type="button">
+              复制终端输出
+            </button>
+          </div>
+          <div
+            aria-label="Interactive terminal screen"
+            className="terminal-screen"
+            onKeyDown={rawKey}
+            ref={screenRef}
+            role="application"
+            tabIndex={0}
+          >
+            <Screen container={screenRef} snapshot={active} />
+          </div>
+          <div className="terminal-input-row">
+            <input
+              aria-label="Terminal input"
+              disabled={!active.connected || active.status?.phase !== "running"}
+              onChange={(event) => setInput(event.target.value)}
+              onKeyDown={(event) => {
+                if (event.key === "Enter" && !event.shiftKey) {
+                  event.preventDefault()
+                  send()
+                }
+              }}
+              placeholder={active.connected ? "输入内容，按 Enter 发送" : "连接恢复后可输入"}
+              value={input}
+            />
+            <button className="button button-primary" disabled={!input || !active.connected} onClick={send} type="button">
+              发送
+            </button>
+          </div>
+          <details className="terminal-structured">
+            <summary>结构化输出（{active.structured.length}）</summary>
+            <ol>
+              {active.structured.slice(-100).map((line, index) => (
+                <li data-terminal-line-kind={line.kind} key={`${index}:${line.kind}:${line.text}`}>
+                  <span>{line.kind}</span>
+                  <code>{line.text}</code>
+                </li>
+              ))}
+            </ol>
+          </details>
+        </div>
+      ) : (
+        <div className="terminal-empty">
+          {loading ? "正在读取终端记录…" : "创建或选择终端后，可在这里查看输出。"}
+        </div>
+      )}
+    </section>
+  )
+}

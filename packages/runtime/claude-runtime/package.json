@@ -1,0 +1,21 @@
+{
+  "name": "@zyra/claude-runtime",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "dependencies": {
+    "@zyra/claude-mcp": "workspace:*",
+    "@zyra/provider-control-plane": "workspace:*",
+    "@zyra/skill-memory-runtime": "workspace:*"
+  },
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "scripts": {
+    "test": "node --experimental-strip-types --test test/protocol.test.ts test/runtime.test.ts test/permission.test.ts test/skills.test.ts test/agents.test.ts test/control.test.ts test/watchdog.test.ts",
+    "test:recovery": "node --experimental-strip-types --test test/watchdog.test.ts test/recovery.test.ts test/recovery-integration.test.ts",
+    "test:omp": "bun test test/omp-worker-control.test.ts",
+    "stdio:node": "bun build ../../../apps/code-worker/src/main.ts --outfile ../../../dist/code-worker-node/main.js --target node && node ../../../dist/code-worker-node/main.js --stdio",
+    "stdio:bun": "bun ../../../apps/code-worker/src/main.ts --stdio"
+  }
+}

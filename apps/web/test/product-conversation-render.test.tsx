@@ -1,0 +1,663 @@
+import { describe, expect, test } from "bun:test"
+import { renderToStaticMarkup } from "react-dom/server"
+import type {
+  ArtifactProjection,
+  PlanNodeProjection,
+  TaskProjection,
+} from "../../../packages/core/typed-api-client/src/index.ts"
+import type { WorkbenchRuntime } from "../src/app/runtime.ts"
+import type { TaskDetailState } from "../src/shell/workbench-controller.ts"
+import { ProductTaskDetail } from "../src/components/tasks/product-task-detail.tsx"
+
+function node(nodeId: string, status: string, metadata: Record<string, unknown> = {}): PlanNodeProjection {
+  return {
+    nodeId,
+    title: `Step ${nodeId}`,
+    description: `${nodeId} description`,
+    status,
+    dependsOn: [],
+    artifactIds: [],
+    metadata,
+  }
+}
+
+function artifact(artifactId: string): ArtifactProjection {
+  return {
+    artifactId,
+    kind: "code",
+    path: `out/${artifactId}.ts`,
+    mediaType: "text/plain",
+    metadata: {},
+  }
+}
+
+function task(overrides: Partial<TaskProjection> = {}): TaskProjection {
+  return {
+    taskId: "task_render_001",
+    runId: "run_render_001",
+    sessionId: "session_render_001",
+    rootNodeId: "node_root",
+    userGoal: "审查当前前端交互",
+    status: "running",
+    createdAt: "2026-08-04T00:00:00.000Z",
+    updatedAt: "2026-08-04T00:04:00.000Z",
+    planNodes: [
+      node("understand", "completed", { tool: "read_files" }),
+      node("implement", "running"),
+      node("verify", "pending"),
+    ],
+    artifacts: [artifact("artifact_one"), artifact("artifact_two")],
+    metadata: {},
+    binding: { taskId: "task_render_001", runId: "run_render_001" },
+    terminal: false,
+    active: true,
+    ...overrides,
+  }
+}
+
+function store<T>(value: T) {
+  const snapshot = () => value
+  return { subscribe: () => () => {}, getSnapshot: snapshot }
+}
+
+function fakeRuntime(options: {
+  activeSubmission?: { value: string; phase: string; taskId?: string }
+  queued?: readonly Record<string, unknown>[]
+  live?: boolean
+  assistant?: Record<string, unknown>
+  reasoning?: Record<string, unknown>
+  /** Canonical spine events the execution stream projects over. */
+  events?: readonly Record<string, unknown>[]
+} = {}): WorkbenchRuntime {
+  const events = options.events ?? []
+  return {
+    api: {
+      lifecycle: { inFlight: () => [] },
+      tasks: { artifactContent: async () => ({}) },
+    },
+    // The execution stream reads the canonical event spine through a projection
+    // selector; the stub returns the supplied events for any selector, which is
+    // all a static render needs.
+    projections: {
+      externalSelector: () => ({
+        subscribe: () => () => {},
+        getSnapshot: () => events,
+      }),
+    },
+    workbench: store({ transportEnabled: true }),
+    commands: store({
+      phase: "idle",
+      busy: false,
+      active: options.activeSubmission,
+      recent: [],
+      revision: 1,
+      enabled: true,
+    }),
+    queue: store({
+      entries: options.queued ?? [],
+      visible: options.queued ?? [],
+      pendingCount: (options.queued ?? []).length,
+      dispatchingCount: 0,
+    }),
+    liveSync: store({
+      live: options.live ?? true,
+      paused: false,
+      syncing: false,
+      consecutiveFailures: 0,
+      taskId: "task_render_001",
+      assistant: options.assistant,
+      reasoning: options.reasoning,
+      revision: 1,
+    }),
+    overlays: { open: () => {} },
+    router: { openTask: () => {}, openTasks: () => {} },
+    announcer: { announce: () => {} },
+  } as unknown as WorkbenchRuntime
+}
+
+function detailState(overrides: Partial<TaskDetailState> = {}): TaskDetailState {
+  const value = task()
+  return {
+    taskId: value.taskId,
+    phase: "ready",
+    task: value,
+    generation: 1,
+    ...overrides,
+  }
+}
+
+describe("product conversation rendering", () => {
+  test("renders the selected turn as an execution stream, not a chat bubble", () => {
+    const markup = renderToStaticMarkup(
+      <ProductTaskDetail runtime={fakeRuntime()} state={detailState()} tasks={[task()]} />,
+    )
+    expect(markup).toContain("执行流")
+    // The goal opens the stream.
+    expect(markup).toContain('class="stream-entry stream-entry-goal" data-kind="goal"')
+    expect(markup).toContain("审查当前前端交互")
+    expect(markup).toContain("实时更新中")
+  })
+
+  test("shows the final answer as a result row, not only the work that produced it", () => {
+    // The durable spine keeps digests only, so the answer has to come from the
+    // task projection.  Without this row the stream shows how the work was done
+    // but never what it produced.
+    const answered = task({ metadata: { final_answer: "已完成审查，共发现 2 处问题。" } })
+    const markup = renderToStaticMarkup(
+      <ProductTaskDetail
+        runtime={fakeRuntime()}
+        state={{ taskId: answered.taskId, task: answered, phase: "ready", generation: 1 }}
+        tasks={[answered]}
+      />,
+    )
+    expect(markup).toContain('data-kind="result"')
+    expect(markup).toContain("已完成审查，共发现 2 处问题。")
+    // The result row is the payoff and renders at reading size.
+    expect(markup).toContain("stream-entry-result-text")
+  })
+
+  test("folds internal run evidence out of the stream instead of listing it as artifacts", () => {
+    // Every run commits an evidence bundle (manifest, snapshot, transcript,
+    // trace, memory continuity).  Those are audit material, not deliverables.
+    const evidenced = task({
+      artifacts: [
+        { ...artifact("artifact_manifest"), kind: "structured_data", path: "evidence/manifest.json" },
+        { ...artifact("artifact_trace"), kind: "trace", path: "evidence/trace.json" },
+      ],
+    })
+    const markup = renderToStaticMarkup(
+      <ProductTaskDetail
+        runtime={fakeRuntime({
+          events: [
+            {
+              eventId: "e1", eventType: "runtime.artifact.committed", taskId: "task_render_001",
+              runId: "run_render_001", artifactIds: ["artifact_manifest", "artifact_trace"],
+              correlationId: "c1", mutationId: "m", sequence: 10, aggregateSequence: 1,
+              createdAt: "2026-08-04T00:05:00.000Z", committedAt: "2026-08-04T00:05:00.000Z",
+              summary: "artifact committed", terminal: false, effective: true, entityRefs: [],
+            },
+          ],
+        })}
+        state={detailState()}
+        tasks={[evidenced]}
+      />,
+    )
+    // Folded into one summary row rather than rendered as stream artifacts.
+    // The two committed artifacts collapse into a single stream row first
+    // (same tool call), so the folded count is per row, not per artifact.
+    expect(markup).toContain("运行证据已归档")
+    expect(markup).toContain("1 项")
+    expect(markup).not.toContain('data-kind="artifact"')
+  })
+
+  test("returns an artifact view to the execution stream, not to the conversation", () => {
+    const current = task()
+    const markup = renderToStaticMarkup(<ProductTaskDetail
+      runtime={fakeRuntime()}
+      state={{ taskId: current.taskId, task: current, phase: "ready", generation: 1 }}
+      tasks={[current]}
+      view="artifacts"
+    />)
+    expect(markup).toContain("会话交付物")
+    expect(markup).toContain("返回对话")
+    expect(markup).toContain("out/artifact_one.ts")
+    expect(markup).toContain('class="product-disclosure product-deliverables" open=""')
+    // The artifact view replaces the stream rather than rendering alongside it.
+    expect(markup).not.toContain('aria-label="执行流"')
+  })
+
+  test("projects spine events into ordered, typed stream rows", () => {
+    const markup = renderToStaticMarkup(
+      <ProductTaskDetail
+        runtime={fakeRuntime({
+          events: [
+            {
+              eventId: "e1", eventType: "runtime.tool.called", taskId: "task_render_001",
+              runId: "run_render_001", toolCallId: "call_1", nodeId: "node_x",
+              artifactIds: [], correlationId: "c1", mutationId: "m", sequence: 10,
+              aggregateSequence: 1, createdAt: "2026-08-04T00:05:00.000Z",
+              committedAt: "2026-08-04T00:05:00.000Z", summary: "file_edit: called",
+              terminal: false, effective: true, entityRefs: [],
+            },
+            {
+              eventId: "e2", eventType: "runtime.tool.succeeded", taskId: "task_render_001",
+              runId: "run_render_001", toolCallId: "call_1", nodeId: "node_x",
+              artifactIds: [], correlationId: "c1", mutationId: "m", sequence: 11,
+              aggregateSequence: 2, createdAt: "2026-08-04T00:05:12.000Z",
+              committedAt: "2026-08-04T00:05:12.000Z",
+              summary: "file_edit: Committed src/flask/blueprints.py through SandboxGateway",
+              terminal: false, effective: true, entityRefs: [],
+            },
+          ],
+        })}
+        state={detailState()}
+        tasks={[task()]}
+      />,
+    )
+    // One row per thing that happened: the call and its result collapse.
+    expect(markup).toContain('data-kind="tool"')
+    expect(markup).toContain('data-status="completed"')
+    expect(markup).toContain("file_edit")
+    expect(markup).toContain("Committed src/flask/blueprints.py")
+    // The settling event's timestamp yields a real duration.
+    expect(markup).toContain("12s")
+    // How many spine events folded into the row is not something a reader acts
+    // on, so the row states what happened and how long it took, and nothing
+    // about the bookkeeping behind it.
+    expect(markup).not.toContain("条记录")
+  })
+
+  test("drops bookkeeping rows that would only add noise", () => {
+    const markup = renderToStaticMarkup(
+      <ProductTaskDetail
+        runtime={fakeRuntime({
+          events: [
+            {
+              eventId: "e1", eventType: "runtime.node.created", taskId: "task_render_001",
+              runId: "run_render_001", nodeId: "node_x", artifactIds: [],
+              correlationId: "c1", mutationId: "m", sequence: 1, aggregateSequence: 1,
+              createdAt: "2026-08-04T00:00:00.000Z", committedAt: "2026-08-04T00:00:00.000Z",
+              summary: "Legacy node_created event normalized into the runtime event spine.",
+              terminal: false, effective: true, entityRefs: [],
+            },
+            {
+              eventId: "e2", eventType: "runtime.agent.message", taskId: "task_render_001",
+              runId: "run_render_001", artifactIds: [], correlationId: "c1",
+              mutationId: "m", sequence: 2, aggregateSequence: 2,
+              createdAt: "2026-08-04T00:00:01.000Z", committedAt: "2026-08-04T00:00:01.000Z",
+              summary: "running", terminal: false, effective: true, entityRefs: [],
+            },
+          ],
+        })}
+        state={detailState()}
+        tasks={[task()]}
+      />,
+    )
+    expect(markup).not.toContain("Legacy node_created")
+    expect(markup).toContain("等待执行输出")
+  })
+
+  test("keeps the transcript visible while a refresh is in flight or stale", () => {
+    const refreshing = renderToStaticMarkup(
+      <ProductTaskDetail
+        runtime={fakeRuntime()}
+        state={detailState({ syncing: true })}
+        tasks={[task()]}
+      />,
+    )
+    expect(refreshing).toContain("审查当前前端交互")
+    expect(refreshing).toContain('data-busy="true"')
+
+    const stale = renderToStaticMarkup(
+      <ProductTaskDetail
+        runtime={fakeRuntime()}
+        state={detailState({
+          staleSince: Date.now(),
+          failure: {
+            name: "TypeError",
+            message: "network disconnected",
+            retryable: true,
+            occurredAt: Date.now(),
+            attempt: 1,
+          },
+        })}
+        tasks={[task()]}
+      />,
+    )
+    expect(stale).toContain("审查当前前端交互")
+    expect(stale).toContain("最新状态暂时读取失败")
+  })
+
+  test("shows an in-flight message immediately instead of dropping it", () => {
+    const markup = renderToStaticMarkup(
+      <ProductTaskDetail
+        runtime={fakeRuntime({
+          activeSubmission: {
+            value: "再补充一个校验步骤",
+            phase: "dispatching",
+            taskId: "task_render_001",
+          },
+        })}
+        state={detailState()}
+        tasks={[task()]}
+      />,
+    )
+    expect(markup).toContain("再补充一个校验步骤")
+    expect(markup).toContain("正在提交给运行时")
+    expect(markup).toContain("product-turn-pending")
+  })
+
+  test("renders live text in the stream while it is still arriving", () => {
+    const assistant = {
+      messageId: "answer_render_001",
+      streamId: "stream_render_001",
+      text: "正在检查 blueprints.py 的注册路径",
+      generation: 1,
+      firstLiveSequence: 1,
+      lastLiveSequence: 4,
+      partial: false,
+      truncated: false,
+      settling: false,
+      startedAt: 1,
+      updatedAt: 2,
+    }
+    const markup = renderToStaticMarkup(
+      <ProductTaskDetail
+        runtime={fakeRuntime({ assistant })}
+        state={detailState()}
+        tasks={[task()]}
+      />,
+    )
+    expect(markup).toContain("正在检查 blueprints.py 的注册路径")
+    expect(markup).toContain("正在生成…")
+    expect(markup).toContain("stream-entry-live")
+  })
+
+  test("renders live reasoning on its own stream, separate from the answer", () => {
+    const stream = (messageId: string, text: string) => ({
+      messageId,
+      streamId: `${messageId}:stream`,
+      text,
+      generation: 1,
+      firstLiveSequence: 1,
+      lastLiveSequence: 4,
+      partial: false,
+      truncated: false,
+      settling: false,
+      startedAt: 1,
+      updatedAt: 2,
+    })
+    const markup = renderToStaticMarkup(
+      <ProductTaskDetail
+        runtime={fakeRuntime({
+          reasoning: stream("reasoning_render_001", "先确认 blueprints.py 的注册顺序"),
+          assistant: stream("answer_render_001", "正在检查注册路径"),
+        })}
+        state={detailState()}
+        tasks={[task()]}
+      />,
+    )
+    // Deliberation renders as its own typed row...
+    expect(markup).toContain('data-kind="thinking"')
+    expect(markup).toContain("先确认 blueprints.py 的注册顺序")
+    expect(markup).toContain("正在推理…")
+    // ...and the answer keeps its own row, so the two are never merged.
+    expect(markup).toContain('data-kind="message"')
+    expect(markup).toContain("正在检查注册路径")
+    expect(markup.indexOf("先确认 blueprints.py 的注册顺序"))
+      .toBeLessThan(markup.indexOf("正在检查注册路径"))
+  })
+
+  test("renders each round's narration as a text row, not an empty step", () => {
+    // The durable spine stores a machine sentence as the summary
+    // ("assistant_text_ended for task_x"); the text the agent actually wrote
+    // rides the event's inline presentation payload.  Without consuming it the
+    // stream shows tool calls and an answer and nothing the agent said, which
+    // is exactly why multi-round runs looked empty.
+    const markup = renderToStaticMarkup(
+      <ProductTaskDetail
+        runtime={fakeRuntime({
+          events: [
+            {
+              eventId: "e1", eventType: "runtime.text.ended", taskId: "task_render_001",
+              runId: "run_render_001", artifactIds: [], correlationId: "c1",
+              mutationId: "m", sequence: 10, aggregateSequence: 1,
+              createdAt: "2026-08-04T00:05:00.000Z", committedAt: "2026-08-04T00:05:00.000Z",
+              summary: "assistant_text_ended for task_render_001",
+              presentationText: "I'll start by inspecting the repository.",
+              terminal: false, effective: true, entityRefs: [],
+            },
+            {
+              eventId: "e2", eventType: "runtime.reasoning.ended", taskId: "task_render_001",
+              runId: "run_render_001", artifactIds: [], correlationId: "c1",
+              mutationId: "m", sequence: 11, aggregateSequence: 2,
+              createdAt: "2026-08-04T00:05:01.000Z", committedAt: "2026-08-04T00:05:01.000Z",
+              summary: "reasoning_ended for task_render_001",
+              presentationText: "The empty name is never validated.",
+              terminal: false, effective: true, entityRefs: [],
+            },
+          ],
+        })}
+        state={detailState()}
+        tasks={[task()]}
+      />,
+    )
+    expect(markup).toContain("I&#x27;ll start by inspecting the repository.")
+    expect(markup).toContain('data-kind="message"')
+    expect(markup).toContain('data-kind="thinking"')
+    expect(markup).toContain("The empty name is never validated.")
+    // The machine summary must never be what a reader sees.
+    expect(markup).not.toContain("assistant_text_ended for")
+  })
+
+  test("reports how long each round thought, from the block's own start and end", () => {
+    // Reasoning emits started then ended around one block.  The ending event
+    // carries the text but not the duration, so the gap has to be computed
+    // from the pair -- without it a reader sees what was thought but not the
+    // 7s it took, which is the figure a transcript leads with.
+    const markup = renderToStaticMarkup(
+      <ProductTaskDetail
+        runtime={fakeRuntime({
+          events: [
+            {
+              eventId: "e1", eventType: "runtime.reasoning.started", taskId: "task_render_001",
+              runId: "run_render_001", artifactIds: [], correlationId: "c1",
+              mutationId: "m", sequence: 10, aggregateSequence: 1,
+              createdAt: "2026-08-04T00:05:00.000Z", committedAt: "2026-08-04T00:05:00.000Z",
+              summary: "reasoning_started for task_render_001",
+              terminal: false, effective: true, entityRefs: [],
+            },
+            {
+              eventId: "e2", eventType: "runtime.reasoning.ended", taskId: "task_render_001",
+              runId: "run_render_001", artifactIds: [], correlationId: "c1",
+              mutationId: "m", sequence: 11, aggregateSequence: 2,
+              createdAt: "2026-08-04T00:05:07.000Z", committedAt: "2026-08-04T00:05:07.000Z",
+              summary: "reasoning_ended for task_render_001",
+              presentationText: "The empty name is never validated.",
+              terminal: false, effective: true, entityRefs: [],
+            },
+          ],
+        })}
+        state={detailState()}
+        tasks={[task()]}
+      />,
+    )
+    expect(markup).toContain("思考了 7s")
+  })
+
+  test("omits the duration when a block has no matching start", () => {
+    // A replay may carry only the ending event.  Reporting a duration then
+    // would invent one; the row is still shown, just without a figure.
+    const markup = renderToStaticMarkup(
+      <ProductTaskDetail
+        runtime={fakeRuntime({
+          events: [
+            {
+              eventId: "e1", eventType: "runtime.reasoning.ended", taskId: "task_render_001",
+              runId: "run_render_001", artifactIds: [], correlationId: "c1",
+              mutationId: "m", sequence: 11, aggregateSequence: 1,
+              createdAt: "2026-08-04T00:05:07.000Z", committedAt: "2026-08-04T00:05:07.000Z",
+              summary: "reasoning_ended for task_render_001",
+              presentationText: "Only the ending survived.",
+              terminal: false, effective: true, entityRefs: [],
+            },
+          ],
+        })}
+        state={detailState()}
+        tasks={[task()]}
+      />,
+    )
+    expect(markup).toContain("Only the ending survived.")
+    expect(markup).not.toContain("思考了")
+  })
+
+  test("collapses one round's parallel tool calls into a single row", () => {
+    // A round issues its calls as a batch, so two commands run at once produced
+    // two rows reading "shell · 6s · 2 条记录" side by side -- identical to a
+    // reader, because per-call arguments are digested away.  The batch is shown
+    // once, with its count.
+    const toolCall = (id: string, sequence: number, type: string) => ({
+      eventId: `e${sequence}`, eventType: type, taskId: "task_render_001",
+      runId: "run_render_001", toolCallId: id, artifactIds: [], correlationId: "c1",
+      mutationId: "m", sequence, aggregateSequence: sequence,
+      createdAt: `2026-08-04T00:05:0${sequence}.000Z`,
+      committedAt: `2026-08-04T00:05:0${sequence}.000Z`,
+      summary: type.endsWith("called") ? "shell: called" : "shell: Sandbox command completed",
+      terminal: false, effective: true, entityRefs: [],
+    })
+    const markup = renderToStaticMarkup(
+      <ProductTaskDetail
+        runtime={fakeRuntime({
+          events: [
+            toolCall("call_00_a", 1, "runtime.tool.called"),
+            toolCall("call_01_b", 2, "runtime.tool.called"),
+            toolCall("call_00_a", 3, "runtime.tool.succeeded"),
+            toolCall("call_01_b", 4, "runtime.tool.succeeded"),
+          ],
+        })}
+        state={detailState()}
+        tasks={[task()]}
+      />,
+    )
+    // One row for the batch, not two identical ones.
+    expect(markup).toContain("shell ×2")
+    expect(markup.match(/data-kind="tool"/g)?.length).toBe(1)
+  })
+
+  test("keeps a tool row's detail to the outcome, not the call", () => {
+    // "shell: called" only echoes the title; the settled line carries the news.
+    const markup = renderToStaticMarkup(
+      <ProductTaskDetail
+        runtime={fakeRuntime({
+          events: [
+            {
+              eventId: "e1", eventType: "runtime.tool.called", taskId: "task_render_001",
+              runId: "run_render_001", toolCallId: "call_only", artifactIds: [],
+              correlationId: "c1", mutationId: "m", sequence: 1, aggregateSequence: 1,
+              createdAt: "2026-08-04T00:05:00.000Z", committedAt: "2026-08-04T00:05:00.000Z",
+              summary: "shell: called", terminal: false, effective: true, entityRefs: [],
+            },
+            {
+              eventId: "e2", eventType: "runtime.tool.succeeded", taskId: "task_render_001",
+              runId: "run_render_001", toolCallId: "call_only", artifactIds: [],
+              correlationId: "c1", mutationId: "m", sequence: 2, aggregateSequence: 2,
+              createdAt: "2026-08-04T00:05:06.000Z", committedAt: "2026-08-04T00:05:06.000Z",
+              summary: "shell: Sandbox command completed",
+              terminal: false, effective: true, entityRefs: [],
+            },
+          ],
+        })}
+        state={detailState()}
+        tasks={[task()]}
+      />,
+    )
+    expect(markup).toContain("Sandbox command completed")
+    // The phase word must not be shown as if it were the outcome.
+    expect(markup).not.toContain("shell: called")
+  })
+
+  test("renders the model's Markdown instead of showing it as source", () => {
+    // The model writes Markdown, so its narration and the final answer have to
+    // be rendered.  Showing the source put "## Root cause" and a row of
+    // backticks on the page, which is what a reader sees when the renderer is
+    // bypassed.
+    const answer = [
+      "## Root cause",
+      "",
+      "`Blueprint.__init__` accepted an empty name.",
+      "",
+      "```python",
+      "if not name:",
+      '    raise ValueError("empty")',
+      "```",
+    ].join("\n")
+    const markup = renderToStaticMarkup(
+      <ProductTaskDetail
+        runtime={fakeRuntime({
+          events: [
+            {
+              eventId: "e1", eventType: "runtime.text.ended", taskId: "task_render_001",
+              runId: "run_render_001", artifactIds: [], correlationId: "c1",
+              mutationId: "m", sequence: 10, aggregateSequence: 1,
+              createdAt: "2026-08-04T00:05:00.000Z", committedAt: "2026-08-04T00:05:00.000Z",
+              summary: "assistant_text_ended for task_render_001",
+              presentationText: answer,
+              terminal: false, effective: true, entityRefs: [],
+            },
+          ],
+        })}
+        state={detailState()}
+        tasks={[task({ metadata: { final_answer: answer } })]}
+      />,
+    )
+    // The heading and code block became elements...
+    expect(markup).toContain("<h2>Root cause</h2>")
+    expect(markup).toContain("<code>")
+    // ...and the source syntax is gone.
+    expect(markup).not.toContain("## Root cause")
+    expect(markup).not.toContain("```")
+  })
+
+  test("renders empty, missing, and failed states without a task projection", () => {
+    expect(renderToStaticMarkup(
+      <ProductTaskDetail runtime={fakeRuntime()} state={{ phase: "idle", generation: 0 }} />,
+    )).toContain("选择一个任务")
+
+    expect(renderToStaticMarkup(
+      <ProductTaskDetail
+        runtime={fakeRuntime()}
+        state={{ taskId: "task_gone", phase: "not-found", generation: 1 }}
+      />,
+    )).toContain("没有找到任务")
+
+    const failed = renderToStaticMarkup(
+      <ProductTaskDetail
+        runtime={fakeRuntime()}
+        state={{
+          taskId: "task_broken",
+          phase: "error",
+          generation: 1,
+          failure: {
+            name: "TypeError",
+            message: "network disconnected",
+            retryable: true,
+            occurredAt: 1,
+            attempt: 1,
+          },
+        }}
+      />,
+    )
+    expect(failed).toContain("暂时无法读取任务")
+    expect(failed).toContain("重试")
+
+    expect(renderToStaticMarkup(
+      <ProductTaskDetail
+        runtime={fakeRuntime()}
+        state={{ taskId: "task_loading", phase: "loading", generation: 1 }}
+      />,
+    )).toContain("正在载入会话")
+  })
+
+  test("keeps earlier turns reachable below the live stream", () => {
+    const first = task({
+      taskId: "task_render_000",
+      status: "completed",
+      terminal: true,
+      active: false,
+      createdAt: "2026-08-03T00:00:00.000Z",
+      updatedAt: "2026-08-03T00:10:00.000Z",
+      metadata: { final_answer: "第一轮已经回答完毕。" },
+    })
+    const markup = renderToStaticMarkup(
+      <ProductTaskDetail
+        runtime={fakeRuntime()}
+        state={detailState()}
+        tasks={[first, task()]}
+      />,
+    )
+    // The stream owns the selected turn; the earlier turn stays reachable so a
+    // follow-up task does not hide the work that produced its input.
+    expect(markup).toContain('class="execution-stream"')
+    expect(markup).toContain("第一轮已经回答完毕。")
+  })
+})

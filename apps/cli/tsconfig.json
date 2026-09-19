@@ -1,0 +1,15 @@
+{
+  "extends": "../../tsconfig.base.json",
+  "compilerOptions": {
+    "allowImportingTsExtensions": true,
+    "lib": ["ES2022", "DOM", "DOM.Iterable"],
+    "noEmit": true,
+    "rootDir": "../..",
+    "types": ["bun", "node"]
+  },
+  "include": [
+    "src/**/*.ts",
+    "test/**/*.ts",
+    "../../scripts/product_tui_smoke.ts"
+  ]
+}

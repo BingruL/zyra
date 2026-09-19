@@ -1,0 +1,1918 @@
+import assert from "node:assert/strict";
+import { mkdtempSync, rmSync } from "node:fs";
+import { createServer, type IncomingHttpHeaders, type Server } from "node:http";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import test, { type TestContext } from "node:test";
+import {
+  InMemorySecretResolver,
+  ProviderControlPlane,
+  ProviderControlPlaneError,
+  ProviderStreamSupervisor,
+  SequenceIdFactory,
+  fingerprintSecret,
+  type ProviderDispatchRequest,
+  type ProviderRouteLease,
+  type ProviderStreamFrame,
+  type RouteRequest,
+  type TransportProtocol,
+} from "../src/index.ts";
+import { ProviderControlPlaneRpcServer, RPC_PROTOCOL } from "../src/stdio-server.ts";
+import { ProviderTransportRuntime } from "../src/transport/runtime.ts";
+import {
+  DEEPSEEK_API_KEY_ENV,
+  DEEPSEEK_CREDENTIAL_ID,
+  DEEPSEEK_ENABLED_ENV,
+  DEEPSEEK_PROVIDER_ID,
+  DEEPSEEK_FLASH_MODEL_ID,
+  deepSeekFlashProfile,
+  installDeepSeekFlashProfile,
+} from "../src/profiles/deepseek.ts";
+import {
+  KIMI_API_KEY_ENV,
+  KIMI_ENABLED_ENV,
+  KIMI_PLATFORM_CREDENTIAL_ID,
+  KIMI_PLATFORM_PROVIDER_ID,
+  KIMI_K27_CODE_MODEL_ID,
+  installKimiK27CodeProfile,
+  kimiK27CodeProfile,
+} from "../src/profiles/kimi-platform.ts";
+import {
+  GLM_ENABLED_ENV,
+  GLM_52_MODEL_ID,
+  ZAI_API_KEY_ENV,
+  ZHIPU_CREDENTIAL_ID,
+  ZHIPU_PROVIDER_ID,
+  glm52Profile,
+  installGlm52Profile,
+} from "../src/profiles/zhipu.ts";
+
+interface CapturedRequest {
+  readonly url: string;
+  readonly method: string;
+  readonly headers: IncomingHttpHeaders;
+  readonly body: string;
+}
+
+interface CaptureServer {
+  readonly server: Server;
+  readonly baseUrl: string;
+  readonly requests: CapturedRequest[];
+  close(): Promise<void>;
+}
+
+async function captureServer(
+  responder: (request: CapturedRequest, response: import("node:http").ServerResponse) => void,
+): Promise<CaptureServer> {
+  const requests: CapturedRequest[] = [];
+  const server = createServer((request, response) => {
+    const chunks: Buffer[] = [];
+    request.on("data", (chunk: Buffer) => chunks.push(chunk));
+    request.on("end", () => {
+      const captured: CapturedRequest = {
+        url: request.url ?? "",
+        method: request.method ?? "",
+        headers: request.headers,
+        body: Buffer.concat(chunks).toString("utf8"),
+      };
+      requests.push(captured);
+      responder(captured, response);
+    });
+  });
+  await new Promise<void>((resolve, reject) => {
+    server.once("error", reject);
+    server.listen(0, "127.0.0.1", () => resolve());
+  });
+  const address = server.address();
+  if (address === null || typeof address === "string") throw new Error("capture server has no TCP address");
+  return {
+    server,
+    baseUrl: `http://127.0.0.1:${address.port}`,
+    requests,
+    close: () => new Promise<void>((resolve, reject) => server.close((error) => error ? reject(error) : resolve())),
+  };
+}
+
+function makeControlPlane(
+  t: TestContext,
+  options: {
+    readonly clock?: { now(): number };
+    readonly routeLeaseMilliseconds?: number;
+    readonly frameObserver?: (frames: readonly ProviderStreamFrame[]) => void | Promise<void>;
+  } = {},
+): { controlPlane: ProviderControlPlane; secrets: InMemorySecretResolver } {
+  const directory = mkdtempSync(join(tmpdir(), "zyra-provider-control-"));
+  const secrets = new InMemorySecretResolver();
+  const controlPlane = new ProviderControlPlane({
+    databasePath: join(directory, "provider.sqlite3"),
+    secrets,
+    ids: new SequenceIdFactory("test"),
+    clock: options.clock,
+    route: { leaseMilliseconds: options.routeLeaseMilliseconds ?? 60_000 },
+    ...(options.frameObserver
+      ? { transport: { frameObserver: options.frameObserver } }
+      : {}),
+  });
+  t.after(() => {
+    controlPlane.close();
+    rmSync(directory, { recursive: true, force: true });
+  });
+  return { controlPlane, secrets };
+}
+
+test("DeepSeek Flash profile binds an environment reference without persisting secret bytes", (t) => {
+  const { controlPlane } = makeControlPlane(t);
+  const secret = "deepseek-test-secret";
+  const installed = installDeepSeekFlashProfile(controlPlane, {
+    [DEEPSEEK_API_KEY_ENV]: secret,
+  });
+  const profile = deepSeekFlashProfile();
+
+  assert.equal(profile.provider.baseUrl, "https://api.deepseek.com");
+  assert.equal(profile.provider.protocol, "openai_chat");
+  assert.deepEqual(profile.provider.allowedHosts, ["api.deepseek.com"]);
+  assert.equal(profile.provider.metadata.routing_priority, 300);
+  assert.equal(profile.model.modelId, "deepseek-flash");
+  assert.equal(profile.model.displayName, "DeepSeek Flash");
+  assert.equal(profile.model.releasedAt, Date.UTC(2026, 3, 24));
+  assert.equal(profile.model.metadata.model_version, "DeepSeek-Flash");
+  assert.deepEqual(profile.model.pricing, [{
+    inputPerMillion: 0.14,
+    outputPerMillion: 0.28,
+    cachedInputPerMillion: 0.0028,
+    currency: "USD",
+  }]);
+  assert.equal(profile.model.endpointPath, "/chat/completions");
+  assert.equal(profile.provider.requestDefaults.thinking, undefined);
+  assert.deepEqual(profile.model.requestDefaults.thinking, { type: "enabled" });
+  assert.equal(profile.model.requestDefaults.reasoning_effort, "high");
+  assert.deepEqual(profile.model.supportedReasoningEfforts, ["low", "high", "max"]);
+  assert.equal(installed.credential.credentialId, DEEPSEEK_CREDENTIAL_ID);
+  assert.equal(installed.credential.secretRef, `env://${DEEPSEEK_API_KEY_ENV}`);
+  assert.notEqual(installed.credential.fingerprint, secret);
+  assert.equal(JSON.stringify(controlPlane.catalog.snapshot()).includes(secret), false);
+  assert.equal(JSON.stringify(controlPlane.credentials.list()).includes(secret), false);
+});
+
+test("configured profile reconciles a persisted credential after its model changes", (t) => {
+  const { controlPlane } = makeControlPlane(t);
+  const secret = "deepseek-test-secret";
+  const profile = deepSeekFlashProfile();
+  controlPlane.upsertIntegration(profile.integration);
+  controlPlane.upsertProvider(profile.provider);
+  controlPlane.upsertModel(profile.model);
+  const legacy = controlPlane.registerCredential({
+    credentialId: DEEPSEEK_CREDENTIAL_ID,
+    integrationId: profile.integration.integrationId,
+    providerId: profile.provider.providerId,
+    accountId: "deepseek-local-test",
+    secretRef: `env://${DEEPSEEK_API_KEY_ENV}`,
+    fingerprint: fingerprintSecret(secret),
+    priority: 20,
+    allowedModels: ["deepseek-pro"],
+    scopes: ["chat.completions"],
+    expiresAt: 9_999_999,
+    refreshAfter: 8_888_888,
+    metadata: {
+      purpose: "legacy-live-provider",
+      secret_material_persisted: false,
+    },
+  });
+
+  const migrated = installDeepSeekFlashProfile(controlPlane, {
+    [DEEPSEEK_API_KEY_ENV]: secret,
+  }).credential;
+  assert.equal(migrated.version, legacy.version + 1);
+  assert.equal(migrated.priority, 100);
+  assert.deepEqual(migrated.allowedModels, [DEEPSEEK_FLASH_MODEL_ID]);
+  assert.deepEqual(migrated.scopes, ["chat.completions"]);
+  assert.equal(migrated.expiresAt, null);
+  assert.equal(migrated.refreshAfter, null);
+  assert.equal(migrated.metadata.purpose, "live-provider-smoke");
+  assert.equal(
+    controlPlane.credentials.select({
+      providerId: DEEPSEEK_PROVIDER_ID,
+      modelId: DEEPSEEK_FLASH_MODEL_ID,
+      requiredScopes: ["chat.completions"],
+    }).credentialId,
+    DEEPSEEK_CREDENTIAL_ID,
+  );
+  assert.throws(
+    () => controlPlane.credentials.select({
+      providerId: DEEPSEEK_PROVIDER_ID,
+      modelId: "deepseek-pro",
+      requiredScopes: ["chat.completions"],
+    }),
+    (error: unknown) => error instanceof ProviderControlPlaneError && error.kind === "credential_missing",
+  );
+
+  const repeated = installDeepSeekFlashProfile(controlPlane, {
+    [DEEPSEEK_API_KEY_ENV]: secret,
+  }).credential;
+  assert.equal(repeated.version, migrated.version);
+});
+
+test("DeepSeek Flash profile fails closed when its environment secret is absent", (t) => {
+  const { controlPlane } = makeControlPlane(t);
+  assert.throws(
+    () => installDeepSeekFlashProfile(controlPlane, {}),
+    new RegExp(`${DEEPSEEK_API_KEY_ENV} is required`),
+  );
+  assert.deepEqual(controlPlane.catalog.providers(), []);
+  assert.deepEqual(controlPlane.credentials.list(), []);
+});
+
+test("Kimi Open Platform K2.7 Code profile keeps thinking enabled and persists only an environment reference", (t) => {
+  const { controlPlane } = makeControlPlane(t);
+  const secret = "kimi-platform-test-secret";
+  const installed = installKimiK27CodeProfile(controlPlane, {
+    [KIMI_API_KEY_ENV]: secret,
+  });
+  const profile = kimiK27CodeProfile();
+
+  assert.equal(profile.provider.baseUrl, "https://api.moonshot.cn/v1");
+  assert.equal(profile.provider.protocol, "openai_chat");
+  assert.deepEqual(profile.provider.allowedHosts, ["api.moonshot.cn"]);
+  assert.equal(profile.provider.metadata.routing_priority, 100);
+  assert.equal(profile.model.modelId, "kimi-k2.7-code");
+  assert.equal(profile.model.contextWindow, 262_144);
+  assert.equal(profile.model.endpointPath, "/chat/completions");
+  assert.deepEqual(profile.model.requestDefaults.thinking, { type: "enabled" });
+  assert.equal(installed.credential.credentialId, KIMI_PLATFORM_CREDENTIAL_ID);
+  assert.equal(installed.credential.secretRef, `env://${KIMI_API_KEY_ENV}`);
+  assert.notEqual(installed.credential.fingerprint, secret);
+  assert.equal(JSON.stringify(controlPlane.catalog.snapshot()).includes(secret), false);
+  assert.equal(JSON.stringify(controlPlane.credentials.list()).includes(secret), false);
+});
+
+test("Kimi Open Platform K2.7 Code profile fails closed when its environment secret is absent", (t) => {
+  const { controlPlane } = makeControlPlane(t);
+  assert.throws(
+    () => installKimiK27CodeProfile(controlPlane, {}),
+    new RegExp(`${KIMI_API_KEY_ENV} is required`),
+  );
+  assert.deepEqual(controlPlane.catalog.providers(), []);
+  assert.deepEqual(controlPlane.credentials.list(), []);
+});
+
+test("Zhipu AI GLM-5.2 profile enables reasoning and persists only an environment reference", (t) => {
+  const { controlPlane } = makeControlPlane(t);
+  const secret = "zhipu-test-secret";
+  const installed = installGlm52Profile(controlPlane, {
+    [ZAI_API_KEY_ENV]: secret,
+  });
+  const profile = glm52Profile();
+
+  assert.equal(profile.provider.baseUrl, "https://open.bigmodel.cn/api/paas/v4");
+  assert.equal(profile.provider.protocol, "openai_chat");
+  assert.deepEqual(profile.provider.allowedHosts, ["open.bigmodel.cn"]);
+  assert.equal(profile.provider.metadata.routing_priority, 200);
+  assert.equal(profile.model.modelId, GLM_52_MODEL_ID);
+  assert.equal(profile.model.contextWindow, 1_000_000);
+  assert.equal(profile.model.maximumOutputTokens, 131_072);
+  assert.equal(profile.model.endpointPath, "/chat/completions");
+  assert.deepEqual(profile.model.requestDefaults.thinking, { type: "enabled" });
+  assert.equal(profile.model.requestDefaults.reasoning_effort, "max");
+  assert.deepEqual(profile.model.supportedReasoningEfforts, ["none", "minimal", "low", "medium", "high", "xhigh", "max"]);
+  assert.equal(installed.credential.credentialId, ZHIPU_CREDENTIAL_ID);
+  assert.equal(installed.credential.secretRef, `env://${ZAI_API_KEY_ENV}`);
+  assert.notEqual(installed.credential.fingerprint, secret);
+  assert.equal(JSON.stringify(controlPlane.catalog.snapshot()).includes(secret), false);
+  assert.equal(JSON.stringify(controlPlane.credentials.list()).includes(secret), false);
+});
+
+test("Zhipu AI GLM-5.2 profile fails closed when its environment secret is absent", (t) => {
+  const { controlPlane } = makeControlPlane(t);
+  assert.throws(
+    () => installGlm52Profile(controlPlane, {}),
+    new RegExp(`${ZAI_API_KEY_ENV} is required`),
+  );
+  assert.deepEqual(controlPlane.catalog.providers(), []);
+  assert.deepEqual(controlPlane.credentials.list(), []);
+});
+
+test("default provider routing prefers DeepSeek, then GLM, with Kimi last", (t) => {
+  const { controlPlane } = makeControlPlane(t);
+  installGlm52Profile(controlPlane, { [ZAI_API_KEY_ENV]: "zhipu-secret" });
+  installKimiK27CodeProfile(controlPlane, { [KIMI_API_KEY_ENV]: "kimi-secret" });
+  installDeepSeekFlashProfile(controlPlane, {
+    [DEEPSEEK_API_KEY_ENV]: "deepseek-secret",
+  });
+
+  const unconstrained: RouteRequest = {
+    ...routeRequest(ZHIPU_PROVIDER_ID, GLM_52_MODEL_ID),
+    preferredProviderId: null,
+    preferredModelId: null,
+    routeHint: null,
+  };
+  const first = controlPlane.acquireRoute(unconstrained);
+  assert.equal(first.providerId, DEEPSEEK_PROVIDER_ID);
+  assert.equal(first.modelId, DEEPSEEK_FLASH_MODEL_ID);
+
+  const withoutDeepSeek: RouteRequest = {
+    ...unconstrained,
+    turnId: "turn-without-deepseek",
+    constraints: {
+      ...unconstrained.constraints,
+      providerIds: [KIMI_PLATFORM_PROVIDER_ID, ZHIPU_PROVIDER_ID],
+      modelIds: [KIMI_K27_CODE_MODEL_ID, GLM_52_MODEL_ID],
+    },
+  };
+  const second = controlPlane.acquireRoute(withoutDeepSeek);
+  assert.equal(second.providerId, ZHIPU_PROVIDER_ID);
+  assert.equal(second.modelId, GLM_52_MODEL_ID);
+});
+
+test("RPC server fails closed when the provider control-plane owner is disabled", async (t) => {
+  const { controlPlane } = makeControlPlane(t);
+  const server = new ProviderControlPlaneRpcServer(controlPlane);
+  const previous = process.env.ZYRA_PROVIDER_CONTROL_PLANE_DISABLED;
+  const restore = () => {
+    if (previous === undefined) delete process.env.ZYRA_PROVIDER_CONTROL_PLANE_DISABLED;
+    else process.env.ZYRA_PROVIDER_CONTROL_PLANE_DISABLED = previous;
+  };
+  process.env.ZYRA_PROVIDER_CONTROL_PLANE_DISABLED = "true";
+
+  const response = await server.handle({
+    protocol: RPC_PROTOCOL,
+    requestId: "provider-owner-disconnect",
+    operation: "health",
+    payload: {},
+  });
+  restore();
+
+  assert.equal(response.ok, false);
+  assert.equal(response.error?.code, "provider_control_plane_disabled");
+});
+
+test("RPC installs configured live profiles in the fixed preference order without secret bytes", async (t) => {
+  const { controlPlane } = makeControlPlane(t);
+  const server = new ProviderControlPlaneRpcServer(controlPlane);
+  const names = [
+    DEEPSEEK_API_KEY_ENV,
+    ZAI_API_KEY_ENV,
+    KIMI_API_KEY_ENV,
+    DEEPSEEK_ENABLED_ENV,
+    GLM_ENABLED_ENV,
+    KIMI_ENABLED_ENV,
+  ] as const;
+  const previous = new Map(names.map((name) => [name, process.env[name]]));
+  const restore = () => {
+    for (const name of names) {
+      const value = previous.get(name);
+      if (value === undefined) delete process.env[name];
+      else process.env[name] = value;
+    }
+  };
+  process.env[ZAI_API_KEY_ENV] = "configured-glm-secret";
+  process.env[DEEPSEEK_API_KEY_ENV] = "configured-deepseek-secret";
+  process.env[KIMI_API_KEY_ENV] = "configured-kimi-secret";
+  process.env[DEEPSEEK_ENABLED_ENV] = "true";
+  process.env[GLM_ENABLED_ENV] = "true";
+  process.env[KIMI_ENABLED_ENV] = "true";
+
+  const response = await server.handle({
+    protocol: RPC_PROTOCOL,
+    requestId: "install-configured-profiles",
+    operation: "profiles.install_configured",
+    payload: {},
+  });
+  restore();
+
+  assert.equal(response.ok, true, JSON.stringify(response.error));
+  const result = response.result as {
+    installed: Array<Record<string, unknown>>;
+    preferenceOrder: string[];
+    secretBytesIncluded: boolean;
+  };
+  assert.deepEqual(
+    result.installed.map((item) => `${item.providerId}/${item.modelId}`),
+    [
+      `${DEEPSEEK_PROVIDER_ID}/${DEEPSEEK_FLASH_MODEL_ID}`,
+      `${ZHIPU_PROVIDER_ID}/${GLM_52_MODEL_ID}`,
+      `${KIMI_PLATFORM_PROVIDER_ID}/${KIMI_K27_CODE_MODEL_ID}`,
+    ],
+  );
+  assert.deepEqual(result.preferenceOrder, [
+    `${DEEPSEEK_PROVIDER_ID}/${DEEPSEEK_FLASH_MODEL_ID}`,
+    `${ZHIPU_PROVIDER_ID}/${GLM_52_MODEL_ID}`,
+    `${KIMI_PLATFORM_PROVIDER_ID}/${KIMI_K27_CODE_MODEL_ID}`,
+  ]);
+  assert.equal(result.secretBytesIncluded, false);
+  const serialized = JSON.stringify(response);
+  assert.equal(serialized.includes("configured-glm-secret"), false);
+  assert.equal(serialized.includes("configured-deepseek-secret"), false);
+  assert.equal(serialized.includes("configured-kimi-secret"), false);
+});
+
+test("RPC disables retained GLM and Kimi profiles when their switches are off", async (t) => {
+  const { controlPlane } = makeControlPlane(t);
+  const server = new ProviderControlPlaneRpcServer(controlPlane);
+  const names = [
+    DEEPSEEK_API_KEY_ENV,
+    ZAI_API_KEY_ENV,
+    KIMI_API_KEY_ENV,
+    DEEPSEEK_ENABLED_ENV,
+    GLM_ENABLED_ENV,
+    KIMI_ENABLED_ENV,
+  ] as const;
+  const previous = new Map(names.map((name) => [name, process.env[name]]));
+  t.after(() => {
+    for (const name of names) {
+      const value = previous.get(name);
+      if (value === undefined) delete process.env[name];
+      else process.env[name] = value;
+    }
+  });
+  process.env[DEEPSEEK_API_KEY_ENV] = "retained-deepseek-secret";
+  process.env[ZAI_API_KEY_ENV] = "retained-glm-secret";
+  process.env[KIMI_API_KEY_ENV] = "retained-kimi-secret";
+  process.env[DEEPSEEK_ENABLED_ENV] = "true";
+  process.env[GLM_ENABLED_ENV] = "false";
+  process.env[KIMI_ENABLED_ENV] = "false";
+
+  const response = await server.handle({
+    protocol: RPC_PROTOCOL,
+    requestId: "disable-configured-profiles",
+    operation: "profiles.install_configured",
+    payload: {},
+  });
+
+  assert.equal(response.ok, true, JSON.stringify(response.error));
+  const result = response.result as {
+    installed: Array<Record<string, unknown>>;
+    disabled: Array<Record<string, unknown>>;
+    preferenceOrder: string[];
+  };
+  assert.deepEqual(
+    result.installed.map((item) => `${item.providerId}/${item.modelId}`),
+    [`${DEEPSEEK_PROVIDER_ID}/${DEEPSEEK_FLASH_MODEL_ID}`],
+  );
+  assert.deepEqual(
+    result.disabled.map((item) => `${item.providerId}/${item.modelId}`),
+    [
+      `${ZHIPU_PROVIDER_ID}/${GLM_52_MODEL_ID}`,
+      `${KIMI_PLATFORM_PROVIDER_ID}/${KIMI_K27_CODE_MODEL_ID}`,
+    ],
+  );
+  assert.deepEqual(result.preferenceOrder, [
+    `${DEEPSEEK_PROVIDER_ID}/${DEEPSEEK_FLASH_MODEL_ID}`,
+  ]);
+  assert.deepEqual(
+    controlPlane.catalog.models({ availableOnly: true }).map(
+      (model) => `${model.providerId}/${model.modelId}`,
+    ),
+    [`${DEEPSEEK_PROVIDER_ID}/${DEEPSEEK_FLASH_MODEL_ID}`],
+  );
+});
+
+function installProvider(
+  controlPlane: ProviderControlPlane,
+  secrets: InMemorySecretResolver,
+  input: {
+    readonly providerId: string;
+    readonly modelId: string;
+    readonly baseUrl: string;
+    readonly protocol: TransportProtocol;
+    readonly endpointPath?: string;
+    readonly secret?: string;
+    readonly releasedAt?: number;
+  },
+): string {
+  const integrationId = `${input.providerId}-integration`;
+  const secretRef = `memory://${input.providerId}`;
+  const secret = input.secret ?? `${input.providerId}-secret`;
+  secrets.put(secretRef, { value: secret });
+  controlPlane.upsertIntegration({
+    integrationId,
+    displayName: integrationId,
+    kind: "bearer",
+    envNames: [],
+    headerName: null,
+    authorizationScheme: "Bearer",
+    supportsRefresh: false,
+    metadata: {},
+  });
+  controlPlane.upsertProvider({
+    providerId: input.providerId,
+    displayName: input.providerId,
+    integrationId,
+    status: "active",
+    baseUrl: input.baseUrl,
+    protocol: input.protocol,
+    defaultHeaders: { "x-zyra-provider": input.providerId },
+    requestDefaults: {},
+    allowedHosts: [new URL(input.baseUrl).hostname],
+    tags: ["test"],
+    metadata: {},
+  });
+  controlPlane.upsertModel({
+    providerId: input.providerId,
+    modelId: input.modelId,
+    displayName: input.modelId,
+    family: "test",
+    status: "active",
+    enabled: true,
+    releasedAt: input.releasedAt ?? 1,
+    contextWindow: 32_000,
+    maximumOutputTokens: 4_096,
+    capabilities: {
+      input: ["text"],
+      output: ["text", "tool"],
+      tools: true,
+      streaming: true,
+      reasoning: true,
+      structuredOutput: true,
+    },
+    pricing: [],
+    endpointPath: input.endpointPath ?? null,
+    protocol: null,
+    requestDefaults: {},
+    tags: [],
+    metadata: {},
+  });
+  const credential = controlPlane.registerCredential({
+    integrationId,
+    providerId: input.providerId,
+    accountId: `${input.providerId}-account`,
+    secretRef,
+    fingerprint: fingerprintSecret(secret),
+  });
+  return credential.credentialId;
+}
+
+function routeRequest(providerId: string, modelId: string, turnId = "turn-1"): RouteRequest {
+  return {
+    runId: "run-1",
+    taskId: "task-1",
+    nodeId: "node-1",
+    sessionId: "session-1",
+    turnId,
+    purpose: "reason",
+    preferredProviderId: providerId,
+    preferredModelId: modelId,
+    routeHint: `${providerId}/${modelId}`,
+    constraints: {
+      providerIds: [],
+      modelIds: [],
+      requiredInput: ["text"],
+      requiredOutput: ["text"],
+      requireTools: false,
+      requireStreaming: true,
+      minimumContextWindow: 1_000,
+      maximumInputPricePerMillion: null,
+      maximumOutputPricePerMillion: null,
+      excludedCredentialIds: [],
+      requiredScopes: [],
+    },
+    metadata: {},
+  };
+}
+
+function dispatchRequest(routeId: string, turnId = "turn-1"): ProviderDispatchRequest {
+  return {
+    dispatchId: `dispatch-${turnId}`,
+    routeId,
+    runId: "run-1",
+    taskId: "task-1",
+    nodeId: "node-1",
+    sessionId: "session-1",
+    turnId,
+    routeFallbackPolicy: "allow_route_change",
+    messages: [{ role: "user", content: "Say hello" }],
+    tools: [],
+    maximumOutputTokens: 256,
+    temperature: null,
+    stream: true,
+    timeoutMilliseconds: 5_000,
+    chunkTimeoutMilliseconds: 1_000,
+    idempotencyKey: `idem-${turnId}`,
+    extraBody: {},
+    metadata: {},
+  };
+}
+
+test("catalog revisions pin immutable route fields and V1 stays read-only", async (t) => {
+  const capture = await captureServer((_request, response) => {
+    response.writeHead(200, { "content-type": "text/event-stream" });
+    response.end("data: [DONE]\n\n");
+  });
+  t.after(() => capture.close());
+  const { controlPlane, secrets } = makeControlPlane(t);
+  installProvider(controlPlane, secrets, {
+    providerId: "alpha",
+    modelId: "alpha-model",
+    baseUrl: capture.baseUrl,
+    protocol: "openai_chat",
+  });
+  const route = controlPlane.acquireRoute(routeRequest("alpha", "alpha-model"));
+  const pinnedRevision = route.catalogRevision;
+  const provider = controlPlane.catalog.provider("alpha");
+  controlPlane.upsertProvider({ ...provider, defaultHeaders: { "x-new-default": "next-turn" } });
+
+  const restored = controlPlane.routes.require(route.routeId);
+  assert.equal(restored.catalogRevision, pinnedRevision);
+  assert.equal(restored.requestHeaders["x-new-default"], undefined);
+  assert.equal(restored.checksum, route.checksum);
+  const compat = controlPlane.catalog.compatibilityV1();
+  assert.equal(compat.writable, false);
+  assert.equal(compat.defaultModel, null);
+  assert.equal(compat.providers[0]?.models["alpha-model"]?.context, 32_000);
+});
+
+test("expired pinned routes renew without changing provider or credential identity", (t) => {
+  let now = 1_000_000;
+  const { controlPlane, secrets } = makeControlPlane(t, {
+    clock: { now: () => now },
+    routeLeaseMilliseconds: 1_000,
+  });
+  installProvider(controlPlane, secrets, {
+    providerId: "renewable",
+    modelId: "renewable-model",
+    baseUrl: "https://renewable.example.test",
+    protocol: "openai_chat",
+  });
+  const original = controlPlane.acquireRoute(routeRequest("renewable", "renewable-model"));
+  now += 1_001;
+
+  assert.throws(
+    () => controlPlane.routes.require(original.routeId),
+    (error: unknown) => error instanceof ProviderControlPlaneError && error.kind === "route_expired",
+  );
+  assert.equal(controlPlane.routes.requirePersisted(original.routeId).checksum, original.checksum);
+
+  const renewed = controlPlane.renewExpiredRoute(original.routeId);
+  assert.notEqual(renewed.routeId, original.routeId);
+  assert.equal(renewed.previousRouteId, original.routeId);
+  assert.equal(renewed.providerId, original.providerId);
+  assert.equal(renewed.modelId, original.modelId);
+  assert.equal(renewed.credentialId, original.credentialId);
+  assert.equal(renewed.credentialVersion, original.credentialVersion);
+  assert.equal(renewed.credentialFingerprint, original.credentialFingerprint);
+  assert.equal(renewed.expiresAt, now + 1_000);
+  assert.equal(controlPlane.renewExpiredRoute(original.routeId).routeId, renewed.routeId);
+  assert.equal(controlPlane.store.listRoutes("run-1", "task-1").length, 2);
+
+  now += 1_001;
+  const renewedAgain = controlPlane.renewExpiredRoute(original.routeId);
+  assert.notEqual(renewedAgain.routeId, renewed.routeId);
+  assert.equal(renewedAgain.previousRouteId, renewed.routeId);
+  assert.equal(controlPlane.store.listRoutes("run-1", "task-1").length, 3);
+});
+
+test("pinned routes renew before their remaining validity can strand a dispatch", (t) => {
+  let now = 1_000_000;
+  const { controlPlane, secrets } = makeControlPlane(t, {
+    clock: { now: () => now },
+    routeLeaseMilliseconds: 1_000,
+  });
+  installProvider(controlPlane, secrets, {
+    providerId: "proactive-renewal",
+    modelId: "proactive-renewal-model",
+    baseUrl: "https://proactive-renewal.example.test",
+    protocol: "openai_chat",
+  });
+  const original = controlPlane.acquireRoute(
+    routeRequest("proactive-renewal", "proactive-renewal-model"),
+  );
+
+  assert.equal(
+    controlPlane.renewExpiredRoute(original.routeId, 300).routeId,
+    original.routeId,
+  );
+  now += 750;
+
+  const renewed = controlPlane.renewExpiredRoute(original.routeId, 300);
+  assert.notEqual(renewed.routeId, original.routeId);
+  assert.equal(renewed.previousRouteId, original.routeId);
+  assert.equal(renewed.expiresAt, now + 1_000);
+  assert.equal(
+    controlPlane.renewExpiredRoute(original.routeId, 300).routeId,
+    renewed.routeId,
+  );
+});
+
+test("proactive validity requests clamp to the configured route lease", (t) => {
+  let now = 2_000_000;
+  const { controlPlane, secrets } = makeControlPlane(t, {
+    clock: { now: () => now },
+    routeLeaseMilliseconds: 1_000,
+  });
+  installProvider(controlPlane, secrets, {
+    providerId: "clamped-renewal",
+    modelId: "clamped-renewal-model",
+    baseUrl: "https://clamped-renewal.example.test",
+    protocol: "openai_chat",
+  });
+  const original = controlPlane.acquireRoute(
+    routeRequest("clamped-renewal", "clamped-renewal-model"),
+  );
+
+  assert.equal(
+    controlPlane.renewExpiredRoute(original.routeId, 10_000).routeId,
+    original.routeId,
+  );
+  now += 1;
+  assert.notEqual(
+    controlPlane.renewExpiredRoute(original.routeId, 10_000).routeId,
+    original.routeId,
+  );
+});
+
+test("RPC archival route lookup remains available after lease expiry", async (t) => {
+  let now = 1_000_000;
+  const { controlPlane, secrets } = makeControlPlane(t, {
+    clock: { now: () => now },
+    routeLeaseMilliseconds: 1_000,
+  });
+  installProvider(controlPlane, secrets, {
+    providerId: "archival",
+    modelId: "archival-model",
+    baseUrl: "https://archival.example.test",
+    protocol: "openai_chat",
+  });
+  const route = controlPlane.acquireRoute(routeRequest("archival", "archival-model"));
+  now += 1_001;
+  const server = new ProviderControlPlaneRpcServer(controlPlane);
+
+  const live = await server.handle({
+    protocol: RPC_PROTOCOL,
+    requestId: "expired-live-route",
+    operation: "route.get",
+    payload: { routeId: route.routeId },
+  });
+  const archived = await server.handle({
+    protocol: RPC_PROTOCOL,
+    requestId: "expired-archival-route",
+    operation: "route.get_persisted",
+    payload: { routeId: route.routeId },
+  });
+
+  assert.equal(live.ok, false);
+  assert.equal(live.error?.code, "route_expired");
+  assert.equal(archived.ok, true);
+  assert.equal((archived.result as ProviderRouteLease).checksum, route.checksum);
+});
+
+test("credential rotation preserves an acquired route snapshot and changes only the next route", async (t) => {
+  const capture = await captureServer((_request, response) => {
+    response.writeHead(200, { "content-type": "text/event-stream" });
+    response.end('data: {"choices":[{"delta":{"content":"ok"},"finish_reason":"stop"}]}\n\ndata: [DONE]\n\n');
+  });
+  t.after(() => capture.close());
+  const { controlPlane, secrets } = makeControlPlane(t);
+  const credentialId = installProvider(controlPlane, secrets, {
+    providerId: "rotating-provider",
+    modelId: "rotating-model",
+    baseUrl: capture.baseUrl,
+    protocol: "openai_chat",
+    secret: "credential-v1",
+  });
+  const acquiredBeforeRotation = controlPlane.acquireRoute(routeRequest("rotating-provider", "rotating-model"));
+  const nextSecretRef = "memory://rotating-provider-v2";
+  secrets.put(nextSecretRef, { value: "credential-v2" });
+  const rotated = controlPlane.credentials.rotate(credentialId, acquiredBeforeRotation.credentialVersion, {
+    secretRef: nextSecretRef,
+    fingerprint: fingerprintSecret("credential-v2"),
+  });
+
+  await controlPlane.dispatch(dispatchRequest(acquiredBeforeRotation.routeId));
+  const acquiredAfterRotation = controlPlane.acquireRoute(
+    routeRequest("rotating-provider", "rotating-model", "turn-2"),
+  );
+  await controlPlane.dispatch(dispatchRequest(acquiredAfterRotation.routeId, "turn-2"));
+
+  assert.equal(rotated.version, acquiredBeforeRotation.credentialVersion + 1);
+  assert.equal(controlPlane.routes.require(acquiredBeforeRotation.routeId).credentialVersion, 1);
+  assert.equal(acquiredAfterRotation.credentialVersion, 2);
+  assert.equal(capture.requests.length, 2);
+  assert.equal(capture.requests[0]?.headers.authorization, "Bearer credential-v1");
+  assert.equal(capture.requests[1]?.headers.authorization, "Bearer credential-v2");
+});
+
+test("OpenAI-compatible dispatch captures real headers, body bytes, and SSE", async (t) => {
+  const capture = await captureServer((_request, response) => {
+    response.writeHead(200, { "content-type": "text/event-stream" });
+    response.write('data: {"id":"response-1","choices":[{"delta":{"role":"assistant"},"finish_reason":null}]}\n\n');
+    response.write('data: {"id":"response-1","choices":[{"delta":{},"finish_reason":null}]}\n\n');
+    response.write('data: {"id":"response-1","choices":[{"delta":{"content":"hello "},"finish_reason":null}]}\n\n');
+    response.write('data: {"choices":[{"delta":{"content":"world"},"finish_reason":"stop"}],"usage":{"prompt_tokens":3,"completion_tokens":2}}\n\n');
+    response.end("data: [DONE]\n\n");
+  });
+  t.after(() => capture.close());
+  const { controlPlane, secrets } = makeControlPlane(t);
+  installProvider(controlPlane, secrets, {
+    providerId: "openai-loopback",
+    modelId: "chat-model",
+    baseUrl: capture.baseUrl,
+    protocol: "openai_chat",
+    endpointPath: "/v1/chat/completions",
+  });
+  const route = controlPlane.acquireRoute(routeRequest("openai-loopback", "chat-model"));
+  const result = await controlPlane.dispatch({
+    ...dispatchRequest(route.routeId),
+    extraBody: { reasoning_effort: "max" },
+  });
+
+  assert.equal(result.text, "hello world");
+  assert.equal(result.frames.filter((frame) => frame.kind === "response_start").length, 1);
+  assert.equal(result.attempts.length, 1);
+  assert.equal(result.attempts[0]?.outcome, "succeeded");
+  assert.equal(capture.requests.length, 1);
+  const request = capture.requests[0]!;
+  assert.equal(request.url, "/v1/chat/completions");
+  assert.equal(request.headers.authorization, "Bearer openai-loopback-secret");
+  assert.equal(request.headers["x-zyra-provider"], "openai-loopback");
+  const body = JSON.parse(request.body) as Record<string, unknown>;
+  assert.equal(body.model, "chat-model");
+  assert.equal(body.stream, true);
+  assert.equal(body.max_tokens, 256);
+  assert.equal(body.reasoning_effort, "max");
+  assert.equal("max_completion_tokens" in body, false);
+  assert.ok(Buffer.byteLength(request.body) > 0);
+  assert.equal(result.attempts[0]?.requestBytes, Buffer.byteLength(request.body));
+});
+
+test("transport observes decoded frames before dispatch completion", async (t) => {
+  const capture = await captureServer((_request, response) => {
+    response.writeHead(200, { "content-type": "text/event-stream" });
+    response.write('data: {"choices":[{"delta":{"content":"live"},"finish_reason":null}]}\n\n');
+    response.end('data: {"choices":[{"delta":{},"finish_reason":"stop"}]}\n\ndata: [DONE]\n\n');
+  });
+  t.after(() => capture.close());
+  let dispatchSettled = false;
+  const observations: Array<{ kind: string; beforeSettlement: boolean }> = [];
+  const { controlPlane, secrets } = makeControlPlane(t, {
+    frameObserver: (frames) => {
+      observations.push(...frames.map((frame) => ({
+        kind: frame.kind,
+        beforeSettlement: !dispatchSettled,
+      })));
+    },
+  });
+  installProvider(controlPlane, secrets, {
+    providerId: "observed-stream",
+    modelId: "observed-stream-model",
+    baseUrl: capture.baseUrl,
+    protocol: "openai_chat",
+  });
+  const route = controlPlane.acquireRoute(
+    routeRequest("observed-stream", "observed-stream-model"),
+  );
+  const dispatched = controlPlane.dispatch(dispatchRequest(route.routeId));
+  void dispatched.then(
+    () => { dispatchSettled = true; },
+    () => { dispatchSettled = true; },
+  );
+  const result = await dispatched;
+
+  assert.equal(result.text, "live");
+  assert.ok(observations.some((item) =>
+    item.kind === "text_delta" && item.beforeSettlement
+  ));
+  assert.ok(observations.every((item) => item.beforeSettlement));
+});
+
+test("active SSE progress may outlive the request-header timeout", async (t) => {
+  const capture = await captureServer((_request, response) => {
+    response.writeHead(200, { "content-type": "text/event-stream" });
+    response.flushHeaders();
+    let sequence = 0;
+    const interval = setInterval(() => {
+      sequence += 1;
+      response.write(
+        `data: {"choices":[{"delta":{"content":"${sequence}"},"finish_reason":null}]}\n\n`,
+      );
+      if (sequence < 5) return;
+      clearInterval(interval);
+      response.write('data: {"choices":[{"delta":{},"finish_reason":"stop"}]}\n\n');
+      response.end("data: [DONE]\n\n");
+    }, 50);
+  });
+  t.after(() => capture.close());
+  const { controlPlane, secrets } = makeControlPlane(t);
+  installProvider(controlPlane, secrets, {
+    providerId: "long-stream",
+    modelId: "long-stream-model",
+    baseUrl: capture.baseUrl,
+    protocol: "openai_chat",
+  });
+  const route = controlPlane.acquireRoute(routeRequest("long-stream", "long-stream-model"));
+  const result = await controlPlane.dispatch({
+    ...dispatchRequest(route.routeId),
+    timeoutMilliseconds: 125,
+    chunkTimeoutMilliseconds: 100,
+  });
+
+  assert.equal(result.text, "12345");
+  assert.equal(result.attempts[0]?.outcome, "succeeded");
+  assert.equal(capture.requests.length, 1);
+});
+
+test("an explicit stream-total watchdog bounds active SSE progress", async (t) => {
+  const capture = await captureServer((_request, response) => {
+    response.writeHead(200, { "content-type": "text/event-stream" });
+    response.flushHeaders();
+    let sequence = 0;
+    const interval = setInterval(() => {
+      sequence += 1;
+      response.write(
+        `data: {"choices":[{"delta":{"content":"${sequence}"},"finish_reason":null}]}\n\n`,
+      );
+      if (sequence < 20) return;
+      clearInterval(interval);
+      response.end("data: [DONE]\n\n");
+    }, 40);
+    response.on("close", () => clearInterval(interval));
+  });
+  t.after(() => capture.close());
+  const { controlPlane, secrets } = makeControlPlane(t);
+  installProvider(controlPlane, secrets, {
+    providerId: "bounded-long-stream",
+    modelId: "bounded-long-stream-model",
+    baseUrl: capture.baseUrl,
+    protocol: "openai_chat",
+  });
+  const route = controlPlane.acquireRoute(
+    routeRequest("bounded-long-stream", "bounded-long-stream-model"),
+  );
+
+  await assert.rejects(
+    controlPlane.dispatch({
+      ...dispatchRequest(route.routeId),
+      timeoutMilliseconds: 125,
+      streamTotalTimeoutMilliseconds: 125,
+      chunkTimeoutMilliseconds: 100,
+    }),
+    (error: unknown) => error instanceof ProviderControlPlaneError
+      && error.kind === "partial_response_observed"
+      && error.recoveryIntent === "reconcile_partial_response"
+      && error.message.includes("total lifetime"),
+  );
+  assert.equal(capture.requests.length, 1);
+});
+
+test("semantic watchdog ignores identityless empty tool deltas", (t) => {
+  let now = 1_000;
+  const { controlPlane, secrets } = makeControlPlane(t, { clock: { now: () => now } });
+  installProvider(controlPlane, secrets, {
+    providerId: "semantic-progress",
+    modelId: "semantic-progress-model",
+    baseUrl: "http://127.0.0.1:1",
+    protocol: "openai_chat",
+  });
+  const route = controlPlane.acquireRoute(routeRequest("semantic-progress", "semantic-progress-model"));
+  const request = dispatchRequest(route.routeId);
+  const supervisor = new ProviderStreamSupervisor(request, route, {
+    now: () => now,
+    budget: { firstByteMilliseconds: 20, chunkMilliseconds: 20 },
+  });
+  const frame = (
+    sequence: number,
+    kind: ProviderStreamFrame["kind"],
+    metadata: ProviderStreamFrame["metadata"] = {},
+    text: string | null = null,
+  ): ProviderStreamFrame => ({
+    frameId: `semantic-${sequence}`,
+    dispatchId: request.dispatchId,
+    routeId: request.routeId,
+    sequence,
+    kind,
+    text,
+    toolCallId: null,
+    toolName: null,
+    jsonDelta: null,
+    usage: {},
+    providerEvent: null,
+    createdAt: now,
+    metadata,
+  });
+
+  supervisor.observe([frame(1, "response_start")]);
+  now += 1;
+  supervisor.observe([frame(2, "text_delta", {}, "x")]);
+  const metadataVariants: ProviderStreamFrame["metadata"][] = [
+    {},
+    { providerIndex: "" },
+    { providerIndex: "   " },
+  ];
+  for (const metadata of metadataVariants) {
+    now += 5;
+    supervisor.observe([frame(supervisor.snapshot().nextSequence, "tool_call_delta", metadata)]);
+  }
+  now += 6;
+
+  assert.throws(
+    () => supervisor.checkWatchdog(),
+    (error: unknown) => error instanceof ProviderControlPlaneError
+      && error.kind === "partial_response_observed"
+      && error.detail.watchdog === "semantic_chunk",
+  );
+  const snapshot = supervisor.snapshot();
+  assert.equal(snapshot.frameCount, 5);
+  assert.equal(snapshot.toolCalls.length, 0);
+  assert.equal(snapshot.lastFrameAt, 1_016);
+  assert.equal(snapshot.lastProgressAt, 1_001);
+});
+
+test("identityless empty tool entries cannot keep a live transport or lifecycle transaction open", async (t) => {
+  const capture = await captureServer((_request, response) => {
+    response.writeHead(200, { "content-type": "text/event-stream" });
+    response.write('data: {"choices":[{"delta":{"content":"x"},"finish_reason":null}]}\n\n');
+    const keepalive = setInterval(() => {
+      response.write('data: {"choices":[{"delta":{"tool_calls":[{}]},"finish_reason":null}]}\n\n');
+    }, 5);
+    response.on("close", () => clearInterval(keepalive));
+  });
+  t.after(() => capture.close());
+  const { controlPlane, secrets } = makeControlPlane(t);
+  const credentialId = installProvider(controlPlane, secrets, {
+    providerId: "empty-tool-keepalive",
+    modelId: "empty-tool-keepalive-model",
+    baseUrl: capture.baseUrl,
+    protocol: "openai_chat",
+  });
+  const route = controlPlane.acquireRoute(
+    routeRequest("empty-tool-keepalive", "empty-tool-keepalive-model"),
+  );
+
+  let observed: unknown;
+  try {
+    await controlPlane.dispatch({
+      ...dispatchRequest(route.routeId),
+      timeoutMilliseconds: 500,
+      chunkTimeoutMilliseconds: 100,
+    });
+  } catch (error) {
+    observed = error;
+  }
+  assert.ok(observed instanceof ProviderControlPlaneError);
+  assert.equal(observed.kind, "partial_response_observed");
+  assert.equal(observed.detail.watchdog, "semantic_chunk");
+  const lifecycle = controlPlane.dispatches.require("dispatch-turn-1");
+  assert.equal(lifecycle.outputObserved, true);
+  assert.deepEqual(lifecycle.toolArgumentStreams, {});
+  const credential = controlPlane.credentials.get(credentialId);
+  assert.equal(credential.status, "active");
+  assert.equal(credential.failureCount, 0);
+});
+
+test("transport chunk timeout after output is reconciled and never replayed", async (t) => {
+  const capture = await captureServer((_request, response) => {
+    response.writeHead(200, { "content-type": "text/event-stream" });
+    response.flushHeaders();
+    response.write('data: {"choices":[{"delta":{"content":"observed"},"finish_reason":null}]}\n\n');
+  });
+  t.after(() => capture.close());
+  const { controlPlane, secrets } = makeControlPlane(t);
+  installProvider(controlPlane, secrets, {
+    providerId: "quiet-after-output",
+    modelId: "quiet-after-output-model",
+    baseUrl: capture.baseUrl,
+    protocol: "openai_chat",
+  });
+  const route = controlPlane.acquireRoute(
+    routeRequest("quiet-after-output", "quiet-after-output-model"),
+  );
+
+  await assert.rejects(
+    controlPlane.dispatch({
+      ...dispatchRequest(route.routeId),
+      timeoutMilliseconds: 500,
+      chunkTimeoutMilliseconds: 25,
+    }),
+    (error: unknown) => error instanceof ProviderControlPlaneError
+      && error.kind === "partial_response_observed"
+      && error.outputObserved
+      && error.detail.upstreamLayer === "transport",
+  );
+  assert.equal(capture.requests.length, 1);
+  const attempts = controlPlane.store.listAttempts("dispatch-turn-1");
+  assert.equal(attempts.length, 1);
+  assert.equal(attempts[0]?.failureKind, "partial_response_observed");
+  assert.equal(controlPlane.dispatches.require("dispatch-turn-1").state, "reconcile_required");
+});
+
+test("completed tool arguments reject a later unbound fragment as a structured protocol failure", (t) => {
+  const { controlPlane, secrets } = makeControlPlane(t);
+  installProvider(controlPlane, secrets, {
+    providerId: "sealed-tool-arguments",
+    modelId: "sealed-tool-arguments-model",
+    baseUrl: "http://127.0.0.1:1",
+    protocol: "openai_chat",
+  });
+  const route = controlPlane.acquireRoute(
+    routeRequest("sealed-tool-arguments", "sealed-tool-arguments-model"),
+  );
+  const request = dispatchRequest(route.routeId);
+  const supervisor = new ProviderStreamSupervisor(request, route, { now: () => 2_000 });
+  const frame = (
+    sequence: number,
+    toolCallId: string | null,
+    toolName: string | null,
+    jsonDelta: string | null,
+    metadata: ProviderStreamFrame["metadata"],
+  ): ProviderStreamFrame => ({
+    frameId: `sealed-${sequence}`,
+    dispatchId: request.dispatchId,
+    routeId: request.routeId,
+    sequence,
+    kind: "tool_call_delta",
+    text: null,
+    toolCallId,
+    toolName,
+    jsonDelta,
+    usage: {},
+    providerEvent: null,
+    createdAt: 2_000,
+    metadata,
+  });
+
+  supervisor.observe([
+    frame(1, "call-sealed", "write_file", '{"path":"result.txt"}', { providerIndex: 7 }),
+  ]);
+  let observed: unknown;
+  try {
+    supervisor.observe([frame(2, null, null, " trailing", {})]);
+  } catch (error) {
+    observed = error;
+  }
+  assert.ok(observed instanceof ProviderControlPlaneError);
+  assert.equal(observed.kind, "partial_response_observed");
+  assert.match(observed.message, /tool argument transaction is invalid/);
+  assert.equal(
+    observed.detail.parserState,
+    "tool arguments must start with a JSON object or array",
+  );
+});
+
+test("response-byte budget is independent from normalized frame and character budgets", (t) => {
+  const { controlPlane, secrets } = makeControlPlane(t);
+  installProvider(controlPlane, secrets, {
+    providerId: "byte-budget",
+    modelId: "byte-budget-model",
+    baseUrl: "http://127.0.0.1:1",
+    protocol: "openai_chat",
+  });
+  const route = controlPlane.acquireRoute(routeRequest("byte-budget", "byte-budget-model"));
+  const supervisor = new ProviderStreamSupervisor(dispatchRequest(route.routeId), route, {
+    now: () => 3_000,
+    budget: { maximumResponseBytes: 8 },
+  });
+
+  supervisor.observeResponseBytes(8);
+  assert.throws(
+    () => supervisor.observeResponseBytes(9),
+    (error: unknown) => error instanceof ProviderControlPlaneError
+      && error.kind === "response_protocol_error"
+      && error.detail.maximumResponseBytes === 8,
+  );
+});
+
+test("repeated protocol failures do not block a healthy credential", async (t) => {
+  let healthy = false;
+  const capture = await captureServer((_request, response) => {
+    response.writeHead(200, { "content-type": "text/event-stream" });
+    if (!healthy) {
+      response.end("data: not-json\n\n");
+      return;
+    }
+    response.end('data: {"choices":[{"delta":{"content":"recovered"},"finish_reason":"stop"}]}\n\ndata: [DONE]\n\n');
+  });
+  t.after(() => capture.close());
+  const { controlPlane, secrets } = makeControlPlane(t);
+  const credentialId = installProvider(controlPlane, secrets, {
+    providerId: "protocol-isolation",
+    modelId: "protocol-isolation-model",
+    baseUrl: capture.baseUrl,
+    protocol: "openai_chat",
+  });
+  const route = controlPlane.acquireRoute(
+    routeRequest("protocol-isolation", "protocol-isolation-model"),
+  );
+  const transport = new ProviderTransportRuntime(
+    controlPlane.store,
+    controlPlane.routes,
+    controlPlane.credentials,
+    secrets,
+  );
+
+  for (let attempt = 1; attempt <= 6; attempt += 1) {
+    await assert.rejects(
+      transport.dispatch({
+        ...dispatchRequest(route.routeId),
+        dispatchId: `protocol-failure-${attempt}`,
+        idempotencyKey: `protocol-failure-${attempt}`,
+      }),
+      (error: unknown) => error instanceof ProviderControlPlaneError
+        && error.kind === "response_protocol_error",
+    );
+  }
+  const afterFailures = controlPlane.credentials.get(credentialId);
+  assert.equal(afterFailures.status, "active");
+  assert.equal(afterFailures.failureCount, 0);
+
+  healthy = true;
+  const recovered = await transport.dispatch({
+    ...dispatchRequest(route.routeId),
+    dispatchId: "protocol-recovered",
+    idempotencyKey: "protocol-recovered",
+  });
+  assert.equal(recovered.text, "recovered");
+  assert.equal(controlPlane.credentials.get(credentialId).status, "active");
+});
+
+test("large output windows admit valid normalized streams beyond the fixed legacy frame cap", (t) => {
+  const { controlPlane, secrets } = makeControlPlane(t);
+  installProvider(controlPlane, secrets, {
+    providerId: "large-stream",
+    modelId: "large-stream-model",
+    baseUrl: "http://127.0.0.1:1",
+    protocol: "openai_chat",
+  });
+  const route = controlPlane.acquireRoute(routeRequest("large-stream", "large-stream-model"));
+  const request: ProviderDispatchRequest = {
+    ...dispatchRequest(route.routeId),
+    maximumOutputTokens: 131_072,
+  };
+  const supervisor = new ProviderStreamSupervisor(request, route, { now: () => 1_000 });
+  const frame = (
+    sequence: number,
+    kind: ProviderStreamFrame["kind"],
+    text: string | null = null,
+  ): ProviderStreamFrame => ({
+    frameId: `large-frame-${sequence}`,
+    dispatchId: request.dispatchId,
+    routeId: route.routeId,
+    sequence,
+    kind,
+    text,
+    toolCallId: null,
+    toolName: null,
+    jsonDelta: null,
+    usage: {},
+    providerEvent: null,
+    createdAt: 1_000,
+    metadata: {},
+  });
+
+  supervisor.observe([frame(1, "response_start")]);
+  for (let sequence = 2; sequence <= 100_002; sequence += 1) {
+    supervisor.observe([frame(sequence, "text_delta", "x")]);
+  }
+  supervisor.observe([frame(100_003, "response_end")]);
+  const completed = supervisor.complete({ requireTerminalFrame: true });
+
+  assert.equal(completed.accepted, true);
+  assert.equal(completed.snapshot.frameCount, 100_003);
+  assert.equal(completed.snapshot.textCharacters, 100_001);
+
+  const explicitSupervisor = new ProviderStreamSupervisor(request, route, {
+    now: () => 1_000,
+    budget: { maximumFrames: 2 },
+  });
+  assert.throws(
+    () => explicitSupervisor.observe([
+      frame(1, "response_start"),
+      frame(2, "text_delta", "x"),
+      frame(3, "response_end"),
+    ]),
+    /provider stream exceeded normalized frame budget/,
+  );
+});
+
+test("stream supervisor joins concurrent tool fragments and ignores identical duplicate frames", (t) => {
+  const { controlPlane, secrets } = makeControlPlane(t);
+  installProvider(controlPlane, secrets, {
+    providerId: "fragment-stream",
+    modelId: "fragment-model",
+    baseUrl: "http://127.0.0.1:1",
+    protocol: "openai_chat",
+  });
+  const route = controlPlane.acquireRoute(routeRequest("fragment-stream", "fragment-model"));
+  const request = dispatchRequest(route.routeId);
+  const supervisor = new ProviderStreamSupervisor(request, route, { now: () => 2_000 });
+  const frame = (
+    sequence: number,
+    frameId: string,
+    kind: ProviderStreamFrame["kind"],
+    toolCallId: string | null = null,
+    toolName: string | null = null,
+    jsonDelta: string | null = null,
+  ): ProviderStreamFrame => ({
+    frameId,
+    dispatchId: request.dispatchId,
+    routeId: route.routeId,
+    sequence,
+    kind,
+    text: null,
+    toolCallId,
+    toolName,
+    jsonDelta,
+    usage: {},
+    providerEvent: null,
+    createdAt: 2_000,
+    metadata: {},
+  });
+  const duplicate = frame(3, "fragment-3", "tool_call_delta", "call-b", "tool_b", "{\"n\":");
+
+  supervisor.observe([
+    frame(1, "fragment-1", "response_start"),
+    frame(2, "fragment-2", "tool_call_delta", "call-a", "tool_a", "{\"path\":\"a"),
+    duplicate,
+  ]);
+  supervisor.observe([duplicate]);
+  supervisor.observe([
+    frame(4, "fragment-4", "tool_call_delta", "call-a", null, ".txt\",\"value\":1}"),
+    frame(5, "fragment-5", "tool_call_delta", "call-b", null, "2}"),
+    frame(6, "fragment-6", "response_end"),
+  ]);
+  const completed = supervisor.complete({ requireTerminalFrame: true });
+
+  assert.equal(completed.replaySafe, true);
+  assert.equal(completed.snapshot.frameCount, 6);
+  assert.equal(completed.snapshot.sideEffectCandidateObserved, false);
+  assert.deepEqual(
+    completed.snapshot.toolCalls.map((call) => [call.toolCallId, call.transactionState, call.parsedArguments]),
+    [
+      ["call-a", "arguments_complete", { path: "a.txt", value: 1 }],
+      ["call-b", "arguments_complete", { n: 2 }],
+    ],
+  );
+});
+
+test("stream supervisor accepts every JSON fragment boundary before dispatch", (t) => {
+  const { controlPlane, secrets } = makeControlPlane(t);
+  installProvider(controlPlane, secrets, {
+    providerId: "boundary-stream",
+    modelId: "boundary-model",
+    baseUrl: "http://127.0.0.1:1",
+    protocol: "openai_chat",
+  });
+  const route = controlPlane.acquireRoute(routeRequest("boundary-stream", "boundary-model"));
+  const serialized = '{"path":"nested/file.txt","payload":{"count":2,"enabled":true}}';
+  for (let boundary = 0; boundary <= serialized.length; boundary += 1) {
+    const request = { ...dispatchRequest(route.routeId), dispatchId: `boundary-dispatch-${boundary}` };
+    const supervisor = new ProviderStreamSupervisor(request, route, { now: () => 3_000 });
+    const frame = (
+      sequence: number,
+      kind: ProviderStreamFrame["kind"],
+      delta: string | null = null,
+    ): ProviderStreamFrame => ({
+      frameId: `boundary-${boundary}-${sequence}`,
+      dispatchId: request.dispatchId,
+      routeId: route.routeId,
+      sequence,
+      kind,
+      text: null,
+      toolCallId: kind === "tool_call_delta" ? "call-boundary" : null,
+      toolName: sequence === 2 ? "write_file" : null,
+      jsonDelta: delta,
+      usage: {},
+      providerEvent: null,
+      createdAt: 3_000,
+      metadata: {},
+    });
+    supervisor.observe([
+      frame(1, "response_start"),
+      frame(2, "tool_call_delta", serialized.slice(0, boundary)),
+      frame(3, "tool_call_delta", serialized.slice(boundary)),
+      frame(4, "response_end"),
+    ]);
+    const completed = supervisor.complete({ requireTerminalFrame: true });
+    assert.deepEqual(completed.snapshot.toolCalls[0]?.parsedArguments, {
+      path: "nested/file.txt",
+      payload: { count: 2, enabled: true },
+    });
+  }
+});
+
+test("Anthropic-compatible dispatch uses Messages wire and parses deltas", async (t) => {
+  const capture = await captureServer((_request, response) => {
+    response.writeHead(200, { "content-type": "text/event-stream" });
+    response.write('event: message_start\ndata: {"type":"message_start","message":{"id":"m","usage":{"input_tokens":2}}}\n\n');
+    response.write('event: content_block_delta\ndata: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"anthropic-ok"}}\n\n');
+    response.write('event: message_delta\ndata: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":1}}\n\n');
+    response.end('event: message_stop\ndata: {"type":"message_stop"}\n\n');
+  });
+  t.after(() => capture.close());
+  const { controlPlane, secrets } = makeControlPlane(t);
+  installProvider(controlPlane, secrets, {
+    providerId: "anthropic-loopback",
+    modelId: "claude-test",
+    baseUrl: capture.baseUrl,
+    protocol: "anthropic_messages",
+    endpointPath: "/v1/messages",
+  });
+  const route = controlPlane.acquireRoute(routeRequest("anthropic-loopback", "claude-test"));
+  const result = await controlPlane.dispatch(dispatchRequest(route.routeId));
+  assert.equal(result.text, "anthropic-ok");
+  assert.equal(result.stopReason, "end_turn");
+  assert.equal(capture.requests[0]?.headers["anthropic-version"], "2023-06-01");
+  const body = JSON.parse(capture.requests[0]!.body) as Record<string, unknown>;
+  assert.equal(body.model, "claude-test");
+  assert.equal(body.max_tokens, 256);
+});
+
+test("revoked pinned credential fails before transport with zero bytes", async (t) => {
+  const capture = await captureServer((_request, response) => {
+    response.writeHead(500);
+    response.end("must not be reached");
+  });
+  t.after(() => capture.close());
+  const { controlPlane, secrets } = makeControlPlane(t);
+  const credentialId = installProvider(controlPlane, secrets, {
+    providerId: "revoked-provider",
+    modelId: "revoked-model",
+    baseUrl: capture.baseUrl,
+    protocol: "openai_chat",
+  });
+  const route = controlPlane.acquireRoute(routeRequest("revoked-provider", "revoked-model"));
+  controlPlane.credentials.revoke(credentialId, route.credentialVersion);
+
+  await assert.rejects(
+    () => controlPlane.dispatch(dispatchRequest(route.routeId)),
+    (error: unknown) => {
+      assert.ok(error instanceof ProviderControlPlaneError);
+      assert.equal(error.kind, "credential_revoked");
+      assert.equal(error.bytesSent, 0);
+      return true;
+    },
+  );
+  assert.equal(capture.requests.length, 0);
+  const attempts = controlPlane.store.listAttempts("dispatch-turn-1");
+  assert.equal(attempts.length, 1);
+  assert.equal(attempts[0]?.requestBytes, 0);
+  assert.equal(attempts[0]?.responseBytes, 0);
+});
+
+test("provider unavailable creates a new route lease without backend concepts", async (t) => {
+  const primary = await captureServer((_request, response) => {
+    response.writeHead(503, { "content-type": "application/json", "retry-after": "0" });
+    response.end('{"error":{"message":"temporarily unavailable"}}');
+  });
+  const fallback = await captureServer((_request, response) => {
+    response.writeHead(200, { "content-type": "text/event-stream" });
+    response.end('data: {"choices":[{"delta":{"content":"fallback-ok"},"finish_reason":"stop"}]}\n\ndata: [DONE]\n\n');
+  });
+  t.after(async () => { await primary.close(); await fallback.close(); });
+  const { controlPlane, secrets } = makeControlPlane(t);
+  installProvider(controlPlane, secrets, {
+    providerId: "primary",
+    modelId: "primary-model",
+    baseUrl: primary.baseUrl,
+    protocol: "openai_chat",
+    releasedAt: 20,
+  });
+  installProvider(controlPlane, secrets, {
+    providerId: "fallback",
+    modelId: "fallback-model",
+    baseUrl: fallback.baseUrl,
+    protocol: "openai_chat",
+    releasedAt: 10,
+  });
+  const route = controlPlane.acquireRoute(routeRequest("primary", "primary-model"));
+  const result = await controlPlane.dispatch(dispatchRequest(route.routeId));
+  assert.equal(result.text, "fallback-ok");
+  assert.equal(result.providerId, "fallback");
+  assert.notEqual(result.routeId, route.routeId);
+  assert.equal(result.attempts.length, 2);
+  assert.equal(result.attempts[0]?.failureKind, "provider_unavailable");
+  assert.equal(primary.requests.length, 1);
+  assert.equal(fallback.requests.length, 1);
+  const nextRoute = controlPlane.routes.require(result.routeId);
+  assert.equal(nextRoute.previousRouteId, route.routeId);
+  assert.equal("backendId" in nextRoute, false);
+});
+
+test("a pinned dispatch retries only its credential-bearing route", async (t) => {
+  const primary = await captureServer((_request, response) => {
+    response.writeHead(503, { "content-type": "application/json", "retry-after": "0" });
+    response.end('{"error":{"message":"temporarily unavailable"}}');
+  });
+  const fallback = await captureServer((_request, response) => {
+    response.writeHead(200, { "content-type": "text/event-stream" });
+    response.end('data: {"choices":[{"delta":{"content":"must-not-run"},"finish_reason":"stop"}]}\n\ndata: [DONE]\n\n');
+  });
+  t.after(async () => { await primary.close(); await fallback.close(); });
+  const { controlPlane, secrets } = makeControlPlane(t);
+  installProvider(controlPlane, secrets, {
+    providerId: "pinned-primary",
+    modelId: "pinned-model",
+    baseUrl: primary.baseUrl,
+    protocol: "openai_chat",
+    releasedAt: 20,
+  });
+  installProvider(controlPlane, secrets, {
+    providerId: "unrelayed-fallback",
+    modelId: "unrelayed-model",
+    baseUrl: fallback.baseUrl,
+    protocol: "openai_chat",
+    releasedAt: 10,
+  });
+  const route = controlPlane.acquireRoute(routeRequest("pinned-primary", "pinned-model"));
+  const request = {
+    ...dispatchRequest(route.routeId),
+    routeFallbackPolicy: "pin_initial_route" as const,
+  };
+
+  await assert.rejects(
+    () => controlPlane.dispatch(request),
+    (error: unknown) => {
+      assert.ok(error instanceof ProviderControlPlaneError);
+      assert.equal(error.kind, "provider_unavailable");
+      assert.equal(error.routeId, route.routeId);
+      assert.equal(error.providerId, "pinned-primary");
+      return true;
+    },
+  );
+  assert.ok(primary.requests.length >= 1);
+  assert.equal(fallback.requests.length, 0);
+  const attempts = controlPlane.store.listAttempts(request.dispatchId);
+  assert.ok(attempts.length >= 1);
+  assert.equal(attempts.every((attempt) => attempt.routeId === route.routeId), true);
+});
+
+test("partial output followed by malformed stream is reconcile-only and never replayed", async (t) => {
+  const primary = await captureServer((_request, response) => {
+    response.writeHead(200, { "content-type": "text/event-stream" });
+    response.write('data: {"choices":[{"delta":{"content":"observed"},"finish_reason":null}]}\n\n');
+    response.end("data: {malformed-json}\n\n");
+  });
+  const fallback = await captureServer((_request, response) => {
+    response.writeHead(200, { "content-type": "text/event-stream" });
+    response.end('data: {"choices":[{"delta":{"content":"must-not-run"},"finish_reason":"stop"}]}\n\n');
+  });
+  t.after(async () => { await primary.close(); await fallback.close(); });
+  const { controlPlane, secrets } = makeControlPlane(t);
+  installProvider(controlPlane, secrets, {
+    providerId: "partial-primary",
+    modelId: "partial-model",
+    baseUrl: primary.baseUrl,
+    protocol: "openai_chat",
+    releasedAt: 20,
+  });
+  installProvider(controlPlane, secrets, {
+    providerId: "partial-fallback",
+    modelId: "fallback-model",
+    baseUrl: fallback.baseUrl,
+    protocol: "openai_chat",
+    releasedAt: 10,
+  });
+  const route = controlPlane.acquireRoute(routeRequest("partial-primary", "partial-model"));
+  await assert.rejects(
+    () => controlPlane.dispatch(dispatchRequest(route.routeId)),
+    (error: unknown) => {
+      assert.ok(error instanceof ProviderControlPlaneError);
+      assert.equal(error.outputObserved, true);
+      assert.equal(error.recoveryIntent, "reconcile_partial_response");
+      return true;
+    },
+  );
+  assert.equal(primary.requests.length, 1);
+  assert.equal(fallback.requests.length, 0);
+  assert.equal(controlPlane.store.listAttempts("dispatch-turn-1").length, 1);
+});
+
+test("Anthropic thinking and fragmented tool JSON remain one pre-dispatch transaction", async (t) => {
+  const capture = await captureServer((_request, response) => {
+    response.writeHead(200, { "content-type": "text/event-stream" });
+    response.write('event: message_start\ndata: {"type":"message_start","message":{"id":"tool-message"}}\n\n');
+    response.write('event: content_block_delta\ndata: {"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"inspect first"}}\n\n');
+    response.write('event: content_block_start\ndata: {"type":"content_block_start","index":1,"content_block":{"type":"tool_use","id":"call-read","name":"read_file","input":{}}}\n\n');
+    response.write('event: content_block_delta\ndata: {"type":"content_block_delta","index":1,"delta":{"type":"input_json_delta","partial_json":"{\\"path\\":"}}\n\n');
+    response.write('event: content_block_delta\ndata: {"type":"content_block_delta","index":1,"delta":{"type":"input_json_delta","partial_json":"\\"README.md\\"}"}}\n\n');
+    response.write('event: message_delta\ndata: {"type":"message_delta","delta":{"stop_reason":"tool_use"},"usage":{"output_tokens":12}}\n\n');
+    response.end('event: message_stop\ndata: {"type":"message_stop"}\n\n');
+  });
+  t.after(() => capture.close());
+  const { controlPlane, secrets } = makeControlPlane(t);
+  installProvider(controlPlane, secrets, {
+    providerId: "anthropic-tools",
+    modelId: "claude-tools",
+    baseUrl: capture.baseUrl,
+    protocol: "anthropic_messages",
+    endpointPath: "/v1/messages",
+  });
+  const route = controlPlane.acquireRoute(routeRequest("anthropic-tools", "claude-tools"));
+  const request = dispatchRequest(route.routeId);
+  const result = await controlPlane.dispatch({
+    ...request,
+    tools: [{ name: "read_file", description: "Read a file", inputSchema: { type: "object" } }],
+  });
+
+  assert.equal(result.stopReason, "tool_use");
+  assert.equal(result.frames.filter((frame) => frame.kind === "thinking_delta").length, 1);
+  const toolFrames = result.frames.filter((frame) => frame.kind === "tool_call_delta");
+  assert.equal(toolFrames.length, 3);
+  assert.equal(toolFrames[0]?.toolCallId, "call-read");
+  assert.equal(toolFrames[0]?.toolName, "read_file");
+  assert.equal(toolFrames.slice(1).map((frame) => frame.jsonDelta).join(""), '{"path":"README.md"}');
+  assert.equal(result.metadata.streamReplaySafe, true);
+  assert.equal(result.attempts[0]?.metadata.streamToolCallCount, 1);
+  assert.equal(capture.requests.length, 1);
+});
+
+test("incomplete tool JSON retries safely before dispatch and reports structured exhaustion", async (t) => {
+  const primary = await captureServer((_request, response) => {
+    response.writeHead(200, { "content-type": "text/event-stream" });
+    response.write('data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call-partial","function":{"name":"write_file","arguments":"{\\"path\\":\\"a.txt\\""}}]},"finish_reason":"tool_calls"}]}\n\n');
+    response.end("data: [DONE]\n\n");
+  });
+  const fallback = await captureServer((_request, response) => {
+    response.writeHead(200, { "content-type": "text/event-stream" });
+    response.end('data: {"choices":[{"delta":{"content":"must-not-replay"},"finish_reason":"stop"}]}\n\ndata: [DONE]\n\n');
+  });
+  t.after(async () => { await primary.close(); await fallback.close(); });
+  const { controlPlane, secrets } = makeControlPlane(t);
+  installProvider(controlPlane, secrets, {
+    providerId: "tool-primary",
+    modelId: "tool-model",
+    baseUrl: primary.baseUrl,
+    protocol: "openai_chat",
+    releasedAt: 20,
+  });
+  installProvider(controlPlane, secrets, {
+    providerId: "tool-fallback",
+    modelId: "fallback-model",
+    baseUrl: fallback.baseUrl,
+    protocol: "openai_chat",
+    releasedAt: 10,
+  });
+  const route = controlPlane.acquireRoute(routeRequest("tool-primary", "tool-model"));
+  await assert.rejects(
+    () => controlPlane.dispatch({
+      ...dispatchRequest(route.routeId),
+      tools: [{ name: "write_file", description: "Write a file", inputSchema: { type: "object" } }],
+    }),
+    (error: unknown) => {
+      assert.ok(error instanceof ProviderControlPlaneError);
+      assert.equal(error.kind, "tool_arguments_incomplete");
+      assert.equal(error.outputObserved, true);
+      assert.equal(error.recoveryIntent, "surface_to_operator");
+      assert.equal(error.detail.recoveryExhausted, true);
+      assert.equal(error.detail.maximumRecoveryAttempts, 3);
+      assert.equal(Array.isArray(error.detail.toolCalls), true);
+      return true;
+    },
+  );
+  assert.equal(primary.requests.length, 3);
+  assert.equal(fallback.requests.length, 0);
+  const attempts = controlPlane.store.listAttempts("dispatch-turn-1");
+  assert.equal(attempts.length, 3);
+  assert.equal(attempts.every((attempt) => attempt.metadata.streamReplaySafe === true), true);
+  assert.equal(attempts.at(-1)?.metadata.streamRecoveryAction, "surface_to_operator");
+  const lifecycle = controlPlane.dispatches.require("dispatch-turn-1");
+  assert.equal(lifecycle.state, "failed");
+  assert.equal(lifecycle.recoveryCount, 2);
+  assert.equal(lifecycle.recoveryFailures.length, 3);
+  const persistedCall = lifecycle.toolArgumentStreams["call-partial"] as Record<string, unknown>;
+  assert.equal(persistedCall.transaction_state, "receiving_arguments");
+  assert.equal((persistedCall.attempt_history as unknown[]).length, 2);
+});
+
+test("a disconnected half-JSON tool call regenerates once without changing route", async (t) => {
+  let requests = 0;
+  const capture = await captureServer((_request, response) => {
+    requests += 1;
+    response.writeHead(200, { "content-type": "text/event-stream" });
+    if (requests === 1) {
+      response.end('data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call-recover","function":{"name":"write_file","arguments":"{\\"path\\":\\"result.txt\\""}}]},"finish_reason":"tool_calls"}]}\n\ndata: [DONE]\n\n');
+      return;
+    }
+    response.end('data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call-recover","function":{"name":"write_file","arguments":"{\\"path\\":\\"result.txt\\",\\"content\\":\\"ready\\"}"}}]},"finish_reason":"tool_calls"}]}\n\ndata: [DONE]\n\n');
+  });
+  t.after(() => capture.close());
+  const { controlPlane, secrets } = makeControlPlane(t);
+  installProvider(controlPlane, secrets, {
+    providerId: "recover-provider",
+    modelId: "recover-model",
+    baseUrl: capture.baseUrl,
+    protocol: "openai_chat",
+  });
+  const route = controlPlane.acquireRoute(routeRequest("recover-provider", "recover-model"));
+  const result = await controlPlane.dispatch({
+    ...dispatchRequest(route.routeId),
+    tools: [{ name: "write_file", description: "Write a file", inputSchema: { type: "object" } }],
+  });
+
+  assert.equal(requests, 2);
+  assert.equal(result.routeId, route.routeId);
+  assert.equal(result.attempts.length, 2);
+  assert.equal(result.attempts[0]?.failureKind, "tool_arguments_incomplete");
+  assert.equal(result.frames.filter((frame) => frame.kind === "tool_call_delta").length, 1);
+  const lifecycle = controlPlane.dispatches.require("dispatch-turn-1");
+  assert.equal(lifecycle.state, "succeeded");
+  assert.equal(lifecycle.recoveryCount, 1);
+  const persistedCall = lifecycle.toolArgumentStreams["call-recover"] as Record<string, unknown>;
+  assert.equal(persistedCall.transaction_state, "arguments_complete");
+  assert.equal(persistedCall.fragments, '{"path":"result.txt","content":"ready"}');
+  assert.equal((persistedCall.attempt_history as unknown[]).length, 1);
+});
+
+test("a dispatch-scoped attempt bound caps route retries", async (t) => {
+  let requests = 0;
+  const capture = await captureServer((_request, response) => {
+    requests += 1;
+    response.writeHead(200, { "content-type": "text/event-stream" });
+    response.end('data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call-bounded","function":{"name":"write_file","arguments":"{\\"path\\":\\"result.txt\\""}}]},"finish_reason":"tool_calls"}]}\n\ndata: [DONE]\n\n');
+  });
+  t.after(() => capture.close());
+  const { controlPlane, secrets } = makeControlPlane(t);
+  installProvider(controlPlane, secrets, {
+    providerId: "bounded-attempt-provider",
+    modelId: "bounded-attempt-model",
+    baseUrl: capture.baseUrl,
+    protocol: "openai_chat",
+  });
+  const route = controlPlane.acquireRoute(
+    routeRequest("bounded-attempt-provider", "bounded-attempt-model"),
+  );
+
+  await assert.rejects(
+    controlPlane.dispatch({
+      ...dispatchRequest(route.routeId),
+      maximumAttempts: 2,
+      tools: [{ name: "write_file", description: "Write a file", inputSchema: { type: "object" } }],
+    }),
+    (error: unknown) => error instanceof ProviderControlPlaneError
+      && error.kind === "tool_arguments_incomplete",
+  );
+  assert.equal(requests, 2);
+});
+
+test("a stalled half-JSON tool call regenerates before any tool dispatch", async (t) => {
+  let requests = 0;
+  const capture = await captureServer((_request, response) => {
+    requests += 1;
+    response.writeHead(200, { "content-type": "text/event-stream" });
+    if (requests === 1) {
+      response.write('data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call-stalled","function":{"name":"write_file","arguments":"{\\"path\\":\\"result.txt\\""}}]},"finish_reason":null}]}\n\n');
+      const keepalive = setInterval(() => response.write(": keepalive\n\n"), 5);
+      const stop = setTimeout(() => response.end(), 150);
+      response.on("close", () => {
+        clearInterval(keepalive);
+        clearTimeout(stop);
+      });
+      return;
+    }
+    response.end('data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call-stalled","function":{"name":"write_file","arguments":"{\\"path\\":\\"result.txt\\",\\"content\\":\\"ready\\"}"}}]},"finish_reason":"tool_calls"}]}\n\ndata: [DONE]\n\n');
+  });
+  t.after(() => capture.close());
+  const { controlPlane, secrets } = makeControlPlane(t);
+  installProvider(controlPlane, secrets, {
+    providerId: "stalled-tool-provider",
+    modelId: "stalled-tool-model",
+    baseUrl: capture.baseUrl,
+    protocol: "openai_chat",
+  });
+  const route = controlPlane.acquireRoute(
+    routeRequest("stalled-tool-provider", "stalled-tool-model"),
+  );
+  const result = await controlPlane.dispatch({
+    ...dispatchRequest(route.routeId),
+    tools: [{ name: "write_file", description: "Write a file", inputSchema: { type: "object" } }],
+    timeoutMilliseconds: 500,
+    chunkTimeoutMilliseconds: 25,
+  });
+
+  assert.equal(requests, 2);
+  assert.equal(result.routeId, route.routeId);
+  assert.equal(result.attempts.length, 2);
+  assert.equal(result.attempts[0]?.failureKind, "tool_arguments_incomplete");
+  assert.equal(result.attempts[0]?.recoveryIntent, "retry_same_route");
+  assert.equal(result.attempts[0]?.outputObserved, true);
+  assert.equal(result.attempts[0]?.metadata.streamReplaySafe, true);
+  const lifecycle = controlPlane.dispatches.require("dispatch-turn-1");
+  assert.equal(lifecycle.state, "succeeded");
+  assert.equal(lifecycle.recoveryCount, 1);
+  const persistedCall = lifecycle.toolArgumentStreams["call-stalled"] as Record<string, unknown>;
+  assert.equal(persistedCall.transaction_state, "arguments_complete");
+  assert.equal((persistedCall.attempt_history as unknown[]).length, 1);
+});
+
+test("rate limit performs a second real request on a new provider route", async (t) => {
+  const primary = await captureServer((_request, response) => {
+    response.writeHead(429, { "content-type": "application/json", "retry-after": "0" });
+    response.end('{"error":{"message":"rate limited","type":"rate_limit_error"}}');
+  });
+  const fallback = await captureServer((_request, response) => {
+    response.writeHead(200, { "content-type": "text/event-stream" });
+    response.end('data: {"choices":[{"delta":{"content":"rate-limit-recovered"},"finish_reason":"stop"}]}\n\ndata: [DONE]\n\n');
+  });
+  t.after(async () => { await primary.close(); await fallback.close(); });
+  const { controlPlane, secrets } = makeControlPlane(t);
+  installProvider(controlPlane, secrets, {
+    providerId: "rate-primary",
+    modelId: "rate-model",
+    baseUrl: primary.baseUrl,
+    protocol: "openai_chat",
+    releasedAt: 30,
+  });
+  installProvider(controlPlane, secrets, {
+    providerId: "rate-fallback",
+    modelId: "rate-fallback-model",
+    baseUrl: fallback.baseUrl,
+    protocol: "openai_chat",
+    releasedAt: 20,
+  });
+  const original = controlPlane.acquireRoute(routeRequest("rate-primary", "rate-model"));
+  const result = await controlPlane.dispatch(dispatchRequest(original.routeId));
+
+  assert.equal(result.text, "rate-limit-recovered");
+  assert.notEqual(result.routeId, original.routeId);
+  assert.equal(result.providerId, "rate-fallback");
+  assert.equal(result.attempts.length, 2);
+  assert.equal(result.attempts[0]?.failureKind, "rate_limited");
+  assert.equal(primary.requests.length, 1);
+  assert.equal(fallback.requests.length, 1);
+  assert.equal(controlPlane.routes.require(result.routeId).previousRouteId, original.routeId);
+});
+
+test("zero-output SSE stall changes provider route and performs one bounded recovery request", async (t) => {
+  const stalled = await captureServer((_request, response) => {
+    response.writeHead(200, { "content-type": "text/event-stream" });
+    response.flushHeaders();
+    setTimeout(() => response.end(), 150);
+  });
+  const fallback = await captureServer((_request, response) => {
+    response.writeHead(200, { "content-type": "text/event-stream" });
+    response.end('data: {"choices":[{"delta":{"content":"stall-recovered"},"finish_reason":"stop"}]}\n\ndata: [DONE]\n\n');
+  });
+  t.after(async () => { await stalled.close(); await fallback.close(); });
+  const { controlPlane, secrets } = makeControlPlane(t);
+  installProvider(controlPlane, secrets, {
+    providerId: "stall-primary",
+    modelId: "stall-model",
+    baseUrl: stalled.baseUrl,
+    protocol: "openai_chat",
+    releasedAt: 30,
+  });
+  installProvider(controlPlane, secrets, {
+    providerId: "stall-fallback",
+    modelId: "stall-fallback-model",
+    baseUrl: fallback.baseUrl,
+    protocol: "openai_chat",
+    releasedAt: 20,
+  });
+  const original = controlPlane.acquireRoute(routeRequest("stall-primary", "stall-model"));
+  const result = await controlPlane.dispatch({
+    ...dispatchRequest(original.routeId),
+    timeoutMilliseconds: 500,
+    chunkTimeoutMilliseconds: 25,
+  });
+
+  assert.equal(result.text, "stall-recovered");
+  assert.notEqual(result.routeId, original.routeId);
+  assert.equal(result.providerId, "stall-fallback");
+  assert.equal(result.attempts.length, 2);
+  assert.equal(result.attempts[0]?.failureKind, "stream_timeout");
+  assert.equal(result.attempts[0]?.outputObserved, false);
+  assert.equal(stalled.requests.length, 1);
+  assert.equal(fallback.requests.length, 1);
+});
+
+test("SSE transport keepalives cannot mask a zero-output semantic stall", async (t) => {
+  const stalled = await captureServer((_request, response) => {
+    response.writeHead(200, { "content-type": "text/event-stream" });
+    response.flushHeaders();
+    const keepalive = setInterval(() => response.write(": keepalive\n\n"), 5);
+    response.on("close", () => clearInterval(keepalive));
+    setTimeout(() => response.end(), 150);
+  });
+  const fallback = await captureServer((_request, response) => {
+    response.writeHead(200, { "content-type": "text/event-stream" });
+    response.end('data: {"choices":[{"delta":{"content":"keepalive-recovered"},"finish_reason":"stop"}]}\n\ndata: [DONE]\n\n');
+  });
+  t.after(async () => { await stalled.close(); await fallback.close(); });
+  const { controlPlane, secrets } = makeControlPlane(t);
+  installProvider(controlPlane, secrets, {
+    providerId: "keepalive-primary",
+    modelId: "keepalive-model",
+    baseUrl: stalled.baseUrl,
+    protocol: "openai_chat",
+    releasedAt: 30,
+  });
+  installProvider(controlPlane, secrets, {
+    providerId: "keepalive-fallback",
+    modelId: "keepalive-fallback-model",
+    baseUrl: fallback.baseUrl,
+    protocol: "openai_chat",
+    releasedAt: 20,
+  });
+  const original = controlPlane.acquireRoute(routeRequest("keepalive-primary", "keepalive-model"));
+  const result = await controlPlane.dispatch({
+    ...dispatchRequest(original.routeId),
+    timeoutMilliseconds: 500,
+    chunkTimeoutMilliseconds: 25,
+  });
+
+  assert.equal(result.text, "keepalive-recovered");
+  assert.notEqual(result.routeId, original.routeId);
+  assert.equal(result.providerId, "keepalive-fallback");
+  assert.equal(result.attempts.length, 2);
+  assert.equal(result.attempts[0]?.failureKind, "stream_timeout");
+  assert.equal(result.attempts[0]?.outputObserved, false);
+  assert.equal(stalled.requests.length, 1);
+  assert.equal(fallback.requests.length, 1);
+});

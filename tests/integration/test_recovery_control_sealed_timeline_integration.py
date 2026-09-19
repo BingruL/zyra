@@ -1,0 +1,1158 @@
+from __future__ import annotations
+
+import json
+import os
+import threading
+import urllib.request
+from contextlib import contextmanager
+from http.server import ThreadingHTTPServer
+from pathlib import Path
+from typing import Any, Iterator
+from urllib.error import HTTPError
+
+import pytest
+
+from apps.api.zyra_api import main as api_main
+from zyra_orchestration.deployment import DeploymentProfile
+from zyra_scheduler.worker_pool import (
+    BackendCapability,
+    ResourceVector,
+    WorkerLocation,
+)
+
+
+def test_timeline_recovery_controls_reach_canonical_owners_and_fence_stale_requests(
+    tmp_path: Path,
+) -> None:
+    with _api(tmp_path) as base_url:
+        commands = {
+            item["name"]: item
+            for item in _get(base_url, "/commands")["commands"]
+        }
+        assert {
+            "/kill",
+            "/steer",
+            "/retry",
+            "/reassign",
+            "/resume",
+        }.issubset(commands)
+        assert commands["/kill"]["handler_id"] == "recovery.kill"
+        assert commands["/steer"]["handler_id"] == "recovery.steer"
+        assert commands["/retry"]["handler_id"] == "recovery.retry"
+        assert commands["/reassign"]["handler_id"] == "recovery.reassign"
+
+        kill_task = _create_task(base_url, "Fence one live worker from the timeline.")
+        kill_owner = _owner(kill_task)
+        kill_status, killed = _command(
+            base_url,
+            kill_task,
+            "kill",
+            arguments={
+                **kill_owner,
+                "target": "worker-and-task",
+                "reason": "Timeline operator observed an unsafe worker.",
+                "old_fence_must_block_commit": True,
+            },
+        )
+        assert kill_status == 201, killed["command_result"].get("error")
+        assert killed["command_result"]["ok"] is True
+        assert killed["command_result"]["data"]["phase"] == "applied"
+        assert (
+            killed["command_result"]["data"]["control_event"]["payload"][
+                "control_runtime"
+            ]["owner"]
+            == "WorkerControlRuntime"
+        )
+        killed_lease = _lease(
+            base_url,
+            kill_owner["expected_lease_id"],
+            task_id=kill_task["task_id"],
+        )
+        assert killed_lease["state"] == "cancelled"
+        assert killed["command_result"]["data"]["observed_event_ids"]
+
+        steer_task = _create_task(
+            base_url,
+            (
+                "Reply without tools that the live graph was steered after "
+                "the requirement changed."
+            ),
+        )
+        steer_status, steered = _command(
+            base_url,
+            steer_task,
+            "steer",
+            arguments={
+                **_owner(steer_task),
+                "node_id": steer_task["root_node_id"],
+                "instruction": "Require verifier evidence before delivery.",
+                "requirement": "Require verifier evidence before delivery.",
+                "reason": "The goal changed while the run was active.",
+                "change_scope": "recovery_graph_route",
+            },
+        )
+        assert steer_status == 201, steered["command_result"].get("error")
+        assert steered["command_result"]["ok"] is True
+        assert steered["command_result"]["data"]["phase"] == "applied"
+        assert (
+            steered["command_result"]["data"]["control_event"]["payload"][
+                "control_runtime"
+            ]["owner"]
+            == "RecoveryApplication"
+        )
+        assert (
+            steered["command_result"]["data"]["recovery"]["plan"]["decision"][
+                "selected"
+            ]["action"]
+            == "replan"
+        )
+
+        retry_task = _create_task(
+            base_url,
+            "Reply without tools that one bounded retry was accepted.",
+        )
+        retry_status, retried = _command(
+            base_url,
+            retry_task,
+            "retry",
+            arguments={
+                **_owner(retry_task),
+                "node_id": retry_task["root_node_id"],
+                "tool_call_id": "tool-call-timeline-retry",
+                "maximum_attempts": 1,
+                "bounded_retry": True,
+                "reason": "The observed tool failure is retryable once.",
+            },
+        )
+        assert retry_status == 201, retried["command_result"].get("error")
+        assert retried["command_result"]["ok"] is True
+        assert retried["command_result"]["data"]["phase"] == "applied"
+        assert retried["command_result"]["data"]["recovery"]["plan"]["decision"]
+        assert (
+            retried["command_result"]["data"]["recovery"]["plan"]["decision"][
+                "selected"
+            ]["action"]
+            == "retry"
+        )
+
+        unbounded_retry_task = _create_task(
+            base_url,
+            "Reject an unbounded retry before recovery applies.",
+        )
+        unbounded_status, unbounded = _command(
+            base_url,
+            unbounded_retry_task,
+            "retry",
+            arguments={
+                **_owner(unbounded_retry_task),
+                "node_id": unbounded_retry_task["root_node_id"],
+                "tool_call_id": "tool-call-unbounded-retry",
+                "maximum_attempts": 9,
+                "bounded_retry": True,
+                "reason": "This direct API request exceeds the bounded policy.",
+            },
+        )
+        assert unbounded_status == 409, unbounded
+        assert unbounded["command_result"]["ok"] is False
+        assert "between 1 and 8" in unbounded["command_result"]["error"]["message"]
+        unbounded_state = api_main.get_store().load_task(
+            unbounded_retry_task["task_id"]
+        )
+        assert unbounded_state is not None
+        assert not unbounded_state.metadata.get("control_mutations")
+
+        reassign_task = _create_task(
+            base_url,
+            (
+                "Reply without tools that a lost worker was reassigned "
+                "without changing logical task ownership."
+            ),
+        )
+        worker_api = api_main.get_worker_pool_api()
+        # The earlier control cases are complete but deliberately delayed
+        # tasks still hold API leases.  Close those test-only reservations
+        # before restarting the shared device process so they cannot mask the
+        # reassign case with unrelated stale-generation leases.
+        for completed_task in (
+            steer_task,
+            retry_task,
+            unbounded_retry_task,
+        ):
+            completed_lease_id = _owner(completed_task)["expected_lease_id"]
+            worker_api.pool.leases.cancel(
+                completed_lease_id,
+                reason="timeline control case completed before successor test",
+            )
+        orchestrator = api_main.get_deployment_api().orchestrator
+        device_policy = orchestrator.catalog.policy(DeploymentProfile.DEVICE)
+        successor_process, _, successor_health = orchestrator.processes.start_node(
+            device_policy,
+            restart=True,
+        )
+        successor_identity = dict(successor_health["runtime_identity"])
+        worker_api.pool.register_physical_worker(
+            worker_id="timeline-successor-worker",
+            worker_kind="code-worker",
+            location=WorkerLocation.LOCAL,
+            backend=BackendCapability(
+                backend_id="timeline-successor-backend",
+                backend_kind="local_process",
+                enabled=True,
+                healthy=True,
+                capabilities=(
+                    "agent_task",
+                    "code_execution",
+                    "artifact_return",
+                ),
+                tool_ids=("code", "shell", "read", "write", "search"),
+            ),
+            capabilities=(
+                "agent_task",
+                "code_execution",
+                "artifact_return",
+            ),
+            tool_ids=("code", "shell", "read", "write", "search"),
+            resources=ResourceVector(
+                cpu_cores=1.0,
+                memory_mb=512,
+                disk_mb=512,
+                process_slots=2,
+            ),
+            process_identity=str(successor_identity["failure_boundary_id"]),
+            endpoint=successor_process.endpoint,
+            metadata={
+                "test_physical_successor": True,
+                "deployment_node_id": successor_health["node_id"],
+                "deployment_generation_id": successor_identity["generation_id"],
+            },
+        )
+        previous_owner = _owner(reassign_task)
+        prior_worker = worker_api.pool.store.require_worker(
+            previous_owner["expected_worker_id"]
+        )
+        successor_worker = worker_api.pool.store.require_worker(
+            "timeline-successor-worker"
+        )
+        assert successor_worker.accepting_leases is True
+        assert successor_worker.process_identity != prior_worker.process_identity
+        # A deployment profile may reuse its stable endpoint after a real
+        # process-generation restart.  The signed failure-boundary identity,
+        # rather than the address alone, distinguishes the successor.
+        assert successor_worker.endpoint == prior_worker.endpoint
+        reassign_status, reassigned = _command(
+            base_url,
+            reassign_task,
+            "reassign",
+            arguments={
+                **previous_owner,
+                "node_id": reassign_task["root_node_id"],
+                "exclude_worker_id": previous_owner["expected_worker_id"],
+                "fence_previous_lease": True,
+                "reason": "The current worker stopped producing heartbeats.",
+            },
+        )
+        assert reassign_status == 201, reassigned["command_result"].get("error")
+        assert reassigned["command_result"]["ok"] is True
+        assert reassigned["command_result"]["data"]["phase"] == "applied"
+        selected_reassignment = reassigned["command_result"]["data"]["recovery"][
+            "plan"
+        ]["decision"]["selected"]["action"]
+        assert selected_reassignment == "reroute", selected_reassignment
+        route_change = reassigned["command_result"]["data"]["recovery"][
+            "execution"
+        ]["receipts"][0]["route_decision"]["changes"][0]
+        assert route_change["owner"] == "WorkerPoolFoundationRuntime"
+        assert route_change["after_ref"]["worker_id"] == (
+            "timeline-successor-worker"
+        ), route_change
+        successor_lease_id = route_change["after_ref"]["lease_id"]
+        refreshed = _get(base_url, f"/tasks/{reassign_task['task_id']}")["task"]
+        replacement = refreshed["metadata"]["worker_pool"]
+        assert replacement["worker_id"] != previous_owner["expected_worker_id"], json.dumps(
+            {
+                "recovery_worker_route": refreshed["metadata"].get("recovery_worker_route"),
+                "runtime_hints": refreshed["metadata"].get("runtime_hints"),
+                "last_resource_decision": refreshed["metadata"].get("last_resource_decision"),
+            },
+            ensure_ascii=False,
+            sort_keys=True,
+        )
+        assert replacement["lease_id"] != previous_owner["expected_lease_id"]
+        rebound_graph = worker_api.graph_custody.current(
+            refreshed["metadata"]["dynamic_graph_id"]
+        )
+        projected_nodes = [
+            node
+            for node in rebound_graph.nodes
+            if node.metadata.get("plan_node_projection") is True
+        ]
+        assert projected_nodes
+        assert {
+            node.metadata.get("worker_id") for node in projected_nodes
+        } == {replacement["worker_id"]}
+        assert all(
+            str(node.metadata.get("arg_binding_id") or "").startswith(
+                f"worker:{replacement['worker_id']}:"
+            )
+            for node in projected_nodes
+        )
+        recovery_route = refreshed["metadata"]["recovery_worker_route"]
+        assert recovery_route["preferred_worker_id"] == "timeline-successor-worker"
+        assert recovery_route["prior_failure_boundary"] != recovery_route[
+            "successor_failure_boundary"
+        ]
+        graph_terminal = refreshed["metadata"]["worker_pool_graph_terminal"]
+        assert graph_terminal["committed"] is True
+        graph_terminal_history = refreshed["metadata"][
+            "worker_pool_graph_terminal_history"
+        ]
+        assert any(
+            item["committed"] is True
+            and item["lease_id"] == previous_owner["expected_lease_id"]
+            for item in graph_terminal_history
+        )
+        assert any(
+            item["committed"] is True
+            and item["lease_id"] == successor_lease_id
+            for item in graph_terminal_history
+        )
+
+        replay_callback = api_main._recovery_owner_callbacks(
+            api_main.get_store()
+        ).worker_successor
+        assert replay_callback is not None
+        attempts_before_replay = api_main.get_worker_pool_api().pool.store.list_attempts(
+            task_id=reassign_task["task_id"]
+        )
+        replayed = replay_callback(
+            {
+                "run_id": reassign_task["run_id"],
+                "task_id": reassign_task["task_id"],
+                "plan_id": recovery_route["plan_id"],
+                "idempotency_key": recovery_route["idempotency_key"],
+                "excluded_refs": [previous_owner["expected_worker_id"]],
+                "constraints": {
+                    "worker": {"required_capabilities": ["agent_task"]}
+                },
+            }
+        )
+        assert replayed["metadata"]["replayed"] is True
+        assert replayed["canonical_ref"]["lease_id"] == recovery_route["lease_id"]
+        assert len(
+            api_main.get_worker_pool_api().pool.store.list_attempts(
+                task_id=reassign_task["task_id"]
+            )
+        ) == len(attempts_before_replay)
+        previous_lease = _lease(
+            base_url,
+            previous_owner["expected_lease_id"],
+            task_id=reassign_task["task_id"],
+        )
+        assert previous_lease["state"] in {"cancelled", "released", "expired"}
+
+        stale_task = _create_task(base_url, "Reject stale timeline owner evidence.")
+        stale_owner = _owner(stale_task)
+        stale_status, stale = _command(
+            base_url,
+            stale_task,
+            "kill",
+            arguments={
+                **stale_owner,
+                "expected_worker_id": "worker-owner-that-no-longer-exists",
+                "target": "worker-and-task",
+                "reason": "This request was composed from stale timeline data.",
+            },
+        )
+        assert stale_status == 409, stale
+        assert stale["command_result"]["ok"] is False
+        live_lease = _lease(
+            base_url,
+            stale_owner["expected_lease_id"],
+            task_id=stale_task["task_id"],
+        )
+        assert live_lease["state"] == "active"
+
+
+def test_worker_successor_recovers_committed_lease_before_task_checkpoint(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    with _api(tmp_path) as base_url:
+        task = _create_task(
+            base_url,
+            "Recover a successor committed before the task checkpoint.",
+        )
+        previous_owner = _owner(task)
+        worker_api = api_main.get_worker_pool_api()
+        orchestrator = api_main.get_deployment_api().orchestrator
+        device_policy = orchestrator.catalog.policy(DeploymentProfile.DEVICE)
+        successor_process, _, successor_health = orchestrator.processes.start_node(
+            device_policy,
+            restart=True,
+        )
+        successor_identity = dict(successor_health["runtime_identity"])
+        worker_api.pool.register_physical_worker(
+            worker_id="checkpoint-crash-successor",
+            worker_kind="code-worker",
+            location=WorkerLocation.LOCAL,
+            backend=BackendCapability(
+                backend_id="checkpoint-crash-backend",
+                backend_kind="local_process",
+                enabled=True,
+                healthy=True,
+                capabilities=(
+                    "agent_task",
+                    "code_execution",
+                    "artifact_return",
+                ),
+                tool_ids=("code", "shell", "read", "write", "search"),
+            ),
+            capabilities=(
+                "agent_task",
+                "code_execution",
+                "artifact_return",
+            ),
+            tool_ids=("code", "shell", "read", "write", "search"),
+            resources=ResourceVector(
+                cpu_cores=1.0,
+                memory_mb=512,
+                disk_mb=512,
+                process_slots=2,
+            ),
+            process_identity=str(successor_identity["failure_boundary_id"]),
+            endpoint=successor_process.endpoint,
+            metadata={
+                "checkpoint_crash_successor": True,
+                "deployment_node_id": successor_health["node_id"],
+                "deployment_generation_id": successor_identity[
+                    "generation_id"
+                ],
+            },
+        )
+        request = {
+            "run_id": task["run_id"],
+            "task_id": task["task_id"],
+            "plan_id": "plan-checkpoint-crash",
+            "idempotency_key": "successor-checkpoint-crash",
+            "excluded_refs": [previous_owner["expected_worker_id"]],
+            "constraints": {
+                "worker": {"required_capabilities": ["agent_task"]}
+            },
+        }
+        store = api_main.get_store()
+        callback = api_main._recovery_owner_callbacks(store).worker_successor
+        assert callback is not None
+        original_save = store.save_checkpoint
+        crashed = False
+
+        def crash_once(state: Any) -> None:
+            nonlocal crashed
+            if not crashed:
+                crashed = True
+                raise RuntimeError("controlled crash before task checkpoint")
+            original_save(state)
+
+        monkeypatch.setattr(store, "save_checkpoint", crash_once)
+        with pytest.raises(
+            RuntimeError,
+            match="controlled crash before task checkpoint",
+        ):
+            callback(request)
+        attempts_after_crash = worker_api.pool.store.list_attempts(
+            task_id=task["task_id"]
+        )
+        assert len(attempts_after_crash) == 2
+
+        recovered = callback(request)
+
+        assert recovered["accepted"] is True
+        assert recovered["metadata"]["replayed"] is True
+        assert len(
+            worker_api.pool.store.list_attempts(task_id=task["task_id"])
+        ) == len(attempts_after_crash)
+        restored = store.load_task(task["task_id"])
+        assert restored is not None
+        route = restored.metadata["recovery_worker_route"]
+        assert route["recovered_before_task_checkpoint"] is True
+        assert route["lease_id"] == recovered["canonical_ref"]["lease_id"]
+        assert restored.metadata["worker_pool"]["lease_id"] == route["lease_id"]
+        graph = worker_api.graph_custody.current(
+            restored.metadata["dynamic_graph_id"]
+        )
+        bound = next(
+            node
+            for node in graph.nodes
+            if node.physical_attempt_ref == route["attempt_id"]
+        )
+        assert bound.worker_lease_ref == route["lease_id"]
+        assert bound.state.value == "leased"
+
+        worker_api.pool.leases.cancel(
+            route["lease_id"],
+            reason="controlled terminal transition after route checkpoint",
+        )
+        terminal_replay = callback(request)
+        assert terminal_replay["accepted"] is False
+        terminal_state = store.load_task(task["task_id"])
+        assert terminal_state is not None
+        terminal_graph = worker_api.graph_custody.current(
+            terminal_state.metadata["dynamic_graph_id"]
+        )
+        terminal_bound = next(
+            node
+            for node in terminal_graph.nodes
+            if node.physical_attempt_ref == route["attempt_id"]
+        )
+        assert terminal_bound.state.value == "cancelled"
+
+
+def test_worker_successor_reconciles_terminal_precheckpoint_lease_then_reroutes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    with _api(tmp_path) as base_url:
+        task = _create_task(
+            base_url,
+            "Reconcile a terminal successor committed before checkpointing.",
+        )
+        previous_owner = _owner(task)
+        worker_api = api_main.get_worker_pool_api()
+        orchestrator = api_main.get_deployment_api().orchestrator
+        device_policy = orchestrator.catalog.policy(
+            DeploymentProfile.DEVICE
+        )
+        successor_process, _, successor_health = (
+            orchestrator.processes.start_node(device_policy, restart=True)
+        )
+        successor_identity = dict(successor_health["runtime_identity"])
+        worker_api.pool.register_physical_worker(
+            worker_id="terminal-checkpoint-successor",
+            worker_kind="code-worker",
+            location=WorkerLocation.LOCAL,
+            backend=BackendCapability(
+                backend_id="terminal-checkpoint-backend",
+                backend_kind="local_process",
+                enabled=True,
+                healthy=True,
+                capabilities=(
+                    "agent_task",
+                    "code_execution",
+                    "artifact_return",
+                ),
+                tool_ids=("code", "shell", "read", "write", "search"),
+            ),
+            capabilities=(
+                "agent_task",
+                "code_execution",
+                "artifact_return",
+            ),
+            tool_ids=("code", "shell", "read", "write", "search"),
+            resources=ResourceVector(
+                cpu_cores=1.0,
+                memory_mb=512,
+                disk_mb=512,
+                process_slots=2,
+            ),
+            process_identity=str(successor_identity["failure_boundary_id"]),
+            endpoint=successor_process.endpoint,
+            metadata={
+                "terminal_checkpoint_successor": True,
+                "deployment_node_id": successor_health["node_id"],
+                "deployment_generation_id": successor_identity[
+                    "generation_id"
+                ],
+            },
+        )
+        request = {
+            "run_id": task["run_id"],
+            "task_id": task["task_id"],
+            "plan_id": "plan-terminal-checkpoint",
+            "idempotency_key": "successor-terminal-checkpoint",
+            "excluded_refs": [previous_owner["expected_worker_id"]],
+            "constraints": {
+                "worker": {"required_capabilities": ["agent_task"]}
+            },
+        }
+        store = api_main.get_store()
+        callback = api_main._recovery_owner_callbacks(
+            store
+        ).worker_successor
+        assert callback is not None
+        original_save = store.save_checkpoint
+        crashed = False
+
+        def crash_once(state: Any) -> None:
+            nonlocal crashed
+            if not crashed:
+                crashed = True
+                raise RuntimeError("controlled terminal precheckpoint crash")
+            original_save(state)
+
+        monkeypatch.setattr(store, "save_checkpoint", crash_once)
+        with pytest.raises(
+            RuntimeError,
+            match="controlled terminal precheckpoint crash",
+        ):
+            callback(request)
+        successor_lease = next(
+            lease
+            for lease in worker_api.pool.store.list_leases(
+                task_id=task["task_id"]
+            )
+            if lease.lease_id != previous_owner["expected_lease_id"]
+        )
+        worker_api.pool.leases.cancel(
+            successor_lease.lease_id,
+            reason="controlled terminal successor before task checkpoint",
+        )
+
+        rejected = callback(request)
+
+        assert rejected["accepted"] is False
+        assert rejected["changed"] is False
+        assert rejected["metadata"] == {
+            "replayed": True,
+            "terminal": True,
+        }
+        restored = store.load_task(task["task_id"])
+        assert restored is not None
+        assert restored.metadata["worker_pool"]["lease_id"] == (
+            successor_lease.lease_id
+        )
+        terminal_graph = worker_api.graph_custody.current(
+            restored.metadata["dynamic_graph_id"]
+        )
+        terminal_node = next(
+            node
+            for node in terminal_graph.nodes
+            if node.physical_attempt_ref == successor_lease.attempt_id
+        )
+        assert terminal_node.worker_lease_ref == successor_lease.lease_id
+        assert terminal_node.state.value == "cancelled"
+
+        rerouted = callback(
+            {
+                **request,
+                "plan_id": "plan-after-terminal-checkpoint",
+                "idempotency_key": "successor-after-terminal-checkpoint",
+                "excluded_refs": [],
+            }
+        )
+
+        assert rerouted["accepted"] is True
+        assert rerouted["canonical_ref"]["lease_id"] != (
+            successor_lease.lease_id
+        )
+        final_state = store.load_task(task["task_id"])
+        assert final_state is not None
+        assert final_state.metadata["worker_pool"]["lease_id"] == (
+            rerouted["canonical_ref"]["lease_id"]
+        )
+        final_graph = worker_api.graph_custody.current(
+            final_state.metadata["dynamic_graph_id"]
+        )
+        final_node = next(
+            node
+            for node in final_graph.nodes
+            if node.physical_attempt_ref
+            == rerouted["canonical_ref"]["attempt_id"]
+        )
+        assert final_node.state.value == "leased"
+
+
+def test_unbound_terminal_successor_route_excludes_failed_boundary_on_new_key(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    with _api(tmp_path) as base_url:
+        task = _create_task(
+            base_url,
+            "Recover a terminal successor whose graph bind never committed.",
+        )
+        previous_owner = _owner(task)
+        worker_api = api_main.get_worker_pool_api()
+        orchestrator = api_main.get_deployment_api().orchestrator
+        _register_successor_worker(
+            worker_api,
+            orchestrator,
+            worker_id="unbound-terminal-successor",
+            backend_id="unbound-terminal-backend",
+        )
+        request = {
+            "run_id": task["run_id"],
+            "task_id": task["task_id"],
+            "plan_id": "plan-unbound-terminal",
+            "idempotency_key": "successor-unbound-terminal",
+            "excluded_refs": [previous_owner["expected_worker_id"]],
+            "constraints": {
+                "worker": {"required_capabilities": ["agent_task"]}
+            },
+        }
+        callback = api_main._recovery_owner_callbacks(
+            api_main.get_store()
+        ).worker_successor
+        assert callback is not None
+        original_bind = worker_api._bind_task_graph_acquisition
+
+        def reject_graph_bind(*args: Any, **kwargs: Any) -> Any:
+            del args, kwargs
+            raise RuntimeError("controlled successor graph bind failure")
+
+        monkeypatch.setattr(
+            worker_api,
+            "_bind_task_graph_acquisition",
+            reject_graph_bind,
+        )
+        with pytest.raises(
+            RuntimeError,
+            match="controlled successor graph bind failure",
+        ):
+            callback(request)
+        monkeypatch.setattr(
+            worker_api,
+            "_bind_task_graph_acquisition",
+            original_bind,
+        )
+
+        rejected = callback(request)
+
+        assert rejected["accepted"] is False
+        assert rejected["metadata"]["terminal"] is True
+        assert rejected["after"]["lease_id"] == (
+            previous_owner["expected_lease_id"]
+        )
+        terminal_successor_id = rejected["canonical_ref"]["worker_id"]
+        assert terminal_successor_id == "unbound-terminal-successor"
+        terminal_route_state = api_main.get_store().load_task(task["task_id"])
+        assert terminal_route_state is not None
+        failed_process_identity = terminal_route_state.metadata[
+            "recovery_worker_route"
+        ]["successor_failure_boundary"]["process_identity"]
+        _register_successor_worker(
+            worker_api,
+            orchestrator,
+            worker_id="unbound-terminal-successor",
+            backend_id="unbound-terminal-backend",
+            replace_generation=True,
+        )
+        replacement_worker = worker_api.pool.store.require_worker(
+            terminal_successor_id
+        )
+        assert replacement_worker.process_identity != failed_process_identity
+
+        rerouted = callback(
+            {
+                **request,
+                "plan_id": "plan-after-unbound-terminal",
+                "idempotency_key": "successor-after-unbound-terminal",
+                "excluded_refs": [],
+            }
+        )
+
+        assert rerouted["accepted"] is True
+        assert rerouted["canonical_ref"]["worker_id"] == (
+            "unbound-terminal-successor"
+        )
+        route = api_main.get_store().load_task(task["task_id"])
+        assert route is not None
+        avoided = route.metadata["recovery_worker_route"][
+            "avoided_worker_ids"
+        ]
+        assert terminal_successor_id not in avoided
+
+
+def test_sealed_timeline_control_is_denied_once_without_manual_mutation_or_human_wait(
+    tmp_path: Path,
+) -> None:
+    with _api(tmp_path) as base_url:
+        task = _create_task(
+            base_url,
+            "Prove sealed recovery control remains autonomous.",
+        )
+        owner = _owner(task)
+        payload = _command_payload(
+            task,
+            "kill",
+            arguments={
+                **owner,
+                "target": "worker-and-task",
+                "reason": "A benchmark observer attempted a manual kill.",
+                "old_fence_must_block_commit": True,
+            },
+            sealed=True,
+        )
+        first_status, denied = _post_with_status(
+            base_url,
+            f"/tasks/{task['task_id']}/commands",
+            payload,
+        )
+        second_status, replay = _post_with_status(
+            base_url,
+            f"/tasks/{task['task_id']}/commands",
+            payload,
+        )
+        assert first_status == 409, denied
+        assert second_status == 409, replay
+        assert denied["command_result"]["ok"] is False
+        assert denied["command_result"]["error"]["code"] == "permission_denied"
+        assert denied["intervention_counted"] is True
+        assert denied["operator_intervention_attempt_count"] == 1
+        assert denied["human_intervention_count"] == 0
+        assert replay["operator_intervention_attempt_count"] == 1
+        state = api_main.get_store().load_task(task["task_id"])
+        assert state is not None
+        assert state.metadata["operator_intervention_attempt_count"] == 1
+        assert state.metadata["human_intervention_count"] == 0
+        assert len(state.metadata["operator_intervention_ledger"]) == 1
+        sealed_denial = state.metadata["last_sealed_control_denial"]
+        assert sealed_denial["manual_command_applied"] is False
+        assert sealed_denial["human_wait_entered"] is False
+        assert sealed_denial["recovery_phase"] in {"applied", "failed_closed"}
+        assert (
+            sealed_denial.get("recovery_action")
+            or sealed_denial["recovery_phase"] == "failed_closed"
+        )
+        lease = _lease(
+            base_url,
+            owner["expected_lease_id"],
+            task_id=task["task_id"],
+        )
+        # Autonomous recovery may finish and release the task lease, but the
+        # rejected manual /kill must never cancel or fence it.
+        assert lease["state"] not in {"cancelled", "fenced"}
+        assert lease["worker_id"] == owner["expected_worker_id"]
+
+
+def test_delayed_sealed_task_runs_loopx_pre_control_before_graph(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[tuple[str, str]] = []
+
+    def pre_control(state: Any, *, causation_id: str) -> dict[str, Any]:
+        calls.append((state.task_id, causation_id))
+        return {"ready": True}
+
+    monkeypatch.setattr(
+        api_main,
+        "prepare_phase2_loopx_pre_control",
+        pre_control,
+    )
+    monkeypatch.setattr(api_main, "graph_execution_context", object)
+    monkeypatch.setattr(
+        api_main,
+        "run_task_graph",
+        lambda state, *, execution_context: [],
+    )
+
+    with _api(tmp_path) as base_url:
+        created = _post(
+            base_url,
+            "/tasks",
+            {
+                "goal": "Run one delayed sealed task.",
+                "sealed": True,
+                "auto_run": False,
+            },
+        )["task"]
+        assert calls == []
+
+        _post(base_url, f"/tasks/{created['task_id']}/run", {})
+
+    assert calls == [
+        (
+            created["task_id"],
+            f"task-resume:{created['run_id']}:{created['task_id']}",
+        )
+    ]
+
+
+def test_timeline_exact_resume_preserves_checkpoint_identity_and_idempotency(
+    tmp_path: Path,
+) -> None:
+    with _api(tmp_path) as base_url:
+        task = _create_task(base_url, "Resume an exact timeline checkpoint.")
+        session_id = f"task:{task['task_id']}"
+        checkpoint = _post(
+            base_url,
+            f"/tasks/{task['task_id']}/recovery/checkpoints",
+            {
+                "run_id": task["run_id"],
+                "task_id": task["task_id"],
+                "session_id": session_id,
+                "workflow_signature": "timeline-control-workflow-v1",
+                "graph_signature": "timeline-control-graph-v1",
+                "topology_signature": "timeline-control-topology-v1",
+                "owner_refs": {
+                    "task": task["task_id"],
+                    "session": session_id,
+                },
+                "version_refs": {"task": 1, "session": 1},
+                "state_payload": {
+                    "progress": 11,
+                    "active_node_id": task["root_node_id"],
+                },
+                "completed_step_ids": ["timeline-step-10"],
+            },
+        )["checkpoint"]["checkpoint_id"]
+        payload = _command_payload(
+            task,
+            "resume",
+            arguments={
+                **_owner(task),
+                "target_session_id": session_id,
+                "checkpoint_ref": checkpoint,
+                "exact_resume": True,
+                "candidate_step_ids": [],
+            },
+            session_id=session_id,
+        )
+        first_status, first = _post_with_status(
+            base_url,
+            f"/tasks/{task['task_id']}/commands",
+            payload,
+        )
+        second_status, replay = _post_with_status(
+            base_url,
+            f"/tasks/{task['task_id']}/commands",
+            payload,
+        )
+        assert first_status == 201, first
+        assert second_status == 201, replay
+        effect = first["command_result"]["data"]["transaction"]["effect"]
+        assert effect["checkpoint_ref"] == checkpoint
+        assert effect["metadata"]["exact_resume"] is True
+        assert effect["metadata"]["same_session"] is True
+        assert replay["command_result"] == first["command_result"]
+        events = _get(base_url, f"/tasks/{task['task_id']}/events")["events"]
+        resumed = [
+            event
+            for event in events
+            if event["event_type"] == "topology_route"
+            and event.get("payload", {}).get("recovery_runtime", {}).get("phase")
+            == "checkpoint_resumed"
+        ]
+        assert len(resumed) == 1
+
+
+def _create_task(base_url: str, goal: str) -> dict[str, Any]:
+    return _post(
+        base_url,
+        "/tasks",
+        {"goal": goal, "auto_run": False},
+    )["task"]
+
+
+def _register_successor_worker(
+    worker_api: Any,
+    orchestrator: Any,
+    *,
+    worker_id: str,
+    backend_id: str,
+    replace_generation: bool = False,
+) -> None:
+    device_policy = orchestrator.catalog.policy(DeploymentProfile.DEVICE)
+    process, _, health = orchestrator.processes.start_node(
+        device_policy,
+        restart=True,
+    )
+    identity = dict(health["runtime_identity"])
+    worker_api.pool.register_physical_worker(
+        worker_id=worker_id,
+        worker_kind="code-worker",
+        location=WorkerLocation.LOCAL,
+        backend=BackendCapability(
+            backend_id=backend_id,
+            backend_kind="local_process",
+            enabled=True,
+            healthy=True,
+            capabilities=(
+                "agent_task",
+                "code_execution",
+                "artifact_return",
+            ),
+            tool_ids=("code", "shell", "read", "write", "search"),
+        ),
+        capabilities=(
+            "agent_task",
+            "code_execution",
+            "artifact_return",
+        ),
+        tool_ids=("code", "shell", "read", "write", "search"),
+        resources=ResourceVector(
+            cpu_cores=1.0,
+            memory_mb=512,
+            disk_mb=512,
+            process_slots=2,
+        ),
+        process_identity=str(identity["failure_boundary_id"]),
+        endpoint=process.endpoint,
+        replace_generation=replace_generation,
+        metadata={
+            "unbound_terminal_test_worker": True,
+            "deployment_node_id": health["node_id"],
+            "deployment_generation_id": identity["generation_id"],
+        },
+    )
+
+
+def _owner(task: dict[str, Any]) -> dict[str, Any]:
+    worker = task["metadata"]["worker_pool"]
+    return {
+        "expected_task_id": task["task_id"],
+        "expected_run_id": task["run_id"],
+        "expected_worker_id": worker["worker_id"],
+        "expected_lease_id": worker["lease_id"],
+        "expected_attempt_id": worker["attempt_id"],
+    }
+
+
+def _command_payload(
+    task: dict[str, Any],
+    action: str,
+    *,
+    arguments: dict[str, Any],
+    sealed: bool = False,
+    session_id: str | None = None,
+) -> dict[str, Any]:
+    suffix = task["task_id"].replace(":", "-")
+    return {
+        "text": f"/{action} timeline recovery control",
+        "arguments": arguments,
+        "request_id": f"request-timeline-{action}-{suffix}",
+        "command_id": f"command-timeline-{action}-{suffix}",
+        "idempotency_key": f"timeline-control-{action}-{suffix}",
+        "actor_id": "sealed-benchmark-observer" if sealed else "timeline-operator",
+        "session_id": session_id,
+        "sealed": sealed,
+        "competition_mode": "sealed_autonomous" if sealed else "interactive",
+    }
+
+
+def _command(
+    base_url: str,
+    task: dict[str, Any],
+    action: str,
+    *,
+    arguments: dict[str, Any],
+) -> tuple[int, dict[str, Any]]:
+    return _post_with_status(
+        base_url,
+        f"/tasks/{task['task_id']}/commands",
+        _command_payload(task, action, arguments=arguments),
+    )
+
+
+def _lease(
+    base_url: str,
+    lease_id: str,
+    *,
+    task_id: str,
+) -> dict[str, Any]:
+    leases = _get(
+        base_url,
+        f"/worker-pool/leases?task_id={task_id}",
+    )["leases"]
+    return next(item for item in leases if item["lease_id"] == lease_id)
+
+
+@contextmanager
+def _api(root: Path) -> Iterator[str]:
+    variables = (
+        "ZYRA_SQLITE_PATH",
+        "ZYRA_RECOVERY_SQLITE_PATH",
+        "ZYRA_EVENT_LOG",
+        "ZYRA_ARTIFACT_ROOT",
+        "ZYRA_TOOL_WORKSPACE",
+        "ZYRA_WORKSPACE_ROOT",
+        "ZYRA_PERMISSION_STATE",
+        "ZYRA_PROVIDER_CONTROL_STATE",
+        "ZYRA_WORKER_POOL_STORE",
+        "ZYRA_GRAPH_STATE_STORE",
+        "ZYRA_WORKSPACE_STORE",
+        "ZYRA_DISABLE_RECOVERY_RUNTIME",
+    )
+    previous = {name: os.environ.get(name) for name in variables}
+    os.environ.update(
+        {
+            "ZYRA_SQLITE_PATH": str(root / "api.sqlite3"),
+            "ZYRA_RECOVERY_SQLITE_PATH": str(root / "recovery.sqlite3"),
+            "ZYRA_EVENT_LOG": str(root / "events.jsonl"),
+            "ZYRA_ARTIFACT_ROOT": str(root / "artifacts"),
+            "ZYRA_TOOL_WORKSPACE": str(root / "tool-workspace"),
+            "ZYRA_WORKSPACE_ROOT": str(root / "managed-workspaces"),
+            "ZYRA_PERMISSION_STATE": str(root / "permission-state.json"),
+            "ZYRA_PROVIDER_CONTROL_STATE": str(
+                root / "provider-control.sqlite3"
+            ),
+            "ZYRA_WORKER_POOL_STORE": str(root / "worker-pool.sqlite3"),
+            "ZYRA_GRAPH_STATE_STORE": str(root / "graph-state.sqlite3"),
+            "ZYRA_WORKSPACE_STORE": str(root / "workspace.sqlite3"),
+            "ZYRA_DISABLE_RECOVERY_RUNTIME": "false",
+        }
+    )
+    api_main._WORKER_POOL_API = None
+    api_main._WORKER_POOL_RUNTIME = None
+    api_main._WORKER_POOL_KEY = None
+    api_main.reset_deployment_api()
+    api_main.reset_control_runtime()
+    api_main.reset_subagent_runtime()
+    server = ThreadingHTTPServer(
+        ("127.0.0.1", 0),
+        api_main.ZyraRequestHandler,
+    )
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        yield f"http://127.0.0.1:{server.server_address[1]}"
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=10)
+        if api_main._WORKER_POOL_API is not None:
+            api_main._WORKER_POOL_API.close()
+        api_main._WORKER_POOL_API = None
+        api_main._WORKER_POOL_RUNTIME = None
+        api_main._WORKER_POOL_KEY = None
+        api_main.reset_deployment_api()
+        api_main.reset_control_runtime()
+        api_main.reset_subagent_runtime()
+        for name, value in previous.items():
+            if value is None:
+                os.environ.pop(name, None)
+            else:
+                os.environ[name] = value
+
+
+def _get(base_url: str, path: str) -> dict[str, Any]:
+    with urllib.request.urlopen(f"{base_url}{path}", timeout=11 * 60) as response:
+        return json.loads(response.read().decode("utf-8"))
+
+
+def _post(
+    base_url: str,
+    path: str,
+    payload: dict[str, Any],
+) -> dict[str, Any]:
+    status, body = _post_with_status(base_url, path, payload)
+    if status >= 400:
+        raise AssertionError(body)
+    return body
+
+
+def _post_with_status(
+    base_url: str,
+    path: str,
+    payload: dict[str, Any],
+) -> tuple[int, dict[str, Any]]:
+    request = urllib.request.Request(
+        f"{base_url}{path}",
+        data=json.dumps(payload).encode("utf-8"),
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=11 * 60) as response:
+            return response.status, json.loads(response.read().decode("utf-8"))
+    except HTTPError as error:
+        return error.code, json.loads(error.read().decode("utf-8"))

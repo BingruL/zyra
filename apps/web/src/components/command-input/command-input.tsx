@@ -1,0 +1,757 @@
+import {
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+  useSyncExternalStore,
+  type KeyboardEvent,
+} from "react"
+import type { WorkbenchRuntime } from "../../app/runtime.ts"
+import type { TaskProjection } from "../../../../../packages/core/typed-api-client/src/index.ts"
+import { useCommandSnapshot, useQueueSnapshot, useWorkbenchSnapshot } from "../../app/hooks.ts"
+import { applyCompletion, commandArgumentHint, completionContext } from "../../command/parser.ts"
+import { commandUsage, type CommandSuggestion } from "../../command/catalog.ts"
+import {
+  decideCommandKey,
+  selectedSuggestionIndex,
+} from "../../command/keyboard.ts"
+import {
+  applyArgumentSuggestion,
+  argumentSuggestions,
+  type ArgumentSuggestion,
+} from "../../command/argument-completion.ts"
+import {
+  classifyPermissionSealedManualAction,
+  permissionDisplayActor,
+  rejectPermissionSealedManualAction,
+} from "../../features/permissions/index.ts"
+import type { PaletteEntry } from "../../../../../packages/commands/src/index.ts"
+
+const COMPOSER_FALLBACK_MAX_HEIGHT_PX = 220
+
+function cursorAt(textarea: HTMLTextAreaElement): number {
+  return textarea.selectionStart ?? textarea.value.length
+}
+
+/**
+ * Grows the composer with its content up to the CSS `max-height`, so a
+ * multi-paragraph goal stays readable while it is being written instead of
+ * scrolling inside a one-line box.
+ */
+function autoSizeComposer(textarea: HTMLTextAreaElement | null): void {
+  if (!textarea || typeof getComputedStyle !== "function") return
+  const maximum =
+    Number.parseFloat(getComputedStyle(textarea).maxHeight)
+    || COMPOSER_FALLBACK_MAX_HEIGHT_PX
+  textarea.style.height = "auto"
+  const next = Math.min(textarea.scrollHeight, maximum)
+  textarea.style.height = `${next}px`
+  textarea.style.overflowY = textarea.scrollHeight > maximum ? "auto" : "hidden"
+}
+
+function setSelection(textarea: HTMLTextAreaElement, position: number): void {
+  requestAnimationFrame(() => {
+    textarea.focus({ preventScroll: true })
+    textarea.setSelectionRange(position, position)
+  })
+}
+
+function SuggestionList({
+  suggestions,
+  selected,
+  onSelected,
+  onChoose,
+}: {
+  suggestions: readonly CommandSuggestion[]
+  selected: number
+  onSelected: (index: number) => void
+  onChoose: (suggestion: CommandSuggestion) => void
+}) {
+  if (!suggestions.length) {
+    return (
+      <div className="command-suggestions command-suggestions-empty" role="status">
+        没有匹配的命令
+      </div>
+    )
+  }
+  return (
+    <div
+      className="command-suggestions"
+      id="command-suggestions"
+      role="listbox"
+      aria-label="斜杠命令建议"
+    >
+      {suggestions.map((suggestion, index) => {
+        const definition = suggestion.definition
+        return (
+          <button
+            key={definition.id}
+            id={`suggestion-${definition.id}`}
+            className="command-suggestion"
+            type="button"
+            role="option"
+            aria-selected={index === selected}
+            disabled={!suggestion.availability.enabled}
+            onMouseMove={() => onSelected(index)}
+            onMouseDown={(event) => event.preventDefault()}
+            onClick={() => onChoose(suggestion)}
+          >
+            <span className="suggestion-command">/{definition.trigger}</span>
+            <span className="suggestion-copy">
+              <strong>{definition.title}</strong>
+              <span>{definition.description}</span>
+            </span>
+            <span className="suggestion-badges">
+              {!suggestion.availability.enabled ? (
+                <span className="tag tag-danger">{suggestion.availability.reason}</span>
+              ) : null}
+            </span>
+          </button>
+        )
+      })}
+    </div>
+  )
+}
+
+function ArgumentSuggestionList({
+  suggestions,
+  selected,
+  onSelected,
+  onChoose,
+}: {
+  suggestions: readonly ArgumentSuggestion[]
+  selected: number
+  onSelected: (index: number) => void
+  onChoose: (suggestion: ArgumentSuggestion) => void
+}) {
+  return (
+    <div
+      className="command-suggestions argument-suggestions"
+      id="command-argument-suggestions"
+      role="listbox"
+      aria-label="Command argument suggestions"
+    >
+      {suggestions.map((suggestion, index) => (
+        <button
+          key={suggestion.id}
+          id={`argument-${suggestion.id.replace(/[^a-z0-9_-]/gi, "-")}`}
+          className="command-suggestion"
+          type="button"
+          role="option"
+          aria-selected={selected === index}
+          disabled={suggestion.disabled}
+          onMouseMove={() => onSelected(index)}
+          onMouseDown={(event) => event.preventDefault()}
+          onClick={() => onChoose(suggestion)}
+        >
+          <span className="suggestion-command">{suggestion.value}</span>
+          <span className="suggestion-copy">
+            <strong>{suggestion.label}</strong>
+            <span>{suggestion.description}</span>
+          </span>
+          <span className="tag tag-muted">{suggestion.kind}</span>
+        </button>
+      ))}
+    </div>
+  )
+}
+
+function ControlArgumentList({
+  entries,
+  selected,
+  onSelected,
+  onChoose,
+}: {
+  entries: readonly PaletteEntry[]
+  selected: number
+  onSelected: (entry: PaletteEntry) => void
+  onChoose: (entry: PaletteEntry) => void
+}) {
+  return (
+    <div
+      className="command-suggestions argument-suggestions"
+      id="control-command-argument-suggestions"
+      role="listbox"
+      aria-label="Typed control command argument suggestions"
+      data-command-palette-owner="packages/commands/CommandPalette"
+    >
+      {entries.map((entry, index) => (
+        <button
+          key={entry.id}
+          id={`control-argument-${entry.id.replace(/[^a-z0-9_-]/gi, "-")}`}
+          className="command-suggestion"
+          type="button"
+          role="option"
+          aria-selected={selected === index}
+          disabled={entry.disabled}
+          onMouseMove={() => onSelected(entry)}
+          onMouseDown={(event) => event.preventDefault()}
+          onClick={() => onChoose(entry)}
+        >
+          <span className="suggestion-command">{entry.value}</span>
+          <span className="suggestion-copy">
+            <strong>{entry.label}</strong>
+            <span>{entry.description}</span>
+          </span>
+          <span className="tag tag-muted">{entry.kind}</span>
+        </button>
+      ))}
+    </div>
+  )
+}
+
+function QueuePreview({
+  runtime,
+  selectedTask,
+  currentDraft,
+  currentCursor,
+}: {
+  runtime: WorkbenchRuntime
+  selectedTask?: TaskProjection
+  currentDraft: string
+  currentCursor: number
+}) {
+  const queue = useQueueSnapshot(runtime)
+  const visible = queue.visible.slice(0, 8)
+  if (!visible.length) return null
+  return (
+    <section className="queue-preview" aria-labelledby="queue-preview-heading">
+      <header>
+        <span id="queue-preview-heading">
+          排队中的输入 <strong>{queue.pendingCount}</strong>
+        </span>
+        <button
+          type="button"
+          onClick={() => runtime.queue.removeSettled()}
+          disabled={!queue.entries.some((entry) => ["committed", "failed", "cancelled"].includes(entry.phase))}
+        >
+          清除已完成
+        </button>
+      </header>
+      <ol>
+        {visible.map((entry) => (
+          <li key={entry.id} data-phase={entry.phase}>
+            <span className={`queue-phase queue-phase-${entry.phase}`} aria-hidden="true" />
+            <span className="queue-value">{entry.value}</span>
+            <span className="queue-meta">{{ now: "优先", next: "下一条", later: "稍后" }[entry.priority]} · {{ queued: "排队中", dispatching: "发送中", committed: "已发送", failed: "失败", cancelled: "已取消" }[entry.phase]}</span>
+            {entry.phase === "queued" && entry.editable ? (
+              <button
+                type="button"
+                onClick={() => {
+                  const popped = runtime.queue.popEditable(currentDraft, currentCursor, entry.id)
+                  if (!popped) return
+                  window.dispatchEvent(new CustomEvent("zyra:restore-command-draft", {
+                    detail: { value: popped.value, cursor: popped.cursor },
+                  }))
+                }}
+              >
+                编辑
+              </button>
+            ) : null}
+            {entry.phase === "failed" || entry.phase === "cancelled" ? (
+              <button type="button" onClick={() => {
+                void (async () => {
+                  const rejected = await rejectPermissionSealedManualAction({
+                    runtime: runtime.permissionConsole,
+                    action: "retry",
+                    actorId: permissionDisplayActor(selectedTask?.metadata),
+                    requestId: entry.id,
+                    reason:
+                      "A manual queued-input retry cannot advance a sealed run.",
+                  })
+                  if (rejected) return
+                  runtime.queue.retry(entry.id)
+                  await runtime.commands.drain()
+                })()
+              }}>
+                重试
+              </button>
+            ) : null}
+          </li>
+        ))}
+      </ol>
+      {queue.visible.length > visible.length ? (
+        <p className="queue-overflow">另有 {queue.visible.length - visible.length} 条排队输入</p>
+      ) : null}
+    </section>
+  )
+}
+
+export function CommandInput({
+  runtime,
+  taskContext,
+}: {
+  runtime: WorkbenchRuntime
+  taskContext?: TaskProjection
+}) {
+  const command = useCommandSnapshot(runtime)
+  const control = useSyncExternalStore(
+    runtime.controlCommands.subscribe,
+    runtime.controlCommands.getSnapshot,
+    runtime.controlCommands.getSnapshot,
+  )
+  const inputBusy = command.busy || control.coordinator.busy
+  const workbench = useWorkbenchSnapshot(runtime)
+  const textareaRef = useRef<HTMLTextAreaElement>(null)
+  const [value, setValue] = useState("")
+  const [cursor, setCursor] = useState(0)
+  const [selectedSuggestion, setSelectedSuggestion] = useState(0)
+  const [suggestionsDismissed, setSuggestionsDismissed] = useState(false)
+  const [submissionError, setSubmissionError] = useState<string>()
+  const selectedTask = taskContext
+  const parsed = useMemo(() => runtime.commands.parse(value), [runtime, value])
+  const completion = useMemo(
+    () => completionContext(value, cursor, runtime.catalog),
+    [runtime, value, cursor],
+  )
+  const suggestions = useMemo(() => {
+    if (completion.kind !== "command") return []
+    return runtime.catalog.search(completion.query, runtime.commands.context(), 10)
+  }, [runtime, completion, workbench.revision, command.revision])
+  const argumentOptions = useMemo(
+    () => argumentSuggestions({
+      parsed,
+      completion,
+      catalog: runtime.catalog,
+      tasks: workbench.list.tasks,
+      limit: 10,
+    }),
+    [completion, parsed, runtime, workbench.list.tasks],
+  )
+  const showSuggestions =
+    !suggestionsDismissed &&
+    completion.kind === "command" &&
+    !(parsed.kind === "command" && parsed.definition && `/${parsed.definition.trigger}` === value.trim()) &&
+    value.trimStart().startsWith("/")
+  const showArgumentSuggestions =
+    !suggestionsDismissed &&
+    completion.kind === "argument" &&
+    argumentOptions.length > 0
+  const suggestionsOpen = showSuggestions || showArgumentSuggestions
+  const argumentHint = useMemo(
+    () => commandArgumentHint(parsed, cursor),
+    [parsed, cursor],
+  )
+  const showControlArgumentSuggestions =
+    !suggestionsDismissed &&
+    value.trimStart().startsWith("/") &&
+    control.palette.query === value &&
+    Boolean(control.palette.parsed.descriptor) &&
+    control.palette.completion.kind !== "command" &&
+    control.palette.entries.length > 0
+  const effectiveSuggestionsOpen =
+    suggestionsOpen || showControlArgumentSuggestions
+
+  useEffect(() => {
+    runtime.controlCommands.input.update({ value, cursor })
+  }, [cursor, runtime, value])
+
+  useEffect(() => {
+    const count = showArgumentSuggestions ? argumentOptions.length : suggestions.length
+    if (selectedSuggestion >= count) setSelectedSuggestion(0)
+  }, [argumentOptions.length, selectedSuggestion, showArgumentSuggestions, suggestions.length])
+
+  // Follow-up tasks share one conversation composer. Advancing a queued turn
+  // must not replace the draft the person is currently editing.
+  const draftScope = selectedTask?.sessionId ?? selectedTask?.taskId ?? "new"
+  useEffect(() => {
+    const draft = runtime.drafts.get(draftScope)
+    setValue(draft?.value ?? "")
+    const position = draft?.cursor ?? 0
+    setCursor(position)
+    if (draft?.value && textareaRef.current) setSelection(textareaRef.current, position)
+  }, [draftScope, runtime])
+
+  useEffect(() => {
+    const restore = (event: Event) => {
+      const detail = (event as CustomEvent<{ value?: string; cursor?: number }>).detail
+      if (!detail?.value) return
+      setValue(detail.value)
+      const position = detail.cursor ?? detail.value.length
+      setCursor(position)
+      setSuggestionsDismissed(false)
+      runtime.drafts.set(draftScope, detail.value, position)
+      if (textareaRef.current) setSelection(textareaRef.current, position)
+    }
+    window.addEventListener("zyra:restore-command-draft", restore)
+    return () => window.removeEventListener("zyra:restore-command-draft", restore)
+  }, [draftScope, runtime])
+
+  useEffect(() => {
+    autoSizeComposer(textareaRef.current)
+  }, [value])
+
+  const chooseSuggestion = useCallback((suggestion: CommandSuggestion) => {
+    if (!suggestion.availability.enabled) return
+    const applied = applyCompletion(value, completion, suggestion.definition.trigger)
+    setValue(applied.value)
+    runtime.drafts.set(draftScope, applied.value, applied.cursor)
+    setCursor(applied.cursor)
+    setSelectedSuggestion(0)
+    if (textareaRef.current) setSelection(textareaRef.current, applied.cursor)
+  }, [completion, draftScope, runtime, value])
+
+  const chooseArgument = useCallback((suggestion: ArgumentSuggestion) => {
+    const applied = applyArgumentSuggestion(value, completion, suggestion)
+    setValue(applied.value)
+    runtime.drafts.set(draftScope, applied.value, applied.cursor)
+    setCursor(applied.cursor)
+    setSelectedSuggestion(0)
+    if (textareaRef.current) setSelection(textareaRef.current, applied.cursor)
+  }, [completion, draftScope, runtime, value])
+
+  const chooseControlArgument = useCallback((entry: PaletteEntry) => {
+    runtime.controlCommands.palette.select(entry.id)
+    const applied = runtime.controlCommands.palette.apply(value)
+    if (!applied) return
+    setValue(applied.value)
+    runtime.drafts.set(draftScope, applied.value, applied.cursor)
+    setCursor(applied.cursor)
+    if (textareaRef.current) setSelection(textareaRef.current, applied.cursor)
+  }, [draftScope, runtime, value])
+
+  const submit = useCallback(async (
+    origin: "keyboard" | "button" = "keyboard",
+    controlMode: "enqueue" | "steer" | "interrupt" = "enqueue",
+  ) => {
+    const captured = value
+    if (!captured.trim() || !command.enabled) return
+    const sealedAction = classifyPermissionSealedManualAction({
+      value: captured,
+      deliveryMode: controlMode,
+    })
+    if (
+      sealedAction
+      && runtime.permissionConsole.getSnapshot().productMode === "sealed"
+    ) {
+      setSubmissionError(undefined)
+      try {
+        const rejected = await rejectPermissionSealedManualAction({
+          runtime: runtime.permissionConsole,
+          action: sealedAction,
+          actorId: permissionDisplayActor(selectedTask?.metadata),
+          reason:
+            `Manual ${sealedAction.replace("_", " ")} cannot advance a sealed run.`,
+        })
+        setSubmissionError(
+          rejected?.reason
+            ?? "The sealed permission policy rejected this manual control.",
+        )
+      } catch (error) {
+        setSubmissionError(
+          error instanceof Error ? error.message : String(error),
+        )
+      }
+      return
+    }
+    const capture = runtime.drafts.captureValue(
+      draftScope,
+      captured,
+      textareaRef.current ? cursorAt(textareaRef.current) : captured.length,
+    )
+    setSubmissionError(undefined)
+    setValue("")
+    setCursor(0)
+    runtime.drafts.clear(draftScope)
+    try {
+      await runtime.commands.submit(captured, {
+        origin,
+        taskId: selectedTask?.taskId,
+        runId: selectedTask?.runId,
+        sessionId: selectedTask?.sessionId,
+        taskStatus: selectedTask?.status,
+        taskActive: selectedTask?.active,
+        taskTerminal: selectedTask?.terminal,
+        allowQueue: true,
+        controlMode,
+      })
+      runtime.drafts.commit(capture.id)
+      runtime.history.resetNavigation()
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error)
+      setSubmissionError(message)
+      const restored = runtime.drafts.restore(capture.id)
+      if (restored) {
+        setValue(restored.value)
+        setCursor(restored.cursor)
+        if (textareaRef.current) setSelection(textareaRef.current, restored.cursor)
+      } else if (textareaRef.current) {
+        // The draft could not be restored, but the person still needs the
+        // caret back where they can react to the failure.
+        textareaRef.current.focus({ preventScroll: true })
+      }
+    }
+  }, [command.enabled, draftScope, runtime, selectedTask, value])
+
+  const navigateHistory = useCallback((direction: "up" | "down") => {
+    const textarea = textareaRef.current
+    if (!textarea) return false
+    const navigation = runtime.history.navigate(
+      direction,
+      value,
+      cursorAt(textarea),
+      { taskId: selectedTask?.taskId },
+    )
+    if (!navigation.handled || navigation.value === undefined) return false
+    const position = navigation.cursor === "start" ? 0 : navigation.value.length
+    setValue(navigation.value)
+    runtime.drafts.set(draftScope, navigation.value, position)
+    setCursor(position)
+    setSelection(textarea, position)
+    return true
+  }, [draftScope, runtime, selectedTask?.taskId, value])
+
+  const handleKeyDown = (event: KeyboardEvent<HTMLTextAreaElement>) => {
+    const decision = decideCommandKey({
+      key: event.key,
+      shift: event.shiftKey,
+      alt: event.altKey,
+      ctrl: event.ctrlKey,
+      meta: event.metaKey,
+      composing: event.nativeEvent.isComposing,
+      suggestionsOpen: effectiveSuggestionsOpen,
+      suggestionCount: showControlArgumentSuggestions
+        ? control.palette.entries.length
+        : showArgumentSuggestions
+          ? argumentOptions.length
+          : suggestions.length,
+      value,
+      cursor: cursorAt(event.currentTarget),
+      busy: inputBusy,
+      overlayOpen: Boolean(runtime.overlays.active()),
+      editableQueuedCount: runtime.queue.list({
+        phases: ["queued"],
+      }).filter((entry) => entry.editable).length,
+      inHistory: false,
+    })
+    if (decision.preventDefault) event.preventDefault()
+    if (decision.stopPropagation) event.stopPropagation()
+    if (decision.action === "submit") {
+      if (
+        showControlArgumentSuggestions &&
+        control.palette.entries[control.palette.selectedIndex]
+      ) {
+        chooseControlArgument(
+          control.palette.entries[control.palette.selectedIndex]!,
+        )
+      } else if (showArgumentSuggestions && argumentOptions[selectedSuggestion]) {
+        chooseArgument(argumentOptions[selectedSuggestion]!)
+      } else if (showSuggestions && suggestions[selectedSuggestion]?.availability.enabled) {
+        chooseSuggestion(suggestions[selectedSuggestion]!)
+      } else {
+        void submit(
+          "keyboard",
+          event.altKey && (event.ctrlKey || event.metaKey)
+            ? "interrupt"
+            : event.altKey
+              ? "steer"
+              : "enqueue",
+        )
+      }
+      return
+    }
+    if (decision.action === "close-suggestions") {
+      setSuggestionsDismissed(true)
+      return
+    }
+    if (decision.action === "cancel" || decision.action === "restore-queue") {
+      // The shell also listens for Escape on window.  Whatever the composer
+      // resolves here is the only thing that should happen for this keypress.
+      if (runtime.overlays.handleEscape()) {
+        event.stopPropagation()
+        return
+      }
+      if (selectedTask?.active) {
+        runtime.overlays.open({ kind: "task-cancel", title: "停止任务",
+          payload: { taskId: selectedTask.taskId, runId: selectedTask.runId, goal: selectedTask.userGoal } })
+        event.stopPropagation()
+        return
+      }
+      if (runtime.controlCommands.cancelActive()) {
+        event.stopPropagation()
+        return
+      }
+      if (inputBusy && runtime.commands.cancelActive()) {
+        event.stopPropagation()
+        return
+      }
+      const popped = runtime.queue.popEditable(value, cursorAt(event.currentTarget))
+      if (popped) {
+        event.stopPropagation()
+        setValue(popped.value)
+        setCursor(popped.cursor)
+        runtime.drafts.set(draftScope, popped.value, popped.cursor)
+        setSelection(event.currentTarget, popped.cursor)
+      }
+      return
+    }
+    if (decision.action === "suggestion-next") {
+      if (showControlArgumentSuggestions) {
+        runtime.controlCommands.palette.move("next")
+        return
+      }
+      setSelectedSuggestion((current) =>
+        selectedSuggestionIndex(
+          current,
+          showArgumentSuggestions ? argumentOptions.length : suggestions.length,
+          "next",
+        ),
+      )
+      return
+    }
+    if (decision.action === "suggestion-previous") {
+      if (showControlArgumentSuggestions) {
+        runtime.controlCommands.palette.move("previous")
+        return
+      }
+      setSelectedSuggestion((current) =>
+        selectedSuggestionIndex(
+          current,
+          showArgumentSuggestions ? argumentOptions.length : suggestions.length,
+          "previous",
+        ),
+      )
+      return
+    }
+    if (decision.action === "history-previous" && navigateHistory("up")) {
+      return
+    }
+    if (decision.action === "history-next") {
+      navigateHistory("down")
+    }
+  }
+
+  const activeDescription =
+    showControlArgumentSuggestions &&
+    control.palette.entries[control.palette.selectedIndex]
+      ? `control-argument-${control.palette.entries[control.palette.selectedIndex]!.id.replace(/[^a-z0-9_-]/gi, "-")}`
+      : showArgumentSuggestions && argumentOptions[selectedSuggestion]
+      ? `argument-${argumentOptions[selectedSuggestion]!.id.replace(/[^a-z0-9_-]/gi, "-")}`
+      : suggestions[selectedSuggestion]
+        ? `suggestion-${suggestions[selectedSuggestion]!.definition.id}`
+        : undefined
+  const disabled = !command.enabled || !workbench.transportEnabled
+  // A plain message always starts a new turn inside the selected session; only
+  // a busy coordinator makes it queue.  The copy has to say which one happens.
+  const contextLabel = !selectedTask
+    ? "新会话"
+    : inputBusy
+      ? "当前会话 · 新消息将进入队列"
+      : selectedTask.active
+        ? "当前会话 · 正在执行"
+        : "当前会话 · 可继续对话"
+  const placeholder = inputBusy
+    ? "继续输入，消息会排队等待当前指令完成"
+    : selectedTask
+      ? "在这个会话里继续，或输入 / 使用命令"
+      : "描述一个任务，或向 Zyra 提问"
+  const hint = argumentHint
+    ?? (parsed.kind === "command" && parsed.definition
+      ? commandUsage(parsed.definition)
+      : "Enter 发送 · Shift+Enter 换行 · 输入 / 查看命令")
+  return (
+    <footer className="command-dock">
+      <QueuePreview runtime={runtime} selectedTask={selectedTask} currentDraft={value} currentCursor={cursor} />
+      <div className="command-input-wrap" data-busy={command.busy || undefined}>
+        {showSuggestions ? (
+          <SuggestionList
+            suggestions={suggestions}
+            selected={selectedSuggestion}
+            onSelected={setSelectedSuggestion}
+            onChoose={chooseSuggestion}
+          />
+        ) : null}
+        {showControlArgumentSuggestions ? (
+          <ControlArgumentList
+            entries={control.palette.entries}
+            selected={control.palette.selectedIndex}
+            onSelected={(entry) => {
+              runtime.controlCommands.palette.select(entry.id)
+            }}
+            onChoose={chooseControlArgument}
+          />
+        ) : showArgumentSuggestions ? (
+          <ArgumentSuggestionList
+            suggestions={argumentOptions}
+            selected={selectedSuggestion}
+            onSelected={setSelectedSuggestion}
+            onChoose={chooseArgument}
+          />
+        ) : null}
+        <div className="command-context">
+          <span className={`status-marker ${selectedTask ? `status-${selectedTask.status}` : "status-idle"}`} aria-hidden="true" />
+          <span>{contextLabel}</span>
+          {selectedTask ? <span className="command-context-title">{selectedTask.userGoal || selectedTask.taskId}</span> : null}
+        </div>
+        <div className="command-editor">
+          <textarea
+            ref={textareaRef}
+            id="workbench-command-input"
+            value={value}
+            rows={1}
+            placeholder={placeholder}
+            aria-label="Zyra 任务输入"
+            aria-expanded={effectiveSuggestionsOpen}
+            aria-controls={
+              showSuggestions
+                ? "command-suggestions"
+                : showControlArgumentSuggestions
+                  ? "control-command-argument-suggestions"
+                : showArgumentSuggestions
+                  ? "command-argument-suggestions"
+                  : undefined
+            }
+            aria-activedescendant={effectiveSuggestionsOpen ? activeDescription : undefined}
+            aria-describedby={argumentHint ? "command-argument-hint" : undefined}
+            disabled={disabled}
+            onChange={(event) => {
+              setValue(event.target.value)
+              const position = cursorAt(event.target)
+              setCursor(position)
+              runtime.drafts.set(draftScope, event.target.value, position)
+              setSuggestionsDismissed(false)
+              setSubmissionError(undefined)
+              autoSizeComposer(event.target)
+            }}
+            onCompositionStart={() => {
+              runtime.controlCommands.input.compositionStart()
+            }}
+            onCompositionEnd={(event) => {
+              runtime.controlCommands.input.compositionEnd(
+                event.currentTarget.value,
+                cursorAt(event.currentTarget),
+              )
+            }}
+            onClick={(event) => setCursor(cursorAt(event.currentTarget))}
+            onKeyUp={(event) => setCursor(cursorAt(event.currentTarget))}
+            onKeyDown={handleKeyDown}
+          />
+          <button
+            className="command-submit"
+            type="button"
+            disabled={disabled || !value.trim()}
+            aria-label={inputBusy ? "将指令加入队列" : "发送任务"}
+            onClick={() => void submit("button")}
+          >
+            {inputBusy ? "排队" : "发送"}
+          </button>
+        </div>
+        {/*
+          The hint is reachable through `aria-describedby`; announcing the whole
+          footer on every keystroke would read the character count aloud
+          continuously.
+        */}
+        <div className="command-footer">
+          <span id="command-argument-hint">{hint}</span>
+          <span aria-hidden="true">{value.length.toLocaleString()} 字符</span>
+        </div>
+        {submissionError || command.lastError ? (
+          <div className="command-error" role="alert">
+            {submissionError ?? command.lastError}
+          </div>
+        ) : null}
+      </div>
+    </footer>
+  )
+}
